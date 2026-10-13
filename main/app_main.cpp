@@ -51,11 +51,10 @@ void processing_task(void*) {
         ESP_LOGE(kTag, "Microphone codec initialization failed");
         vTaskDelete(nullptr);
     }
-    esp_codec_dev_sample_info_t format = {
-        .sample_rate = kSampleRate,
-        .channel = 1,
-        .bits_per_sample = 16,
-    };
+    esp_codec_dev_sample_info_t format = {};
+    format.sample_rate = kSampleRate;
+    format.channel = 1;
+    format.bits_per_sample = 16;
     ESP_ERROR_CHECK(esp_codec_dev_set_in_gain(microphone, 36.0f));
     ESP_ERROR_CHECK(esp_codec_dev_open(microphone, &format));
 
