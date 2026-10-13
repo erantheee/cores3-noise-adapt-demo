@@ -12,3 +12,13 @@ jobs:
           esp_idf_version: v5.4.1
           target: esp32s3
           path: .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cores3-noise-adapt-firmware
+          if-no-files-found: error
+          path: |
+            build/*.bin
+            build/bootloader/bootloader.bin
+            build/partition_table/partition-table.bin
+            build/flasher_args.json
+            build/flash_args
