@@ -4,11 +4,8 @@
  * Opts: --size 16 --bpp 4 --no-compress --no-prefilter --font /private/tmp/shss/SourceHanSansSC-Normal.otf -r 0x20-0x7f,0xb0,0xb7,0xd7 --symbols 端侧算法验证机自动环境当前动作人声增益降噪媒体音量控制链路模拟已发送安静噪声嘈杂高正在感知调节保持设置恢复麦克风异常正常处理内存非最终耳机学与产品形态未知蓝牙连接断开静音音乐播放暂停继续检测状态故障电量充电通道模式手动智能增强提升降低延迟毫秒响度佩戴舒适功耗 --format lvgl --lv-font-name lv_font_ui_16 -o main/lv_font_ui_16.c
  ******************************************************************************/
 
-#ifdef LV_LVGL_H_INCLUDE_SIMPLE
+/* ESP-IDF: the lvgl managed component exports "lvgl.h" directly */
 #include "lvgl.h"
-#else
-#include "lvgl/lvgl.h"
-#endif
 
 #ifndef LV_FONT_UI_16
 #define LV_FONT_UI_16 1
