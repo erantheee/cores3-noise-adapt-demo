@@ -3,6 +3,10 @@
 #include <cstdio>
 #include "lvgl.h"
 
+extern "C" {
+extern const lv_font_t lv_font_ui_16;
+}
+
 namespace {
 lv_obj_t* env_value;
 lv_obj_t* action_value;
@@ -50,13 +54,13 @@ lv_obj_t* make_card(lv_obj_t* parent, int x, int y, int w, int h,
     lv_obj_t* label = lv_label_create(card);
     lv_label_set_text(label, title);
     lv_obj_set_style_text_color(label, lv_color_hex(0x8E99A8), 0);
-    lv_obj_set_style_text_font(label, &lv_font_source_han_sans_sc_16_cjk, 0);
+    lv_obj_set_style_text_font(label, &lv_font_ui_16, 0);
     *value = lv_label_create(card);
     lv_obj_set_pos(*value, 0, 25);
     lv_obj_set_width(*value, w - 14);
     lv_label_set_long_mode(*value, LV_LABEL_LONG_CLIP);
     lv_obj_set_style_text_color(*value, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(*value, &lv_font_source_han_sans_sc_16_cjk, 0);
+    lv_obj_set_style_text_font(*value, &lv_font_ui_16, 0);
     return card;
 }
 }  // namespace
@@ -69,13 +73,13 @@ void demo_ui_create() {
     lv_obj_t* title = lv_label_create(screen);
     lv_label_set_text(title, "端侧算法验证机");
     lv_obj_set_pos(title, 10, 7);
-    lv_obj_set_style_text_font(title, &lv_font_source_han_sans_sc_16_cjk, 0);
+    lv_obj_set_style_text_font(title, &lv_font_ui_16, 0);
 
     lv_obj_t* badge = lv_label_create(screen);
     lv_label_set_text(badge, "自动");
     lv_obj_set_pos(badge, 270, 7);
     lv_obj_set_style_text_color(badge, lv_color_hex(0x5FF2A7), 0);
-    lv_obj_set_style_text_font(badge, &lv_font_source_han_sans_sc_16_cjk, 0);
+    lv_obj_set_style_text_font(badge, &lv_font_ui_16, 0);
 
     make_card(screen, 10, 31, 92, 60, "环境", &env_value);
     make_card(screen, 108, 31, 202, 60, "当前动作", &action_value);
@@ -91,12 +95,12 @@ void demo_ui_create() {
     detail_value = lv_label_create(screen);
     lv_obj_set_pos(detail_value, 112, 158);
     lv_obj_set_style_text_color(detail_value, lv_color_hex(0x5FF2A7), 0);
-    lv_obj_set_style_text_font(detail_value, &lv_font_source_han_sans_sc_16_cjk, 0);
+    lv_obj_set_style_text_font(detail_value, &lv_font_ui_16, 0);
 
     performance_value = lv_label_create(screen);
     lv_obj_set_pos(performance_value, 112, 179);
     lv_obj_set_style_text_color(performance_value, lv_color_hex(0x9BA5B4), 0);
-    lv_obj_set_style_text_font(performance_value, &lv_font_source_han_sans_sc_16_cjk, 0);
+    lv_obj_set_style_text_font(performance_value, &lv_font_ui_16, 0);
 
     confidence_bar = lv_bar_create(screen);
     lv_obj_set_pos(confidence_bar, 112, 200);
@@ -109,7 +113,7 @@ void demo_ui_create() {
     lv_label_set_text(footer, "非最终耳机声学与产品形态");
     lv_obj_align(footer, LV_ALIGN_BOTTOM_MID, 0, -4);
     lv_obj_set_style_text_color(footer, lv_color_hex(0x697384), 0);
-    lv_obj_set_style_text_font(footer, &lv_font_source_han_sans_sc_16_cjk, 0);
+    lv_obj_set_style_text_font(footer, &lv_font_ui_16, 0);
 }
 
 void demo_ui_update(const AnalysisFrame& frame, const EarbudCommand& command,
