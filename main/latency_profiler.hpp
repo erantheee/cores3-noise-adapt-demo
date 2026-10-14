@@ -105,11 +105,11 @@ private:
 /// of the probes is reported alongside the measurements they produce.
 ///
 /// The unit is microseconds rather than milliseconds, and there is deliberately no
-/// "percentage of frame budget" here. An earlier version compared the figure against 1% of
-/// the 150 ms frame budget and reported thousands of microseconds, which was a true
-/// statement about a number that measured the wrong thing. What the probes actually cost
-/// is a handful of microseconds; anything larger means the measurement code is doing work,
-/// not that the budget is tight.
+/// "percentage of frame budget" here. An earlier version compared the figure against a
+/// fixed percentage of the control period and reported thousands of microseconds, which was
+/// a true statement about a number that measured the wrong thing. What the probes actually
+/// cost is a handful of microseconds; anything larger means the measurement code is doing
+/// work, not that the budget is tight.
 class ProfilerOverhead {
 public:
     void record(float overhead_us);

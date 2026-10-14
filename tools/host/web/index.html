@@ -301,7 +301,7 @@ function renderAlerts(s) {
       `已连接，但已经 ${s.age_ms} ms 没有新帧（阈值 ${s.silence_threshold_ms} ms，` +
       `设备节拍 100 ms，等于连续丢了 ${Math.round((s.age_ms || 0) / 100)} 帧）。` +
       `<b>先查上位机这一侧</b>：读取粒度、调度抖动、批量到达都会造成这种静默；` +
-      `项目文档记过一次同类事故——pyserial 的 read 粒度把 150 ms 的节拍读成了 202 ms。`]);
+      `项目文档记过一次同类事故——pyserial 的 read 粒度把主机侧间隔读成了 202 ms。`]);
   }
   if (s.frame && s.frame.link_reported_connected === false) {
     items.push(["", "控制链路：设备自称 <b>模拟</b>。没有确认回执之前，不得写成已连接或已发送。"]);
@@ -633,7 +633,7 @@ function renderStats(s) {
     ["坏行", s.stats.bad_lines],
     // 这三行量的是**主机侧逐行到达间隔**，不是设备节拍。一次 read 返回多行时，
     // 同一批里的行间隔接近 0，于是 p50 会被批量伪影拉高（实测 202 ms，而设备自报
-    // 采集间隔是 150.04 ms，且丢帧为 0）。要看设备节拍，看上面延迟表的 capture 阶段。
+    // 采集间隔稳定在 100 ms 附近，且丢帧为 0）。要看设备节拍，看上面延迟表的 capture 阶段。
     ["主机侧到达间隔 p50", iv.n ? iv.p50.toFixed(1) + " ms" : "—"],
     ["主机侧到达间隔 p95", iv.n ? iv.p95.toFixed(1) + " ms" : "—"],
     ["主机侧到达间隔 min / max", iv.n ? iv.min.toFixed(2) + " / " + iv.max.toFixed(1) + " ms" : "—"],

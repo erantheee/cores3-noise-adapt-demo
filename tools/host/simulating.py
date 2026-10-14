@@ -8,11 +8,13 @@
 
 生成的行为刻意贴住固件的真实数字，而不是随便造几个数：
 
-    控制节拍        150 ms（main/app_main.cpp: kControlPeriodMs）
+    控制节拍        100 ms（main/app_main.cpp: kControlPeriodMs）
+    协议            schema 2：mode / conversation / external_voice_gain_db / 24 段 eq_gain_db。
+                    **不发 noise_reduction_db**——那个字段已从固件删除（main/controller.hpp）
     状态机          从安静 → 噪声 → 人声 → 高噪声，中间有斜坡而不是跳变，
                     因为固件本身是"建议值逐步逼近目标"（controller.cpp）
-    人声增益上限    +6.5 dB（kMaxSpeechGainDb），模拟值永不越界
-    降噪上限        −8 dB（kMaxNoiseReductionDb）
+    人声增益上限    +8.0 dB（kDemoSpeechGainDb，固件实际下发的上限），模拟值永不越界；
+                    song_eq 的逐段建议另有 4 dB 上限，safety_hold 禁止正增益
     latency 汇总    每 10 s 一次，字段与 emit_latency_report 一致，含 n=0 的未实现阶段
 
 `plant_fault` 与 `drop_frames` 是给测试用的注入点：前者复现"麦克风异常"，
@@ -25,17 +27,24 @@ import json
 import random
 from dataclasses import dataclass, field
 
-from .protocol import CAPTURE_RATE_HZ, MAX_NOISE_REDUCTION_DB, MAX_SPEECH_GAIN_DB
+from .protocol import CAPTURE_RATE_HZ, DEMO_SPEECH_GAIN_DB, SCHEMA_VERSION
 
-#: 与环境对应的建议值。数字取自固件的硬上限与设备屏幕上的量级。
-#: `noise` 是**降噪量的大小**（0…+8 dB），与固件 std::clamp(_, 0, kMaxNoiseReductionDb)
-#: 的语义一致——不是负值偏移。这一点在模拟源里写错过一次：按负数生成的帧会被上位机的
-#: 校验全部判为异常，而那是模拟源的错，不是校验的错。
+#: 控制节拍，与固件 main/app_main.cpp 的 kControlPeriodMs 一致（100 ms）。
+CONTROL_PERIOD_S = 0.1
+
+#: 与环境对应的决策，按固件 controller.cpp 的四条分支给（不是随便造几个数）：
+#:   QUIET → flat，什么都不做；NOISY → song_eq，只给逐段建议、标量增益为 0；
+#:   VOICE → external_voice_intent，语音段抬到实发上限、媒体让位；
+#:   LOUD  → safety_hold，禁止正增益（这一条最容易被模拟源写错成"越大声抬越多"）。
 TARGETS = {
-    "QUIET": {"gain": 0.0, "noise": 0.0, "media": 100, "confidence": 0.95},
-    "NOISY": {"gain": 2.6, "noise": 4.0, "media": 94, "confidence": 0.98},
-    "VOICE": {"gain": 4.2, "noise": 3.2, "media": 92, "confidence": 0.99},
-    "LOUD": {"gain": 5.6, "noise": 7.4, "media": 85, "confidence": 1.0},
+    "QUIET": {"gain": 0.0, "media": 100, "confidence": 0.95, "mode": "FLAT",
+              "conversation": "NONE"},
+    "NOISY": {"gain": 0.0, "media": 100, "confidence": 0.98, "mode": "SONG_EQ",
+              "conversation": "NONE"},
+    "VOICE": {"gain": 7.6, "media": 30, "confidence": 0.99, "mode": "EXTERNAL_VOICE_INTENT",
+              "conversation": "LIKELY"},
+    "LOUD": {"gain": 0.0, "media": 100, "confidence": 1.0, "mode": "SAFETY_HOLD",
+             "conversation": "NONE"},
 }
 
 #: 环境序列与各段时长（秒）。刻意包含升段与降段，让面板上的趋势线有形状。
@@ -52,7 +61,7 @@ SCHEDULE: tuple[tuple[str, float], ...] = (
 
 @dataclass
 class MockDevice:
-    """按 150 ms 节拍产出一行行串口文本。"""
+    """按 100 ms 节拍（与固件 kControlPeriodMs 一致）产出一行行串口文本。"""
 
     seed: int = 7
     speed: float = 1.0
@@ -73,7 +82,6 @@ class MockDevice:
     _sequence: int = field(default=0, init=False)
     _next_emit_s: float = field(default=0.0, init=False)
     _gain: float = field(default=0.0, init=False)
-    _noise: float = field(default=0.0, init=False)
     _media: float = field(default=100.0, init=False)
     _chunk_sequence: int = field(default=0, init=False)
     _samples_since_chunk: int = field(default=0, init=False)
@@ -108,7 +116,7 @@ class MockDevice:
     def advance(self, elapsed_s: float) -> list[str]:
         """推进到 elapsed_s，返回这一拍要吐出的所有行。"""
         lines: list[str] = []
-        dt = 0.10
+        dt = CONTROL_PERIOD_S
         while self._next_emit_s <= elapsed_s:
             lines.extend(self._emit(self._next_emit_s, dt))
             self._next_emit_s += dt
@@ -118,9 +126,20 @@ class MockDevice:
         lines: list[str] = []
         environment = self.environment_at(at_s)
         target = TARGETS[environment]
-        self._gain = self._ramp(self._gain, min(target["gain"], MAX_SPEECH_GAIN_DB), dt)
-        self._noise = self._ramp(self._noise, min(target["noise"], MAX_NOISE_REDUCTION_DB), dt)
+        self._gain = self._ramp(self._gain, min(target["gain"], DEMO_SPEECH_GAIN_DB), dt)
         self._media = self._ramp(self._media, float(target["media"]), dt, tau_s=1.6)
+
+        # 24 段建议的形状按模式给，与固件一致：人声模式抬 8–16 段（两端 0.75 收口），
+        # song_eq 抬全部频段但夹在 4 dB 内，flat / safety_hold 一律 0 dB。
+        mode = str(target["mode"])
+        bands = [0.0] * 24
+        if mode == "EXTERNAL_VOICE_INTENT":
+            for band in range(8, 17):
+                bands[band] = round(self._gain * (0.75 if band in (8, 16) else 1.0), 2)
+        elif mode == "SONG_EQ":
+            for band in range(24):
+                importance = 1.0 if 8 <= band <= 16 else (0.45 if band < 5 else 0.70)
+                bands[band] = round(min(4.0, 4.0 * 0.6 * importance), 2)
 
         self._sequence += 1
         if self.drop_probability and self._random.random() < self.drop_probability:
@@ -136,16 +155,23 @@ class MockDevice:
                 json.dumps(
                     {
                         "type": "earbud_command",
-                        "schema": 1,
+                        "schema": SCHEMA_VERSION,
                         "sequence": self._sequence,
                         "timestamp_ms": int(at_s * 1000),
                         "speech_gain_db": round(max(0.0, self._gain + jitter), 2),
-                        "noise_reduction_db": round(max(0.0, self._noise + jitter / 3), 2),
+                        "external_voice_gain_db": round(max(0.0, self._gain + jitter), 2),
                         "media_percent": int(round(self._media)),
                         "state": state,
                         "environment": environment,
+                        "mode": mode,
+                        "conversation": target["conversation"],
                         "confidence": round(min(1.0, target["confidence"] - abs(jitter)), 2),
+                        "execution": "decision_only",
                         "link": "simulated",
+                        "eq_gain_db": bands,
+                        # 24 段环境谱：面板用它画趋势与"设备实测"的出处。
+                        "ambient_band_dbfs": [round(-72.0 + 40.0 * (i / 23.0), 1)
+                                              for i in range(24)],
                     },
                     ensure_ascii=False,
                 )
@@ -205,10 +231,10 @@ class MockDevice:
         # 字段与 main/app_main.cpp 的 emit_latency_report 一致，包括 n=0 的未实现阶段——
         # 上位机必须能显示"声纹推理 0.000 ms（未实现）"，而不是把 0 当成"很快"。
         stages = [
-            ("capture", 150.045, 150.048, 150.058, 68),
-            ("analyse", 7.033, 7.036, 7.038, 68),
+            ("capture", 100.03, 100.03, 100.05, 68),
+            ("analyse", 7.02, 7.03, 7.03, 68),
             ("embed", 0.0, 0.0, 0.0, 68),
-            ("decide", 0.051, 0.051, 0.060, 68),
+            ("decide", 0.06, 0.06, 0.06, 68),
             ("transport", 0.0, 0.0, 0.0, 0),
             ("apply", 0.0, 0.0, 0.0, 0),
             ("render", 0.0, 0.0, 0.0, 0),

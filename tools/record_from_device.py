@@ -44,7 +44,7 @@ class MissingDependency(Exception):
 def parse_chunk(line: str):
     """解析一行录音块。返回 (序号, 采样字节) 或 None。
 
-    先做一次便宜的字符检查再解析：设备每 150 ms 也会输出 earbud_command 行，而录音时
+    先做一次便宜的字符检查再解析：设备每 100 ms 也会输出 earbud_command 行，而录音时
     日志量很大，不值得为每一行做完整 JSON 解析。但检查只用来快速排除，判定仍以解析出的
     类型字段为准——真实数据不该因为冒号后面多个空格就被静默丢掉。
     """

@@ -276,13 +276,13 @@ class SerialSource:
                 while not stop.is_set() and not self.requested_stop.is_set():
                     # 只读"现在就有"的字节，而不是 request 4096 个。
                     #
-                    # 这一行是修一个实测了 200 ms 的偏差：pyserial 的 read(size) 会在
-                    # 一个**一次性**的超时预算里等到攒满 size 才返回（成功后不重置预算）。
-                    # 设备每 150 ms 只产出约 180 字节，4096 字节要 23 帧才凑得满，所以
-                    # 每次都必然等满 timeout=0.2 s 才返回，把攒下的 1–2 行一次性交给
-                    # 状态归约。表现就是"主机侧逐行到达间隔 p50 = 202 ms"（且 min≈0.02 ms
-                    # 是同一批里的第二行），而设备自报节拍是 150.04 ms、丢帧为 0。
-                    # 副作用不只是数字难看：面板最多滞后约 208 ms。
+                    # 这一行是修一个实测过的偏差：pyserial 的 read(size) 会在一个
+                    # **一次性**的超时预算里等到攒满 size 才返回（成功后不重置预算）。
+                    # 设备每帧只产出约 300 字节，4096 字节要十几帧才凑得满，所以每次都必然
+                    # 等满 timeout=0.2 s 才返回，把攒下的几行一次性交给状态归约。表现就是
+                    # "主机侧逐行到达间隔 p50 紧贴在 200 ms 上方"（min≈0.02 ms 是同一批里
+                    # 的第二行），而设备自报节拍稳定、丢帧为 0。
+                    # 副作用不只是数字难看：面板会因此滞后约一个超时预算。
                     #
                     # in_waiting 为 0 时读 1 字节：有数据立刻返回，没数据按 timeout 返回，
                     # 于是读取循环的节奏交给设备，而不是交给超时预算。
@@ -294,7 +294,7 @@ class SerialSource:
                         yield raw
                         continue
                     # 读超时（0.2 s）会回到这里。判定只看"开机以来有没有过数据"，
-                    # 所以录音时节拍从 150 ms 放宽到 250 ms 不会误触发这一条。
+                    # 所以录音时节拍放宽到 250 ms 不会误触发这一条。
                     if first_data_at is None and time.monotonic() - opened_at > self.no_data_timeout:
                         raise SourceError(self._explain_silence(port))
 

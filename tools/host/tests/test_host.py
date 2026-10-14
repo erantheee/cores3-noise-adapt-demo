@@ -284,7 +284,7 @@ def test_latency_missing_fields_are_reported() -> None:
     trimmed = (
         '{"type":"latency","frames":10,"total_p50_ms":1.0,"total_p95_ms":2.0,'
         '"overhead_mean_us":1.0,"overhead_max_us":2.0,"overhead_samples":10,'
-        '"stages":[{"stage":"capture","p50_ms":150.0,"p95_ms":151.0,"max_ms":152.0},'
+        '"stages":[{"stage":"capture","p50_ms":100.03,"p95_ms":100.04,"max_ms":100.05},'
         '{"stage":"transport","n":0,"p50_ms":0.0}]}'
     )
     parsed = parse_line(trimmed)
@@ -327,7 +327,10 @@ def test_latency_report() -> None:
     close(report.overhead_mean_us, 1.45, "打点自身开销均值")
     capture = report.stage("capture")
     check(capture is not None, "必须能取到 capture 阶段")
-    close(capture.p50_ms, 150.045, "采集间隔 p50 与文档一致", tolerance=0.01)
+    # 这份 fixture 是 2026-10-14 抓的**真机原文**，抓取时固件节拍还是 150 ms。
+    # 断言它、而不是断言当前节拍：这条测的是"解析器读得懂设备真正吐出来的字节"，
+    # 换固件不该让它变绿——真机换节拍后要重新抓一份，而不是改这里的数字。
+    close(capture.p50_ms, 150.045, "真机日志原文原样读出（150 ms 时期抓取）", tolerance=0.01)
     analyse = report.stage("analyse")
     close(analyse.p50_ms, 7.033, "24 频段分析 p50 与文档一致", tolerance=0.01)
     embed = report.stage("embed")
@@ -662,9 +665,22 @@ def test_mock_device_is_wire_compatible() -> None:
     check(snapshot["latency"] is not None, "模拟源要能产出 latency 汇总")
 
     # 硬上限：模拟值越界就等于在测试里纵容一个不该存在的状态。
+    # 上限用**实发**值（8.0），不是产品策略值（6.5）——固件末尾钳到 kDemoSpeechGainDb。
     for frame in [json.loads(line) for line in commands]:
-        check(frame["speech_gain_db"] <= MAX_SPEECH_GAIN_DB + 1e-9, "模拟增益不越上限")
-        check(abs(frame["noise_reduction_db"]) <= MAX_NOISE_REDUCTION_DB + 1e-9, "模拟降噪不越上限")
+        check(frame["schema"] == SCHEMA_VERSION, "模拟帧必须是当前 schema")
+        check(frame["speech_gain_db"] <= DEMO_SPEECH_GAIN_DB + 1e-9, "模拟增益不越实发上限")
+        check(frame["external_voice_gain_db"] <= DEMO_SPEECH_GAIN_DB + 1e-9, "模拟人声意图不越上限")
+        check("noise_reduction_db" not in frame, "模拟源不得再发已删除的降噪字段")
+        check(len(frame["eq_gain_db"]) == 24, "模拟帧必须带满 24 段调音")
+        # 四种模式各自的形状约束——模拟源最容易犯的错是"越大声抬越多"，
+        # 而 safety_hold 恰恰禁止正增益，这条断言就是挡它的。
+        if frame["mode"] == "SONG_EQ":
+            check(max(frame["eq_gain_db"]) <= 4.0 + 1e-9, "song_eq 的逐段建议不超过 4 dB")
+        elif frame["mode"] == "EXTERNAL_VOICE_INTENT":
+            check(abs(max(frame["eq_gain_db"]) - frame["external_voice_gain_db"]) < 0.2,
+                  "人声模式的曲线必须跟着标量走，不能一个动一个不动")
+        elif frame["mode"] in ("FLAT", "SAFETY_HOLD"):
+            check(max(frame["eq_gain_db"]) == 0.0, f"{frame['mode']} 不得给正增益")
         check(0 <= frame["media_percent"] <= 100, "模拟媒体音量在 0–100")
         check(frame["link"] == "simulated", "模拟源的 link 必须是 simulated")
 
@@ -938,7 +954,7 @@ def test_server_endpoints() -> None:
 def test_interval_stats_and_percentile() -> None:
     """主机侧到达间隔的数值本身要有断言。
 
-    文档里引用的"修复前 202 ms / 修复后 150 ms"就是这个统计算出来的；以前只断言了
+    README 里记的那次"主机侧间隔被读取粒度拖到 200 ms 上方"就是这个统计算出来的；以前只断言了
     key 存在，等于把最该被钉住的数字留空。
     """
     from host.state import _percentile
