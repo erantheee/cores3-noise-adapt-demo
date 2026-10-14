@@ -167,6 +167,10 @@ class SerialSource:
         self._resolved_port: str | None = None
         #: 只给测试用：注入一个假串口，好在不碰真设备的前提下验证重连与瞬态故障处理。
         self._serial_factory = serial_factory
+        #: 由外部（HTTP /api/stop）触发的停止请求。置位后读取循环退出并关闭连接，
+        #: 把串口让给 tools/record_from_device.py 这类需要独占的工具。
+        self.requested_stop = threading.Event()
+        self.close_connection = None  # type: ignore[assignment]
         #: 连接建立/关闭时各回调一次，由上位机用来把句柄交给回控出口。
         self.on_open: Callable[[object], None] | None = None
         self.on_close: Callable[[], None] | None = None
@@ -248,6 +252,7 @@ class SerialSource:
 
         try:
             connection = open_port()
+            self.close_connection = connection.close
         except serial.SerialException as exc:
             raise SourceError(self._explain_open_failure(port, exc)) from exc
 
@@ -268,7 +273,7 @@ class SerialSource:
 
             def chunks() -> Iterable[bytes]:
                 nonlocal first_data_at
-                while not stop.is_set():
+                while not stop.is_set() and not self.requested_stop.is_set():
                     # 只读"现在就有"的字节，而不是 request 4096 个。
                     #
                     # 这一行是修一个实测了 200 ms 的偏差：pyserial 的 read(size) 会在
@@ -298,12 +303,14 @@ class SerialSource:
             # record_from_device.py 都会开同一个口）。一个跑了几十分钟的会话不该被
             # 一次扰动终结，所以这里改成重连，并且把重连次数与错误次数都报到面板上——
             # 静默重连和不重连一样糟，因为看不出来数据中间断过。
-            while not stop.is_set():
+            while not stop.is_set() and not self.requested_stop.is_set():
                 try:
                     for line in iter_json_objects(chunks()):
-                        if stop.is_set():
+                        if stop.is_set() or self.requested_stop.is_set():
                             break
                         state.feed_line(line)
+                    if self.requested_stop.is_set():
+                        break
                 except SourceError:
                     state.set_connection(False, "串口读取中止")
                     raise
@@ -342,6 +349,8 @@ class SerialSource:
                 connection.close()
             except Exception:  # noqa: BLE001 - 关闭失败不该盖住真正的错误
                 pass
+            # 显式清掉句柄：回控线程可能正拿着一份引用，而 macOS 上 fd 不关就是端口不释放。
+            self.close_connection = None
 
     # ------------------------------------------------------------------ 报错措辞
 

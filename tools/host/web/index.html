@@ -183,6 +183,9 @@
         <button id="btn-rec-stop">停止</button>
         <span id="capture-text" class="sub">未在录音</span>
       </div>
+      <div class="row" style="margin-top:6px">
+        <button id="btn-release">释放串口（交给录音工具/刷机）</button>
+      </div>
       <div class="sub" id="capture-detail">—</div>
       <pre class="raw" id="capture-progress" style="margin-top:8px">—</pre>
       <div class="warnbox" style="margin-top:10px">
@@ -544,6 +547,22 @@ $("btn-rec-start").addEventListener("click", () => {
   sendCommand(seconds > 0 ? `rec start ${Math.floor(seconds)}` : "rec start");
 });
 $("btn-rec-stop").addEventListener("click", () => sendCommand("rec stop"));
+// 上位机独占串口时，record_from_device.py 与刷机都打不开端口。这个按钮把端口让出去，
+// 上位机随后退出——比让使用者去翻进程号好。
+$("btn-release").addEventListener("click", async () => {
+  const toast = $("toast");
+  toast.textContent = "正在释放串口…";
+  try {
+    const response = await fetch("/api/stop");
+    const payload = await response.json();
+    toast.textContent = payload.released_port
+      ? "串口已释放，上位机即将退出。现在可以跑录音工具或刷机了。"
+      : "已请求退出（当前数据源没有串口需要释放）";
+    toast.style.color = "#3ddc84";
+  } catch (error) {
+    toast.textContent = "上位机已退出（连接中断属正常）";
+  }
+});
 
 // 暴露给渲染校验（tools/host/tests/render_check.js）：那台脚本用 DOM 桩把 render()
 // 真跑一遍，断言"喂进真实快照时界面上会出现什么"。界面里唯一会算错的就是这一层。

@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import threading
 import time
@@ -131,11 +132,14 @@ class HostHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, handler, state: HostState, broadcaster: Broadcaster, writer=None):
+    def __init__(self, address, handler, state: HostState, broadcaster: Broadcaster, writer=None,
+                 releaser=None):
         super().__init__(address, handler)
         self.state = state
         self.broadcaster = broadcaster
         self.writer = writer
+        #: 可调用对象：释放串口（供 /api/stop 用）。
+        self.releaser = releaser
         self.started_at = time.monotonic()
 
 
@@ -153,6 +157,10 @@ class Handler(BaseHTTPRequestHandler):
     @property
     def state(self) -> HostState:
         return self.server.state  # type: ignore[attr-defined]
+
+    @property
+    def releaser(self):
+        return getattr(self.server, "releaser", None)
 
     def _send(self, status: int, body: bytes, content_type: str) -> None:
         self.send_response(status)
@@ -186,10 +194,30 @@ class Handler(BaseHTTPRequestHandler):
                     "uptime_s": snapshot["uptime_s"],
                 }
             )
+        elif path == "/api/stop":
+            # 释放串口并让进程退出。存在的理由很具体：tools/record_from_device.py 与刷机
+            # 都需要独占这个端口，而"上位机开着的时候录音工具打不开串口"是个卡人的死结。
+            # 面板上点一下就能让出来，比让使用者去找进程号好。
+            released = False
+            releaser = self.releaser
+            if releaser is not None:
+                try:
+                    released = bool(releaser())
+                except Exception as exc:  # noqa: BLE001
+                    self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                    return
+            self._send_json({"ok": True, "released_port": released, "note": "进程即将退出"})
+            threading.Thread(target=self._delayed_exit, daemon=True).start()
         elif path == "/events":
             self._serve_events()
         else:
             self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain; charset=utf-8")
+
+    @staticmethod
+    def _delayed_exit() -> None:
+        # 先让响应发出去，再退出——否则浏览器只会看到连接被重置。
+        time.sleep(0.3)
+        os._exit(0)
 
     def _serve_index(self) -> None:
         if not INDEX_FILE.exists():
@@ -317,8 +345,9 @@ def make_server(
     port: int,
     host: str = "127.0.0.1",
     writer=None,
+    releaser=None,
 ) -> HostHTTPServer:
-    return HostHTTPServer((host, port), Handler, state, broadcaster, writer)
+    return HostHTTPServer((host, port), Handler, state, broadcaster, writer, releaser)
 
 
 def pick_port(preferred: int, host: str = "127.0.0.1") -> int:

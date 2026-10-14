@@ -123,8 +123,30 @@ def main(argv: list[str] | None = None) -> int:
         source.on_open = writer.attach
         source.on_close = writer.detach
 
+    def release_port() -> bool:
+        """释放串口：把录音工具或刷机需要的独占权让出去。
+
+        只有 SerialSource 有端口可让；源线程会因此退出读取循环并 close()。macOS 上
+        "只是停线程"并不释放 fd，所以关闭这一步必须真做（sources.SerialSource 的 finally）。
+        """
+        if not isinstance(source, SerialSource):
+            return False
+        source.requested_stop.set()
+        # 等它真的关掉，最多 3 秒，然后把结果如实回报给调用者。
+        for _ in range(30):
+            if getattr(source, "close_connection", None) is None:
+                return True
+            time.sleep(0.1)
+        return False
+
     web_port = pick_port(args.web_port)
-    httpd = make_server(state, broadcaster, web_port, writer=writer if can_control else None)
+    httpd = make_server(
+        state,
+        broadcaster,
+        web_port,
+        writer=writer if can_control else None,
+        releaser=release_port,
+    )
     url = f"http://127.0.0.1:{web_port}/"
 
     if not args.quiet:
