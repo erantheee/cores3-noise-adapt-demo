@@ -7,3 +7,6 @@ sdkconfig
 __pycache__/
 *.pyc
 build-host-tests/
+记录/
+*.jsonl
+recordings/
