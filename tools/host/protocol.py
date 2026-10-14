@@ -155,6 +155,10 @@ class CaptureEvent:
     rate: int | None = None
     chunks: int | None = None
     samples: int | None = None
+    #: 录音期间每 5 秒一次的设备内诊断（state == "progress"）。键值随固件演进，
+    #: 所以按原样带出来给界面显示，而不是每个字段都建一个成员——固件加一个计数器时
+    #: 上位机不该因为不认识就把它丢掉。
+    progress: dict[str, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -387,12 +391,19 @@ def _parse_capture(payload: dict[str, Any]) -> ParsedLine:
     state = _as_str(payload, "state")
     if state is None:
         return ParsedLine(error=ParseError("capture 缺 state", ""), json_line=True)
-    if state not in ("started", "stopped", "finished", "encode_failed"):
+    if state not in ("started", "stopped", "finished", "encode_failed", "progress"):
         return ParsedLine(
             value=CaptureEvent(state=state),
             json_line=True,
             problems=(f"未知的录音状态 {state!r}",),
         )
+    progress = None
+    if state == "progress":
+        progress = {
+            key: value
+            for key, value in payload.items()
+            if key not in ("type", "state") and isinstance(value, int) and not isinstance(value, bool)
+        }
     return ParsedLine(
         value=CaptureEvent(
             state=state,
@@ -400,6 +411,7 @@ def _parse_capture(payload: dict[str, Any]) -> ParsedLine:
             rate=_as_int(payload, "rate"),
             chunks=_as_int(payload, "chunks"),
             samples=_as_int(payload, "samples"),
+            progress=progress,
         ),
         json_line=True,
     )

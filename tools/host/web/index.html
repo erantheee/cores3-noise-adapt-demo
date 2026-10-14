@@ -184,6 +184,7 @@
         <span id="capture-text" class="sub">未在录音</span>
       </div>
       <div class="sub" id="capture-detail">—</div>
+      <pre class="raw" id="capture-progress" style="margin-top:8px">—</pre>
       <div class="warnbox" style="margin-top:10px">
         这里的录音块<b>不会自动落盘</b>——落盘由 <code>tools/record_from_device.py</code> 负责，
         它同时报告丢块。上位机只负责把状态显示出来，避免两套写盘逻辑各记一半。
@@ -391,6 +392,29 @@ function renderCapture(s) {
   parts.push(`约 ${s.capture.audio_seconds} s`);
   if (s.capture.chunks_lost) parts.push(`丢块 ${s.capture.chunks_lost}`);
   $("capture-detail").textContent = parts.join(" · ");
+  // 设备自报的录音通路计数。它是"录音为什么不满"的唯一现场证据，所以照原样列出，
+  // 只做一行简短的字段说明，不替读者下结论。
+  const progress = s.capture.progress;
+  if (progress) {
+    const labels = {
+      ok_reads: "成功读取次数",
+      ok_read_ms: "成功读取总耗时 ms",
+      no_data_ms: "空读总耗时 ms",
+      analyse_ms: "分析总耗时 ms",
+      to_decimator: "送入抽取器的块数",
+      to_decimator_samples: "送入抽取器的样本数",
+      decimated: "抽取产出的样本数",
+      pending: "待发样本",
+      chunks: "已发块数",
+    };
+    const lines = Object.entries(progress).map(
+      ([key, value]) => `  ${(labels[key] || key).padEnd(22)} ${value}`
+    );
+    $("capture-progress").textContent =
+      `设备内诊断（${s.capture.progress_age_s}s 前）:\n` + lines.join("\n");
+  } else {
+    $("capture-progress").textContent = "—";
+  }
   $("btn-rec-stop").disabled = !s.connected || !s.recording;
   $("btn-rec-start").disabled = !s.connected;
 }

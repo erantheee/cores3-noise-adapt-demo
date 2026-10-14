@@ -202,6 +202,9 @@ class HostState:
         self.capture_seconds: int | None = None
         self.capture_rate: int | None = None
         self.capture_finished_chunks: int | None = None
+        #: 设备在录音期间每 5 秒报一次的内诊断（原样保留，界面负责翻译显示）。
+        self.capture_progress: dict[str, int] | None = None
+        self.capture_progress_at: float | None = None
         self.audio_samples: int = 0
         self.recording = False
 
@@ -413,6 +416,11 @@ class HostState:
                 if self.capture_rate
                 else "",
             )
+        elif event.state == "progress":
+            # 设备自报的录音通路计数。这不是给最终用户看的数字，而是"录音为什么不满"
+            # 的唯一现场证据：上位机只负责原样呈现，不做解释。
+            self.capture_progress = dict(event.progress or {})
+            self.capture_progress_at = time.monotonic()
         elif event.state == "encode_failed":
             self.recording = False
             self.capture_state = "encode_failed"
@@ -501,6 +509,10 @@ class HostState:
                 if self.capture_rate
                 else 0.0,
                 "finished_chunks": self.capture_finished_chunks,
+                "progress": self.capture_progress,
+                "progress_age_s": None
+                if self.capture_progress_at is None
+                else round(now - self.capture_progress_at, 1),
             },
             "frame": None
             if frame is None

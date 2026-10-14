@@ -40,7 +40,8 @@
 | 15 | **本仓库自带上位机** | ✅ **完成** | `tools/host/`，33 组 1055 条断言；真机已在跑 |
 | 16 | **串口 DTR 真 bug（三个工具读不到数据）** | ✅ **已修** | 实测 dtr=False 10 秒 0 字节 → dtr=True 10 秒 17115 字节 |
 | 17 | **口径：本机不做降噪，只有增益与调音** | ✅ **已落到上位机** | 面板删掉降噪格与曲线；固件侧的残留见第 19 项 |
-| 18 | 上位机回控（录音）可用性 | ✅ **已修（待刷机验证）** | 控制台改为内置 USB-Serial/JTAG，stdin 与 stdout 同链路 |
+| 18 | 上位机回控（录音）可用性 | ✅ **已修并真机验证** | 控制台改为内置 USB-Serial/JTAG；`rec start` 得到 `capture started` 回执 |
+| 18b | 设备端录音的数据速率 | ⏸ **未达标：约 3.3 k vs 目标 16 k 样本/秒** | 读取已不再空转（空读 27 万→758），但产出仍偏低；设备内诊断已接到面板上 |
 | 19 | 固件清理：`noise_reduction_db` 与屏幕「降噪」 | ✅ **已完成** | 字段从 `EarbudCommand` 删除；屏幕改「调音」；字库确认有 `调` `音` |
 | 20 | 调音（24 频段）进串口 JSON | ✅ **已完成** | `eq_gain_db` 随帧下发；一帧 301 B（约 2 kB/s） |
 
@@ -88,13 +89,23 @@ python3 tools/host/tests/test_host.py   # 33 组、1055 条断言，不需要设
 因为"设备报了一个越界的值"依然要能被发现。固件仍在算它、设备屏幕仍写着「降噪」，
 那是固件侧待清理的残留（第 19 项）。
 
-**录音回控（第 18 项）**：命令写得进串口，设备却没有任何反应。原因是固件主控制台是 UART0，
-而 `poll_console_command()` 用 `std::getchar()`——stdout 被路由到 USB 了，**stdin 没有**。
-修法已落到 `sdkconfig.defaults`：`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` +
-`CONFIG_ESP_CONSOLE_SECONDARY_UART0=y`。
+**录音回控（第 18 项）已通**：真机验证 `rec start 8` 得到
+`{"type":"capture","state":"started","seconds":8,"rate":16000}`，上位机按钮返回
+`{"ok":true,"acknowledged":true}`。根因是固件主控制台是 UART0，而 `poll_console_command()`
+用 `std::getchar()`——stdout 被路由到 USB 了，**stdin 没有**。修法：
+`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` + `CONFIG_ESP_CONSOLE_SECONDARY_NONE=y`。
 
-在固件刷进去之前，上位机仍然报降级：它会返回 `ok:false` 并在面板上写"回控处于降级状态"，
-不假装成功。
+**但录音的数据速率还没达标（第 18b 项）**：12 秒的录音只产出 2.5 秒音频（约 3.3 k 样本/秒，
+目标 16 k）。修好的部分有三处，都有真机实测支撑：
+
+| 缺陷 | 症状 | 现状 |
+|---|---|---|
+| `Decimator::process` 容量算少 1 个样本 | 第二块起永久返回 0，录音**完全空** | ✅ 已修，单测覆盖 |
+| 每个循环把整块喂给抽取器 | 录音里混入上一轮的陈旧样本 | ✅ 已修 |
+| 读取与块大小绑定 | 空读 27 万次/10 秒 | ✅ 已修，降到 758 次 |
+
+剩下的是产出速率。设备内诊断（`state:"progress"`）现在会走串口并在面板「设备录音」区显示，
+所以下一次不用再猜。
 
 ### 已修：串口 DTR（第 16 项）
 
@@ -154,11 +165,32 @@ python3 tools/voice_separability.py --enroll 甲A.wav 甲B.wav 甲C.wav \
 1. **`ows-earbud-demo` 是否要动**——那是你已排练过的 Mac 工程，我不会未经确认就改
 2. **录音素材由谁录**——近场信噪比与声纹可分性都必须由人在设备旁完成
 3. ~~固件侧清掉降噪残留~~ —— ✅ 已完成（第 19 项）
-4. ~~录音回控这条通路修不修~~ —— ✅ 已修，待刷机验证（第 18 项）
-5. **刷机窗口**：改动已落到源码，需要一个刷写窗口（设备独占、约 1 分钟）才能生效。
-   本机没有 IDF，构建方式见下
+4. ~~录音回控这条通路修不修~~ —— ✅ 已修并真机验证（第 18 项）
+5. **录音速率要不要继续追**（第 18b 项）——当前约 3.3 k / 16 k 样本每秒。
+   声纹与信噪比那两笔账都需要足量的真实录音，所以这个还没达标之前，`tools/record_from_device.py`
+   录出来的文件时长会是标称的约五分之一。
 
 ---
+
+## 固件构建（本机没有 ESP-IDF）
+
+本机**没有 ESP-IDF**（`idf.py` 不在 PATH，`~/esp` 是空的），且 GitHub/espressif 直连只有
+约 11 kB/s（清华、南大、SJTU、gitee 镜像均不可用），在本机装 IDF 不现实。因此固件改动走
+**CI 构建**，用 `gh` 取产物后本地刷写：
+
+```bash
+git push origin main                                  # 触发 CI（host-tests → firmware，约 7-8 分钟）
+gh run watch                                           # 或 gh run list
+gh run download <run-id> -n cores3-noise-adapt-firmware -D /tmp/ci
+python3 -m esptool --chip esp32s3 --port /dev/cu.usbmodem1101 --baud 460800 \
+    write-flash --flash-mode dio --flash-freq 80m --flash-size 16MB \
+    0x0 /tmp/ci/bootloader/bootloader.bin \
+    0x8000 /tmp/ci/partition_table/partition-table.bin \
+    0x10000 /tmp/ci/cores3_noise_adapt_demo.bin
+```
+
+回滚靠 `outputs/cores3-pre-demo-backup-20261013.bin`（16 MB 原厂整片备份，
+SHA256 前缀 `cfe4efba216fbe59`）。
 
 ## 已知的维护风险
 
