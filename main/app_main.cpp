@@ -217,11 +217,11 @@ void processing_task(void*) {
     // 10.2 k samples/s against the 48 k it is actually producing, so tying one block to one
     // read capped the recording at about a fifth of real time. Reads are decoupled from the
     // block size: take whatever arrives and hand a block on once one has accumulated.
-    constexpr std::size_t kStageCapacity = 2 * kReadBlockSamples;
-    constexpr std::size_t kStageHighWater = 3 * kReadBlockSamples;
-    // The move loops below top up the staging buffer with `while (staged < kStageCapacity)`.
-    // That only terminates because kStageCapacity is an exact multiple of kReadBlockSamples;
-    // a non-multiple would leave a remainder that never reaches the threshold.
+    // Staging has two independent consumers: the analysis window, and -- during a recording --
+    // the decimator. Four blocks of slack keeps a busy analysis pass from forcing audio to be
+    // dropped. Capacity must be a whole number of blocks, or the top-up loop leaves a remainder
+    // that never reaches the block threshold.
+    constexpr std::size_t kStageCapacity = 4 * kReadBlockSamples;
     static_assert(kStageCapacity % kReadBlockSamples == 0,
                   "staging capacity must be a whole number of blocks");
     auto* stage = static_cast<int16_t*>(
@@ -281,6 +281,8 @@ void processing_task(void*) {
     uint32_t capture_ok_reads = 0;
     uint32_t capture_blocks_to_decimator = 0;
     uint32_t capture_samples_to_decimator = 0;
+    uint32_t capture_dropped_window_full = 0;
+    uint32_t capture_max_filled = 0;
     uint32_t capture_ok_read_us = 0;
     uint32_t capture_analyse_us = 0;
     uint32_t capture_last_produced = 0;
@@ -328,8 +330,14 @@ void processing_task(void*) {
             if (staged >= kReadBlockSamples) break;
         }
 
-        // Move whole blocks from the staging buffer into the analysis window.
-        while (staged >= kReadBlockSamples && filled + kReadBlockSamples <= kFrameSamplesMax) {
+        // Top up the analysis window from staging. At most two blocks per pass: 2048 samples
+        // every 150 ms is all the 24-band analysis needs, and leaving the rest staged keeps the
+        // decimator fed. Staging keeps its remainder -- clearing it here is what made four blocks
+        // in every five disappear, because the window reaches its high-water mark during a
+        // recording while audio keeps arriving at 48 kHz.
+        for (int block = 0; block < 2; ++block) {
+            if (staged < kReadBlockSamples) break;
+            if (filled + kReadBlockSamples > kFrameSamplesMax) break;
             for (std::size_t i = 0; i < kReadBlockSamples; ++i) {
                 samples[filled + i] = stage[i];
             }
@@ -346,7 +354,7 @@ void processing_task(void*) {
         // Only drop the remainder when the window is genuinely near full; at 2048+ of 2560
         // there is still room for another block, and clearing there would throw away audio
         // on every pass.
-        if (filled >= kStageHighWater) staged = 0;
+        if (filled > capture_max_filled) capture_max_filled = static_cast<uint32_t>(filled);
         const int64_t now_us = esp_timer_get_time();
 
         if (poll_console_command()) {
@@ -365,6 +373,8 @@ void processing_task(void*) {
                 capture_ok_reads = 0;
                 capture_blocks_to_decimator = 0;
                 capture_samples_to_decimator = 0;
+                capture_dropped_window_full = 0;
+                capture_max_filled = 0;
                 capture_ok_read_us = 0;
                 capture_analyse_us = 0;
                 capture_last_produced = 0;
@@ -377,24 +387,41 @@ void processing_task(void*) {
         // below. Sitting behind that gate was a real bug: during capture the analysis
         // period is 300 ms while frames arrive every ~43 ms, so six frames in seven were
         // discarded and the recording came out with periodic holes.
-        // The capture path runs on every pass, deliberately outside the analysis cadence gate.
-        // `got` is non-zero only when a whole block moved into the window this pass, so a pass
-        // with no complete block is skipped instead of re-decimating stale samples.
-        if (g_record_seconds >= 0 && got > 0) {
-            const std::size_t produced = decimator.process(samples + filled - got, got, decimated,
-                                                           kDecimatedCapacity);
-            ++capture_blocks_to_decimator;
-            capture_samples_to_decimator += static_cast<uint32_t>(got);
-            capture_decimated_samples += static_cast<uint32_t>(produced);
-            capture_last_produced = static_cast<uint32_t>(produced);
-            for (std::size_t i = 0; i < produced; ++i) {
-                pending[pending_samples++] = decimated[i];
-                if (pending_samples == kCaptureChunkSamples) {
-                    emit_capture_chunk(pending, pending_samples, ++capture_sequence,
-                                       encode_buffer);
-                    pending_samples = 0;
+        // Capture runs on every pass, deliberately outside the analysis cadence gate, and it
+        // feeds the decimator straight from staging rather than from the analysis window.
+        //
+        // Routing it through the window tied the recording's throughput to the analysis's
+        // high-water mark: measured on device, 953 blocks read in 10 s (487936 samples, the full
+        // 48 kHz) against only 196 blocks reaching the decimator. Decimation needs whole blocks
+        // and no window state, so it consumes staging directly and staging keeps its remainder.
+        if (g_record_seconds >= 0) {
+            while (staged >= kReadBlockSamples) {
+                const std::size_t produced =
+                    decimator.process(stage, kReadBlockSamples, decimated, kDecimatedCapacity);
+                ++capture_blocks_to_decimator;
+                capture_samples_to_decimator += static_cast<uint32_t>(kReadBlockSamples);
+                capture_decimated_samples += static_cast<uint32_t>(produced);
+                capture_last_produced = static_cast<uint32_t>(produced);
+                const std::size_t remaining = staged - kReadBlockSamples;
+                for (std::size_t i = 0; i < remaining; ++i) {
+                    stage[i] = stage[kReadBlockSamples + i];
+                }
+                staged = remaining;
+                for (std::size_t i = 0; i < produced; ++i) {
+                    pending[pending_samples++] = decimated[i];
+                    if (pending_samples == kCaptureChunkSamples) {
+                        emit_capture_chunk(pending, pending_samples, ++capture_sequence,
+                                           encode_buffer);
+                        pending_samples = 0;
+                    }
                 }
             }
+        }
+
+        // Diagnostics and the recording deadline are outside the block loop on purpose: a
+        // recording that produces no complete block still has to report why, and still has to
+        // end -- the previous shape only checked the deadline when a block had been produced.
+        if (g_record_seconds >= 0) {
             if (now_us >= next_capture_diag_us) {
                 next_capture_diag_us = now_us + 5 * 1000 * 1000;
                 // `no_data` are reads that returned while the DMA had nothing ready; they are
@@ -405,6 +432,7 @@ void processing_task(void*) {
                             "\"reads\":%lu,\"no_data\":%lu,"
                             "\"ok_reads\":%lu,\"ok_read_ms\":%lu,\"no_data_ms\":%lu,"
                             "\"analyse_ms\":%lu,\"to_decimator\":%lu,\"to_decimator_samples\":%lu,"
+                            "\"drop_window_full\":%lu,\"max_filled\":%lu,"
                             "\"decimated\":%lu,\"last_produced\":%lu,"
                             "\"pending\":%lu,\"chunks\":%lu}\n",
                             static_cast<unsigned long>(capture_reads),
@@ -415,6 +443,8 @@ void processing_task(void*) {
                             static_cast<unsigned long>(capture_analyse_us / 1000),
                             static_cast<unsigned long>(capture_blocks_to_decimator),
                             static_cast<unsigned long>(capture_samples_to_decimator),
+                            static_cast<unsigned long>(capture_dropped_window_full),
+                            static_cast<unsigned long>(capture_max_filled),
                             static_cast<unsigned long>(capture_decimated_samples),
                             static_cast<unsigned long>(capture_last_produced),
                             static_cast<unsigned long>(pending_samples),
