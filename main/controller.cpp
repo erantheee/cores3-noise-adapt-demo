@@ -357,7 +357,9 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
             // frame, so the slew never settled and the media only reached 46% instead of the 25%
             // the policy asks for. Sustained speech is also the honest trigger: a one-frame blip
             // should not slam the bed to the floor.
-            const float duck_depth = clamp01(speech_run_ms_ / 600.0f);
+            // 深度斜坡：从"刚听到人声"到"压到底"用 250 ms。原来是 600 ms，叠加 slew 的
+            // 时间常数后实测要 700 ms 才压到 30%——用户的原话是"反应略慢"。
+            const float duck_depth = clamp01(speech_run_ms_ / 250.0f);
             media_target =
                 100.0f - (100.0f - static_cast<float>(kDemoMediaFloorPercent)) * duck_depth;
         } else if (command.tuning_mode == TuningMode::safety_hold) {
@@ -370,7 +372,12 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
         // release constant and only reached 36% after 1.8 s of continuous speech. The sibling OWS
         // demo's Beat 1 ramps 100 ms down / 500 ms up, and a demo that takes two seconds to
         // respond reads as "it did nothing".
-        speech_gain_db_ = slew(speech_gain_db_, speech_target, dt_ms, 300.0f, 900.0f);
+        //
+        // 2026-10-14 复测（阶跃实验，100 ms 拍）：检测本身只要 1 拍（100 ms），但攻击常数
+        // 300 ms 意味着到 90% 要 2.3τ ≈ 690 ms，实测第 7 拍才到 7.2 dB。用户反馈"反应略慢"
+        // 说的就是这一段。攻击收到 120 ms（到 90% 约 275 ms），释放保持慢一些（600 ms）——
+        // 释放太快会让增益在人声停顿处抖回去，反而更像坏了。
+        speech_gain_db_ = slew(speech_gain_db_, speech_target, dt_ms, 120.0f, 600.0f);
         media_percent_ = slew(media_percent_, media_target, dt_ms, 500.0f, 100.0f);
 
         const bool moving = std::abs(speech_target - speech_gain_db_) > 0.25f ||
