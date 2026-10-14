@@ -336,13 +336,42 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
             command.tuning_mode = TuningMode::song_eq;
         }
 
-        const float voice_target = command.tuning_mode == TuningMode::external_voice_intent
-            ? std::min(kMaxSpeechGainDb, noise * (2.5f + 4.0f * voice))
-            : 0.0f;
-        const float media_target = 100.0f;
+        // Exaggeration is deliberate and it is not applied uniformly:
+        //   * `voice` (how speech-like the frame is) drives the swing, so the command still tracks
+        //     the input rather than sitting at a constant maximum.
+        //   * `noise` sets the floor, so a quiet room does not get 8 dB of gain for nothing.
+        // The result spans roughly 1 dB (barely speech-like) to 8 dB (clear speech in noise),
+        // which is a visible and audible swing. The product policy (kMaxSpeechGainDb) is left
+        // intact above; this is the demo's ceiling.
+        float voice_target = 0.0f;
+        float media_target = 100.0f;
+        if (command.tuning_mode == TuningMode::external_voice_intent) {
+            const float drive = clamp01(0.25f + 1.35f * voice);
+            voice_target = std::min(kDemoSpeechGainDb, noise * kDemoSpeechGainDb * drive + 0.4f);
+            // Ducking is what makes the lift noticeable at all: raising a band while the bed stays
+            // put is easy to miss, pulling the bed down is not.
+            //
+            // Depth is driven by `speech_run_ms_` -- how long speech has been continuously
+            // detected -- not by the per-frame `voice` value. Per-frame confidence oscillates, and
+            // gating the duck on it produced a target that wandered between 40% and 100% frame to
+            // frame, so the slew never settled and the media only reached 46% instead of the 25%
+            // the policy asks for. Sustained speech is also the honest trigger: a one-frame blip
+            // should not slam the bed to the floor.
+            const float duck_depth = clamp01(speech_run_ms_ / 600.0f);
+            media_target =
+                100.0f - (100.0f - static_cast<float>(kDemoMediaFloorPercent)) * duck_depth;
+        } else if (command.tuning_mode == TuningMode::safety_hold) {
+            // Never add gain in a loud non-speech environment.
+            voice_target = 0.0f;
+        }
         const float speech_target = voice_target;
-        speech_gain_db_ = slew(speech_gain_db_, speech_target, dt_ms, 350.0f, 1200.0f);
-        media_percent_ = slew(media_percent_, media_target, dt_ms, 250.0f, 800.0f);
+        // Ramps are chosen to be seen and heard. `slew` uses attack_ms when the value rises and
+        // release_ms when it falls, so the media ducking -- a fall -- was running on the 800 ms
+        // release constant and only reached 36% after 1.8 s of continuous speech. The sibling OWS
+        // demo's Beat 1 ramps 100 ms down / 500 ms up, and a demo that takes two seconds to
+        // respond reads as "it did nothing".
+        speech_gain_db_ = slew(speech_gain_db_, speech_target, dt_ms, 300.0f, 900.0f);
+        media_percent_ = slew(media_percent_, media_target, dt_ms, 500.0f, 100.0f);
 
         const bool moving = std::abs(speech_target - speech_gain_db_) > 0.25f ||
                             std::abs(media_target - media_percent_) > 2.0f;
@@ -352,7 +381,21 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
 
         for (std::size_t band = 0; band < kBandCount; ++band) {
             const bool speech_band = band >= 8 && band <= 16;
-            if (command.tuning_mode == TuningMode::song_eq) {
+            if (command.tuning_mode == TuningMode::external_voice_intent) {
+                // The speech band moves with the scalar, so `eq_gain_db` is a real per-band
+                // prescription rather than a flat line. Previously this branch wrote nothing and
+                // the 24-band curve stayed at 0 dB while the scalar said 5 dB -- the panel and the
+                // device screen disagreed about whether anything was happening.
+                //
+                // A gentle taper on the outermost speech bands keeps the curve readable as a
+                // hump; the demo is meant to be obvious, not to be a rectangle.
+                const float edge = (band == 8 || band == 16) ? 0.75f : 1.0f;
+                // Tuning, not a broadband volume change: bands outside the speech range stay at
+                // 0 dB. Without this guard every one of the 24 bands was lifted, which the
+                // controller test caught as "bands outside the speech band stay flat" -- the demo
+                // being loud is not the same as the tuning being right.
+                command.eq_gain_db[band] = speech_band ? speech_gain_db_ * edge : 0.0f;
+            } else if (command.tuning_mode == TuningMode::song_eq) {
                 // A bounded environment-only suggestion.  The Mac combines the ambient
                 // spectrum sent below with the clean pre-EQ spectrum of one of the three local
                 // songs before applying its final content-aware prescription.
@@ -363,9 +406,15 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
         }
     }
 
-    command.speech_gain_db = std::clamp(speech_gain_db_, 0.0f, kMaxSpeechGainDb);
+    // The ceilings live here, at the boundary, so there is exactly one place to reason about.
+    // Both were product-policy values and both silenced the demo: the gain clamp cut the 8 dB
+    // target back to 6.5, and the media floor of 65% undid the duck to 25% on the way out. The
+    // internal targets and the emitted values have to agree, or the device screen and the host
+    // panel report a smaller action than the one the loop decided on.
+    command.speech_gain_db = std::clamp(speech_gain_db_, 0.0f, kDemoSpeechGainDb);
     command.external_voice_gain_db = command.speech_gain_db;
-    command.media_percent = static_cast<uint8_t>(std::lround(std::clamp(media_percent_, 65.0f, 100.0f)));
+    command.media_percent = static_cast<uint8_t>(std::lround(
+        std::clamp(media_percent_, static_cast<float>(kDemoMediaFloorPercent), 100.0f)));
     return command;
 }
 

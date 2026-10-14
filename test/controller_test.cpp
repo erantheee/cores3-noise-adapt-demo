@@ -43,26 +43,46 @@ int main() {
     check(voice.tuning_mode == TuningMode::external_voice_intent,
           "nearby speech selects external voice intent");
     check(voice.external_voice_gain_db > 3, "external voice intent carries bounded gain");
-    check(voice.external_voice_gain_db <= kMaxSpeechGainDb, "voice gain is bounded");
-    check(voice.media_percent == 100, "external voice intent does not pretend media ducking is voice gain");
+    check(voice.external_voice_gain_db <= kDemoSpeechGainDb, "voice gain stays under the demo ceiling");
+    check(voice.external_voice_gain_db == voice.speech_gain_db,
+          "external voice gain is the voice lift, not something else");
 
-    // Real-world voice gain is not a song EQ. AirPods Pro exposes no public DSP control,
-    // so this mode must leave the song prescription flat until the Mac relay path exists.
+    // Media ducking and voice lift are two separate fields and must not be conflated: the
+    // external-voice number is the lift only. Ducking is its own deliberate action, and for the
+    // demo it is what makes the lift noticeable -- raising a band over an unmoving bed is easy to
+    // miss. The sibling OWS demo's Beat 1 ships with the same 25% floor.
+    check(steady.media_percent == 100, "song EQ does not duck media");
+    check(voice.media_percent < 60, "external voice intent ducks the media bed");
+    check(voice.media_percent >= static_cast<int>(kDemoMediaFloorPercent) - 1,
+          "media ducking respects the floor");
+
+    // The demo has to be visible: the swing from a quiet frame to clear speech must be wide
+    // enough to see on the panel and hear in the room. This is the assertion that would have
+    // caught the original 5.4 dB ceiling looking like "nothing is happening".
+    check(voice.speech_gain_db - quiet.speech_gain_db > 5.0f,
+          "gain swing is wide enough to be visible");
+
+    // The 24-band curve must move with the scalar in this mode, or the panel shows a flat line
+    // while the scalar claims 5 dB and the two disagree. A gentle taper on the outer speech bands
+    // keeps it readable as a hump rather than a rectangle.
     std::size_t lifted = 0;
-    bool all_match = true;
+    bool matches_scalar = true;
     bool outside_is_flat = true;
     for (std::size_t band = 0; band < kBandCount; ++band) {
         const bool in_band = band >= kSpeechBandFirst && band <= kSpeechBandLast;
         if (in_band) {
             ++lifted;
-            if (voice.eq_gain_db[band] != 0.0f) all_match = false;
+            const float expected = band == kSpeechBandFirst || band == kSpeechBandLast
+                                       ? voice.speech_gain_db * 0.75f
+                                       : voice.speech_gain_db;
+            if (std::fabs(voice.eq_gain_db[band] - expected) > 0.05f) matches_scalar = false;
         } else if (voice.eq_gain_db[band] != 0.0f) {
             outside_is_flat = false;
         }
     }
     check(lifted == kSpeechBandLast - kSpeechBandFirst + 1, "test inspects the full speech band");
-    check(all_match, "external voice intent leaves speech-band song EQ flat");
-    check(outside_is_flat, "external voice intent leaves all song bands flat");
+    check(matches_scalar, "every speech band tracks the reported voice gain");
+    check(outside_is_flat, "bands outside the speech band stay flat");
 
     bool song_eq_has_gain = false;
     for (float gain : steady.eq_gain_db) song_eq_has_gain = song_eq_has_gain || gain > 0.05f;
@@ -77,7 +97,8 @@ int main() {
     for (int i = 0; i < 3; ++i) failed_frame = controller.update(frame(-20, 0, false), 100);
     check(failed_frame.state == AdaptState::mic_fault, "persistent invalid mic enters fault");
     check(failed_frame.speech_gain_db < voice.speech_gain_db, "fault fails toward zero gain");
-    check(failed_frame.media_percent == 100, "fault preserves media");
+    check(failed_frame.media_percent > voice.media_percent,
+          "fault restores the media bed it had ducked");
     check(failed_frame.eq_gain_db[kSpeechBandFirst] <
               steady.eq_gain_db[kSpeechBandFirst],
           "fault flattens the tuning");
@@ -89,6 +110,22 @@ int main() {
     bool safety_flat = true;
     for (float gain : loud.eq_gain_db) safety_flat = safety_flat && gain == 0.0f;
     check(safety_flat, "safety hold forbids positive EQ gain");
+
+    // The project has a standing rule: no test or demo parameter may exceed +10 dB of gain.
+    // The demo exaggeration is the most likely place to break it, so it is asserted rather than
+    // trusted to code review.
+    check(kDemoSpeechGainDb <= 10.0f, "demo gain stays inside the project-wide 10 dB ceiling");
+    check(kDemoSpeechGainDb > kMaxSpeechGainDb,
+          "the demo ceiling is deliberately above the product policy");
+    {
+        AdaptController loud_voice;
+        EarbudCommand worst;
+        for (int i = 0; i < 40; ++i) worst = loud_voice.update(frame(-20, 1.0f), 150);
+        check(worst.speech_gain_db <= 10.0f, "no frame may exceed the 10 dB ceiling");
+        for (std::size_t band = 0; band < kBandCount; ++band) {
+            check(worst.eq_gain_db[band] <= 10.0f, "no EQ band may exceed the 10 dB ceiling");
+        }
+    }
 
     check(std::string(adapt_state_name(AdaptState::adjusting)) == "ADJUSTING",
           "state names are stable protocol values");

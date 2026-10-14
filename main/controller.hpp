@@ -9,6 +9,22 @@ constexpr std::size_t kBandCount = 24;
 constexpr std::size_t kMaxAnalysisFrame = 4096;
 constexpr float kMaxSpeechGainDb = 6.5f;
 
+/// Demo exaggeration. The numbers above are the *product* policy: bounded, smooth, and chosen so
+/// a real listener is not startled. This instrument exists to answer a different question -- "is
+/// this闭-loop even happening, and how much is it doing?" -- and at 5.4 dB with a flat EQ the
+/// answer looked like "nothing". A demo has to be visible.
+///
+/// The ceilings are inherited from the user's standing rule for this project (no test may exceed
+/// +10 dB of gain) and from the measured OWS result in the sibling project (speech band +7.8 dB
+/// measured, +9.7 dB peak, hard constraint 10 dB). So:
+///   * gain swing 0 → kDemoSpeechGainDb (8.0 dB, inside the measured/verified range, 2 dB margin)
+///   * the same value is written into the speech bands of eq_gain_db, so the 24-band curve moves
+///     instead of staying flat -- previously the speech-likely branch left eq_gain_db at zero
+///   * media ducks to kDemoMediaFloorPercent (25%), which is the ducking depth the sibling demo's
+///     Beat 1 shipped with and is plainly audible
+constexpr float kDemoSpeechGainDb = 8.0f;
+constexpr uint8_t kDemoMediaFloorPercent = 25;
+
 enum class TuningMode : uint8_t {
     flat,
     song_eq,
