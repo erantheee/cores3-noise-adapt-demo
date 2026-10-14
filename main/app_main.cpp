@@ -245,27 +245,33 @@ void processing_task(void*) {
     std::size_t pending_samples = 0;
     int64_t capture_deadline_us = 0;  // 0 = capture until stopped
     int64_t last_control_us = esp_timer_get_time();
+    // Capture-path counters for the periodic diagnostic below. The first recording attempt
+    // produced one chunk of 170 samples in 15 seconds and the log said nothing about why,
+    // so the next failure has to be readable off the wire instead of re-derived.
+    uint32_t capture_reads = 0;
+    uint32_t capture_read_failures = 0;
+    uint32_t capture_decimated_samples = 0;
+    int64_t next_capture_diag_us = 0;
 
-    bool logged_first_capture_frame = false;
     std::size_t filled = 0;  // samples currently in the analysis window
     while (true) {
-        // Advance by what the codec actually delivered.
+        // esp_codec_dev_read returns a *status code*, not a byte count:
+        //   ESP_CODEC_DEV_OK (0) on success, negative ESP_CODEC_DEV_* on failure.
+        // Reading it as a count is what silenced this firmware once already -- the check
+        // `bytes > 0` was false on every successful read, so the window never filled and no
+        // frame was ever emitted.
         //
-        // The previous revision called esp_codec_dev_read for kReadBlockSamples and then did
-        // `filled += kReadBlockSamples` unconditionally: a codec read is a partial read, so
-        // the analysis window advanced at a rate the hardware never delivered, and the
-        // decimator was handed a full 512-sample block every pass whether or not those samples
-        // were new. Measured on device: a 15-second recording produced one chunk of 170
-        // samples -- exactly one block's worth of decimation -- while the loop held its
-        // 250 ms cadence.
+        // On success the block was filled in full (the driver reads exactly `len`), so the
+        // window advances by the whole block. That is the original behaviour and it is right;
+        // what was wrong before was feeding the decimator a full block *unconditionally*,
+        // which is handled at the capture call site below.
         esp_err_t read_result = ESP_OK;
         std::size_t got = 0;
         if (filled + kReadBlockSamples <= kFrameSamplesMax) {
-            const int bytes = esp_codec_dev_read(microphone, read_block,
-                                                 kReadBlockSamples * sizeof(int16_t));
-            if (bytes > 0) {
-                got = static_cast<std::size_t>(bytes) / sizeof(int16_t);
-                if (got > kReadBlockSamples) got = kReadBlockSamples;
+            read_result = esp_codec_dev_read(microphone, read_block,
+                                             kReadBlockSamples * sizeof(int16_t));
+            if (read_result == ESP_OK) {
+                got = kReadBlockSamples;
                 for (std::size_t i = 0; i < got; ++i) {
                     samples[filled + i] = read_block[i];
                 }
@@ -283,22 +289,28 @@ void processing_task(void*) {
                 pending_samples = 0;
                 capture_deadline_us =
                     requested > 0 ? now_us + static_cast<int64_t>(requested) * 1000000 : 0;
-                logged_first_capture_frame = false;
+                capture_reads = 0;
+                capture_read_failures = 0;
+                capture_decimated_samples = 0;
+                next_capture_diag_us = now_us + 5 * 1000 * 1000;
             }
         }
+        if (g_record_seconds >= 0 && got == 0) ++capture_read_failures;
 
         // Capture runs on EVERY frame, deliberately outside the analysis cadence gate
         // below. Sitting behind that gate was a real bug: during capture the analysis
         // period is 300 ms while frames arrive every ~43 ms, so six frames in seven were
         // discarded and the recording came out with periodic holes.
-        // A zero-byte read is not a microphone fault and must not stop the loop: the timing
-        // above, the console poll and the capture deadline all have to keep running. Only the
-        // work that needs samples is guarded by `got > 0`.
+        // The capture path runs on every pass, deliberately outside the analysis cadence gate.
+        // Only a failed read skips it: a failed read delivers no fresh samples, and decimating
+        // the stale block is what made recordings contain leftovers.
         if (g_record_seconds >= 0 && got > 0) {
             // Feed only the samples that were actually read: passing the whole block here is
             // what made the recording contain stale audio.
+            ++capture_reads;
             const std::size_t produced = decimator.process(read_block, got, decimated,
                                                            kReadBlockSamples / capture::kDecimation + 1);
+            capture_decimated_samples += static_cast<uint32_t>(produced);
             for (std::size_t i = 0; i < produced; ++i) {
                 pending[pending_samples++] = decimated[i];
                 if (pending_samples == kCaptureChunkSamples) {
@@ -307,15 +319,16 @@ void processing_task(void*) {
                     pending_samples = 0;
                 }
             }
-            if (!logged_first_capture_frame && produced > 0) {
-                // One line per recording, so a future capture problem is diagnosable from the
-                // log instead of from a 15-second file that turns out to be empty.
-                logged_first_capture_frame = true;
-                std::printf("{\"type\":\"capture\",\"state\":\"first_frame\","
-                            "\"read_samples\":%lu,\"decimated\":%lu,\"pending\":%lu}\n",
-                            static_cast<unsigned long>(got),
-                            static_cast<unsigned long>(produced),
-                            static_cast<unsigned long>(pending_samples));
+            if (now_us >= next_capture_diag_us) {
+                next_capture_diag_us = now_us + 5 * 1000 * 1000;
+                std::printf("{\"type\":\"capture\",\"state\":\"progress\","
+                            "\"reads\":%lu,\"failed_reads\":%lu,"
+                            "\"decimated\":%lu,\"pending\":%lu,\"chunks\":%lu}\n",
+                            static_cast<unsigned long>(capture_reads),
+                            static_cast<unsigned long>(capture_read_failures),
+                            static_cast<unsigned long>(capture_decimated_samples),
+                            static_cast<unsigned long>(pending_samples),
+                            static_cast<unsigned long>(capture_sequence));
             }
             if (capture_deadline_us != 0 && now_us >= capture_deadline_us) {
                 if (pending_samples > 0) {
