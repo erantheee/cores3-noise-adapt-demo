@@ -1,0 +1,13 @@
+{
+  "_说明": "Mac 播放器要播的本地曲目。先按两首做，第三首直接往 tracks 里加一项即可，播放器与面板不需要改。path 必须是在这台 Mac 上真实存在的绝对路径。",
+  "tracks": [
+    {
+      "title": "渡口",
+      "path": "/Users/eranthe/Desktop/01.渡口.flac"
+    },
+    {
+      "title": "Sweet Child O' Mine",
+      "path": "/Users/eranthe/Desktop/02._SWEET_CHILD_OF_MINE_-_GUN_N_ROSES_(mp3.pm).mp3"
+    }
+  ]
+}

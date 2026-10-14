@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[2]  # tools/
 sys.path.insert(0, str(ROOT))
 
 from host.protocol import (  # noqa: E402
+    DEMO_SPEECH_GAIN_DB,
     MAX_NOISE_REDUCTION_DB,
     MAX_SPEECH_GAIN_DB,
     SCHEMA_VERSION,
@@ -217,13 +218,24 @@ def test_command_frame_noise_reduction_sign() -> None:
     )
     check(bool(over.problems), "降噪超过硬上限必须报异常")
 
-    over_gain = parse_line(
+    # 校验线是**实发**上限（8.0），不是产品策略值（6.5）。固件末尾把值钳到
+    # kDemoSpeechGainDb，所以 6.5…8.0 之间的帧是正常帧；旧断言拿 6.5 当上限，
+    # 会把整个 demo 的正常动作报成异常（2026-10-14 对齐文档时发现）。
+    policy_only = parse_line(
         '{"type":"earbud_command","schema":1,"sequence":1,"timestamp_ms":0,'
-        f'"speech_gain_db":{MAX_SPEECH_GAIN_DB + 0.1},"noise_reduction_db":0,'
+        f'"speech_gain_db":{MAX_SPEECH_GAIN_DB + 0.5},"noise_reduction_db":0,'
         '"media_percent":100,"state":"OBSERVING","environment":"QUIET",'
         '"confidence":0.5,"link":"simulated"}'
     )
-    check(bool(over_gain.problems), "人声增益超过 +6.5 dB 硬上限必须报异常")
+    check(not policy_only.problems, "6.5…8.0 之间的增益是固件正常输出，不得报异常")
+
+    over_gain = parse_line(
+        '{"type":"earbud_command","schema":1,"sequence":1,"timestamp_ms":0,'
+        f'"speech_gain_db":{DEMO_SPEECH_GAIN_DB + 0.1},"noise_reduction_db":0,'
+        '"media_percent":100,"state":"OBSERVING","environment":"QUIET",'
+        '"confidence":0.5,"link":"simulated"}'
+    )
+    check(bool(over_gain.problems), "人声增益超过 +8.0 dB 实发上限必须报异常")
 
 
 def test_command_frame_rejects_bad_input() -> None:
@@ -419,15 +431,36 @@ def test_staleness_distinguishes_quiet_from_dead() -> None:
     """
     state = HostState(source="serial")
     state.set_connection(True, "/dev/cu.usbmodem1101")
-    check(state.is_stale(), "刚连上还没有任何帧，必须判为陈旧")
-    eq(state.age_ms(), None, "没有任何帧时没有年龄")
+    # 旧实现没有宽限期：从未收到帧时 `is_stale()` 直接返回 `connected`，于是每次启动面板
+    # 都会先弹一次假告警「已连接但 ? ms 没有收到任何帧」（数字位因为 age_ms() 返回 None
+    # 只能显示 "?"）——两个字段的判据互相矛盾。2026-10-14 用户实测撞到。
+    check(not state.is_stale(), "刚连上还没有任何帧，不得立刻报陈旧")
+    check(not state.is_silent(), "刚连上不算静默")
+    check(state.age_ms() is not None, "没有帧时年龄必须从连接那一刻算起，不能是 None")
+    check(state.is_stale(time.monotonic() + 11.0), "连接后持续 10 秒以上没帧才判为陈旧")
+    check(state.age_ms(time.monotonic() + 11.0) > 10_000, "陈旧时年龄要是个数字，界面才有得显示")
 
     state.feed_line('{"type":"earbud_command","sequence":1,"timestamp_ms":1,"speech_gain_db":0,'
                     '"noise_reduction_db":0,"media_percent":100,"state":"OBSERVING",'
                     '"environment":"QUIET","confidence":0.5,"link":"simulated"}')
     check(not state.is_stale(), "刚收到帧就不该判为陈旧")
+    check(not state.is_silent(), "刚收到帧不算静默")
+    # 5.9 秒静默：够不到"设备可能停了"，但绝不能写成"数据在流"。旧实现的告警区在这种
+    # 空档里写的就是「数据在流，未发现异常。」——那句话正是用户报的 bug。
     check(not state.is_stale(time.monotonic() + 5.0), "短暂 5 秒停顿不误报设备死亡")
+    check(state.is_silent(time.monotonic() + 5.0), "静默超过阈值必须报静默，不能说数据在流")
     check(state.is_stale(time.monotonic() + 11.0), "持续 10 秒以上没帧才判为陈旧")
+
+    # 静默要单独记账。旧实现只在 0 < 间隔 < 5000 ms 时取样，≥5 秒的空档被直接丢掉，
+    # 于是面板上 max 仍显示 101 ms，"上位机自己跟丢了 5.9 秒"完全看不见。
+    state.last_frame_at = time.monotonic() - 5.9413
+    state.feed_line('{"type":"earbud_command","sequence":2,"timestamp_ms":2,"speech_gain_db":0,'
+                    '"noise_reduction_db":0,"media_percent":100,"state":"OBSERVING",'
+                    '"environment":"QUIET","confidence":0.5,"link":"simulated"}')
+    stats = state.snapshot()["stats"]
+    check(stats["silences"] == 1, "5.9 秒静默必须单独记账，不能消失在统计里")
+    check(5900 <= stats["max_silence_ms"] <= 6000, "最长静默要能被面板读出来")
+    check(stats["interval"]["max"] < 1000, "静默不得污染节拍分布（p50/max）")
 
     # 录音时设备把节拍放宽到 250 ms，判陈旧的窗口要跟着放宽，否则界面会误报。
     state.feed_capture(CaptureEvent(state="started", seconds=10, rate=16000))
@@ -1114,6 +1147,56 @@ def test_server_refuses_control_without_device() -> None:
         thread.join(timeout=3)
 
 
+class _FakePlayerProcess:
+    """够用的子进程桩：PlayerService.available 只看 poll()。"""
+
+    def poll(self):  # noqa: ANN201 - 与 subprocess.Popen 同形
+        return None
+
+
+def test_player_decision_path_is_not_silently_dropped() -> None:
+    """S3 的决策必须真的下发到播放器——这条通路静默失败过一次。
+
+    当时 `eq` 不在命令白名单里：`apply_decision` 每 100 ms 抛 PlayerError、又被 `except`
+    吞掉，现象是**面板全绿而两条曲线恒为 0**。所以这里两头都要钉住：
+      * 面板不能自己发 `eq`（曲线形状必须来自设备那一帧，这是"谁在做决策"的唯一变量）；
+      * 上位机自己必须发得出去，且失败原因要留下来给人看。
+    """
+    from host.player import PlayerError, PlayerService
+
+    service = PlayerService(autostart=False)
+    try:
+        service.command("eq", bands=[0.0] * 24, depth=2.5, media_percent=100)
+        check(False, "面板不得能自己下发 eq")
+    except PlayerError:
+        check(True, "面板不得能自己下发 eq（形状只能来自设备）")
+
+    sent: list[dict] = []
+    service._process = _FakePlayerProcess()  # type: ignore[assignment]
+    service._send = lambda payload: sent.append(payload)  # type: ignore[assignment]
+
+    bands = [0.0] * 24
+    bands[8:17] = [5.0] * 9
+    check(service.apply_decision(bands, 80.0), "决策要能真的发出去")
+    eq(len(sent), 1, "只发一条 eq")
+    eq(sent[0]["cmd"], "eq", "发的是 eq 命令")
+    eq(len(sent[0]["bands"]), 24, "eq 必须带满 24 段")
+    eq(sent[0]["bands"][8], 5.0, "频段值原样透传")
+    eq(sent[0]["depth"], service.depth, "eq 带处方深度")
+    eq(sent[0]["media_percent"], 80.0, "eq 带媒体音量")
+    eq(service.last_error, "", "成功时不得留下错误")
+
+    check(not service.apply_decision(bands, 80.0), "同一形状在节流窗口内不得重复下发")
+
+    def boom(payload: dict) -> None:
+        raise PlayerError("串口断了")
+
+    service._send = boom  # type: ignore[assignment]
+    check(not service.apply_decision([1.0] * 24, 100.0), "下发失败必须返回 False")
+    check("串口断了" in service.last_error, "失败原因必须留下来给人看，不能吞掉")
+    check("串口断了" in service.snapshot()["last_error"], "失败原因要进快照，面板才看得见")
+
+
 def main() -> int:
     tests = [
         test_d2_matches_c_printf,
@@ -1150,6 +1233,7 @@ def main() -> int:
         test_web_assets_contract,
         test_server_endpoints,
         test_interval_stats_and_percentile,
+        test_player_decision_path_is_not_silently_dropped,
         test_control_acknowledgement_is_tracked,
         test_serial_source_survives_transient_read_errors,
         test_sse_endpoint_streams,

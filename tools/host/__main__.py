@@ -19,6 +19,7 @@ import time
 import webbrowser
 
 from .mac_audio import default_output, route_command
+from .player import DEFAULT_VOLUME_PERCENT, PlayerService
 from .server import Broadcaster, make_server, pick_port
 from .sources import (
     MissingDependency,
@@ -100,6 +101,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="USB 设备树里没有 Espressif 设备时也照样打开指定端口（默认拒绝，避免读到陈旧节点）",
     )
     parser.add_argument("--quiet", action="store_true", help="不打印启动说明")
+    parser.add_argument(
+        "--no-player",
+        action="store_true",
+        help="不起 Mac 播放与执行端（tools/player）；默认会起，面板上据此出现播放控件",
+    )
+    parser.add_argument(
+        "--player-volume",
+        type=float,
+        default=DEFAULT_VOLUME_PERCENT,
+        help=f"播放器音量百分比，默认 {DEFAULT_VOLUME_PERCENT:.0f}（刻意调低：第一次出声不该吓人）",
+    )
     return parser.parse_args(argv)
 
 
@@ -141,12 +153,22 @@ def main(argv: list[str] | None = None) -> int:
         return False
 
     web_port = pick_port(args.web_port)
+
+    # Mac 播放与执行端。它不属于"数据源"，而是执行端：S3 决策 → 这里落到音频上。
+    # 起不来（没构建、缺曲库）不算致命错误——面板照样跑，但会把原因写在播放卡片里，
+    # 而不是让播放按钮看起来能用。
+    player_service = None
+    if not args.no_player:
+        player_service = PlayerService(volume_percent=args.player_volume)
+        state.attach_player(player_service)
+
     httpd = make_server(
         state,
         broadcaster,
         web_port,
         writer=writer if can_control else None,
         releaser=release_port,
+        player=player_service,
     )
     url = f"http://127.0.0.1:{web_port}/"
 
@@ -205,14 +227,25 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_browser and not args.quiet:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
 
-    # 主线程只做一件事：按节拍发布快照。没有新帧时也发，界面才能区分"设备停了"与
-    # "浏览器和主机之间的连接断了"——这两种情况的处置完全不同。
+    # 主线程只做一件事：按节拍发布快照，并把最新一帧的决策下发给 Mac 执行端。
+    # 没有新帧时也发快照，界面才能区分"设备停了"与"浏览器和主机之间的连接断了"——
+    # 这两种情况的处置完全不同。
     while not stop.is_set():
         broadcaster.publish()
+        if player_service is not None:
+            # 决策的形状永远来自 S3，这里只是把它搬到音频上；apply_decision 内部有节流。
+            # 旧固件不发 eq_gain_db（tuning 为 None）时下发全平直：**没有建议就该什么都不做**，
+            # 而不是把上一次的形状留在曲子上。
+            latest = state.latest
+            if latest is not None:
+                bands = list(latest.tuning.band_gain_db) if latest.tuning else [0.0] * 24
+                player_service.apply_decision(bands, float(latest.media_percent))
         time.sleep(0.1)
 
     httpd.shutdown()
     source_thread.join(timeout=3.0)
+    if player_service is not None:
+        player_service.stop()
 
     if thread_error:
         error = thread_error[0]

@@ -33,8 +33,13 @@ from typing import Any, Iterable
 SCHEMA_VERSION = 2
 SUPPORTED_SCHEMA_VERSIONS = (1, 2)
 
-#: 固件侧的硬上限，与 main/controller.hpp 保持一致。
+#: 固件侧的**产品策略**上限（main/controller.hpp 的 kMaxSpeechGainDb）。
+#: 注意：固件实际下发的值被钳到 demo 上限，不是这一个——见下面那个常量。
 MAX_SPEECH_GAIN_DB = 6.5
+#: 固件**实际下发**的上限（main/controller.hpp 的 kDemoSpeechGainDb，末尾
+#: `std::clamp(speech_gain_db_, 0.0f, kDemoSpeechGainDb)`）。校验必须用它：
+#: 按 6.5 校验会把每一帧正常的 8 dB 帧标成"超出硬上限"，把一个正常动作报成异常。
+DEMO_SPEECH_GAIN_DB = 8.0
 MAX_NOISE_REDUCTION_DB = 8.0
 
 #: 固件侧录音输出参数，与 capture::kOutputRate / kCaptureChunkSamples 一致。
@@ -275,11 +280,16 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
     elif schema not in SUPPORTED_SCHEMA_VERSIONS:
         problems.append(f"schema={schema} 不在支持范围 {SUPPORTED_SCHEMA_VERSIONS}")
 
-    if speech_gain > MAX_SPEECH_GAIN_DB + 1e-6:
-        problems.append(f"人声增益 {speech_gain:+.2f} dB 超过硬上限 +{MAX_SPEECH_GAIN_DB} dB")
+    # 校验用**实发**上限（8.0），不是产品策略值（6.5）：固件末尾把值钳到 kDemoSpeechGainDb，
+    # 所以 8.0 才是正常帧。按 6.5 校验的话，每一帧人声意图都会被标成"超出硬上限"。
+    if speech_gain > DEMO_SPEECH_GAIN_DB + 1e-6:
+        problems.append(
+            f"人声增益 {speech_gain:+.2f} dB 超过固件实发上限 +{DEMO_SPEECH_GAIN_DB} dB"
+            f"（产品策略值 +{MAX_SPEECH_GAIN_DB} dB）"
+        )
     if speech_gain < -1e-6:
         problems.append(
-            f"人声增益 {speech_gain:+.2f} dB 为负数（固件钳在 0…+{MAX_SPEECH_GAIN_DB} dB）"
+            f"人声增益 {speech_gain:+.2f} dB 为负数（固件钳在 0…+{DEMO_SPEECH_GAIN_DB} dB）"
         )
     # noise_reduction_db 是"降噪量的大小"，不是负值偏移。固件的钳位是
     # std::clamp(noise_reduction_db_, 0.0f, kMaxNoiseReductionDb)（main/controller.cpp:307），
@@ -300,8 +310,8 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
     ambient = _parse_float_array(payload, "ambient_band_dbfs")
     if schema >= 2 and external_voice_gain is None:
         problems.append("v2 帧缺 external_voice_gain_db")
-    if external_voice_gain is not None and not 0.0 <= external_voice_gain <= MAX_SPEECH_GAIN_DB:
-        problems.append(f"现实人声增益 {external_voice_gain:+.2f} dB 越界")
+    if external_voice_gain is not None and not 0.0 <= external_voice_gain <= DEMO_SPEECH_GAIN_DB:
+        problems.append(f"现实人声增益 {external_voice_gain:+.2f} dB 越界（合法 0…{DEMO_SPEECH_GAIN_DB}）")
     if not 0 <= media_percent <= 100:
         problems.append(f"媒体音量 {media_percent}% 超出 0–100")
     if not 0.0 <= confidence <= 1.0:

@@ -25,20 +25,27 @@ constexpr std::size_t kFrameSamples = 2048;
 /// Samples requested per hardware read. This is the quantisation step of the control
 /// cadence, because the cadence test can only run once a read returns.
 ///
-/// It used to equal kFrameSamples, which put the measured loop period at 170 ms against a
-/// 150 ms target: the deadline is always crossed part-way through a read, so the period
-/// overshoots by half a read on average, and half of 42.7 ms is 21 ms. Measured on device,
-/// 150 + 21 = 171 ms, which is exactly what the report showed. A smaller block cuts the
-/// overshoot proportionally; 512 samples is 10.7 ms, so the period lands near 155 ms.
+/// It used to equal kFrameSamples, which put the measured loop period at 170 ms against the
+/// 150 ms target of that revision: the deadline is always crossed part-way through a read, so
+/// the period overshoots by half a read on average, and half of 42.7 ms is 21 ms. Measured on
+/// device, 150 + 21 = 171 ms, which is exactly what the report showed. A smaller block cuts the
+/// overshoot proportionally; 512 samples is 10.7 ms, so half a read costs about 5 ms -- the
+/// overshoot shrank, it did not disappear, which is why the measured period stays a hair above
+/// whatever target it is given. That target is kControlPeriodMs below, and it is no longer
+/// 150 ms.
 constexpr std::size_t kReadBlockSamples = 512;
 /// Largest analysis frame the accumulator can hold.
 constexpr std::size_t kFrameSamplesMax = kFrameSamples + kReadBlockSamples;
+/// What the control loop waits for between decisions. It was 150 ms; commit 4308366 brought it
+/// to 100 ms, and the reasoning above is unaffected -- only the number the overshoot is measured
+/// against.
 constexpr float kControlPeriodMs = 100.0f;
 /// During capture the analysis cadence is relaxed. The capture path costs a decimation
 /// plus a base64 encode and a console write per chunk, so the two must not both run flat
 /// out. 250 ms still resolves a change of environment, and it keeps the instrumentation
-/// inside its 1%-of-budget check: the probe plus the analysis of one 2048-sample frame
-/// costs on the order of 10-20 ms, which is under 8% of 250 ms rather than 13% of 150 ms.
+/// modest: the probe plus the analysis of one 2048-sample frame costs on the order of
+/// 10-20 ms, which is under 10% of 250 ms. On device the analysis itself measures 7.03 ms p50
+/// (see README), so 10-20 ms is the pessimistic end of that estimate, not the observed one.
 constexpr float kCapturePeriodMs = 250.0f;
 /// Samples accumulated before a chunk is sent: 1024 at 16 kHz is 64 ms, which is exactly
 /// three 2048-sample input frames at the 3:1 decimation, so blocks line up with no

@@ -10,3 +10,5 @@ build-host-tests/
 记录/
 *.jsonl
 recordings/
+# Mac 播放器的编译产物（源码是 tools/player/player.swift，用 sh tools/player/build.sh 生成）
+tools/player/player

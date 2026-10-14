@@ -13,7 +13,8 @@ KILL=0
 [ "${1:-}" = "--kill" ] && KILL=1
 
 if [ ! -e "$PORT" ]; then
-    echo "端口不存在: $PORT（设备没插，或编号变了：ls /dev/cu.usb*）"
+    echo "端口不存在（设备没插，或编号变了：ls /dev/cu.usb*）"
+    echo "  找过的路径：$PORT"
     exit 0
 fi
 

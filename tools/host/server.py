@@ -29,6 +29,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from .player import PlayerError
 from .state import HostState
 
 WEB_ROOT = Path(__file__).resolve().parent / "web"
@@ -133,13 +134,16 @@ class HostHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
     def __init__(self, address, handler, state: HostState, broadcaster: Broadcaster, writer=None,
-                 releaser=None):
+                 releaser=None, player=None):
         super().__init__(address, handler)
         self.state = state
         self.broadcaster = broadcaster
         self.writer = writer
         #: 可调用对象：释放串口（供 /api/stop 用）。
         self.releaser = releaser
+        #: Mac 播放与执行端（tools/host/player.py）。为 None 表示本次没启用播放器，
+        #: 面板上的播放控件要明确禁用而不是假装点过了。
+        self.player = player
         self.started_at = time.monotonic()
 
 
@@ -258,8 +262,58 @@ class Handler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------------ POST
 
+    def _read_json_body(self) -> dict[str, Any] | None:
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b""
+        try:
+            payload = json.loads(raw.decode("utf-8") or "{}")
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._send_json({"ok": False, "error": "请求体不是合法 JSON"}, HTTPStatus.BAD_REQUEST)
+            return None
+        if not isinstance(payload, dict):
+            self._send_json({"ok": False, "error": "请求体必须是 JSON 对象"}, HTTPStatus.BAD_REQUEST)
+            return None
+        return payload
+
+    def _handle_player(self) -> None:
+        """Mac 播放与执行端的回控。与设备回控同一条原则：**白名单，不是通用终端**。
+
+        面板上只有播放/暂停、切曲、音量、处方深度这几个动作，所以这里只放行这几个。
+        播放器没启用或没构建出来时明确拒绝并带回原因——按钮"点过了"但什么都没发生，
+        是这块面板最不该有的谎。
+        """
+        player = getattr(self.server, "player", None)
+        if player is None:
+            self._send_json(
+                {"ok": False, "error": "本次运行没有启用 Mac 播放器（用 --no-player 起的）"},
+                HTTPStatus.CONFLICT,
+            )
+            return
+        payload = self._read_json_body()
+        if payload is None:
+            return
+        command = payload.pop("cmd", None)
+        if not isinstance(command, str):
+            self._send_json({"ok": False, "error": "缺少 cmd 字段"}, HTTPStatus.BAD_REQUEST)
+            return
+        try:
+            if command == "depth":
+                result = player.set_depth(float(payload.get("depth", player.depth)))
+            else:
+                result = player.command(command, **payload)
+        except PlayerError as exc:
+            self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        except (TypeError, ValueError) as exc:
+            self._send_json({"ok": False, "error": f"参数不合法：{exc}"}, HTTPStatus.BAD_REQUEST)
+            return
+        self._send_json({"ok": True, "result": result, "player": player.snapshot()})
+
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0]
+        if path == "/api/player":
+            self._handle_player()
+            return
         if path != "/api/command":
             self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain; charset=utf-8")
             return
@@ -346,8 +400,9 @@ def make_server(
     host: str = "127.0.0.1",
     writer=None,
     releaser=None,
+    player=None,
 ) -> HostHTTPServer:
-    return HostHTTPServer((host, port), Handler, state, broadcaster, writer, releaser)
+    return HostHTTPServer((host, port), Handler, state, broadcaster, writer, releaser, player)
 
 
 def pick_port(preferred: int, host: str = "127.0.0.1") -> int:

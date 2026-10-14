@@ -31,6 +31,7 @@ from typing import Any
 
 from .protocol import (
     CAPTURE_RATE_HZ,
+    DEMO_SPEECH_GAIN_DB,
     KNOWN_ENVIRONMENTS,
     KNOWN_STATES,
     MAX_NOISE_REDUCTION_DB,
@@ -50,6 +51,10 @@ CAPTURE_PERIOD_MS = 250.0
 #: 与串口层的 no-data 判据一致。短暂的路由探测、浏览器切页或一次调度抖动不应
 #: 把仍在工作的设备判死；持续 10 秒没有控制帧才显示断流告警。
 STALE_TIMEOUT_MS = 10_000.0
+#: "这一段静默不正常"的门槛。控制节拍 100 ms，1 秒 = 丢 10 帧——正常抖动到不了这里，
+#: 录音时放宽到 250 ms 也只是 4 帧。它和 STALE 的区别是**结论不同**：5.9 秒静默的常见
+#: 原因是上位机自己的读法/调度（2026-10-14 实测撞到过），不能直接说"设备可能停了"。
+SILENCE_THRESHOLD_MS = 1_000.0
 #: 面板保留的样本数。100 ms 一帧，600 帧约 60 秒，够画趋势又不至于让浏览器变慢。
 SAMPLE_CAPACITY = 600
 #: 事件保留条数。
@@ -163,6 +168,11 @@ class Stats:
     lines: int = 0
     unparsed_json: int = 0
     intervals_ms: deque[float] = field(default_factory=lambda: deque(maxlen=200))
+    #: 超过阈值的到达间隔。**不能只丢掉了事**：旧版把 ≥5 秒的间隔直接过滤掉，于是"上位机
+    #: 自己跟丢了 5.9 秒"在面板上完全看不见（max 仍显示 101 ms）——而那正是最该被看见的
+    #: 一类故障，2026-10-14 用户实测撞到过。
+    silences_ms: deque[float] = field(default_factory=lambda: deque(maxlen=50))
+    max_silence_ms: float = 0.0
 
     def interval_stats(self) -> dict[str, float]:
         values = list(self.intervals_ms)
@@ -193,7 +203,12 @@ class HostState:
 
         self.connected = False
         self.connected_detail = ""
+        #: 端口打开的时刻。没有它，"从未收到过帧"就没有起点，只能靠 `connected` 硬判 stale
+        #: （旧行为的 bug：一打开面板就报"已连接但没有帧"，而 age 处只能显示 "?"）。
+        self.connected_at: float | None = None
         self.last_frame_at: float | None = None
+        #: Mac 播放与执行端（tools/player）。为 None 表示本次运行没有启用它。
+        self.player = None
 
         self.latest: CommandFrame | None = None
         self.latency: LatencyReport | None = None
@@ -255,7 +270,18 @@ class HostState:
         if connected != self.connected or detail != self.connected_detail:
             self.connected = connected
             self.connected_detail = detail
+            # 连接的起点要记下来：设备插着但一帧都没来时，"等了多久"只能从这一刻算。
+            self.connected_at = time.monotonic() if connected else None
             self.log("link", "上位机已连接设备" if connected else "上位机与设备断开", detail)
+
+    def attach_player(self, player: object | None) -> None:
+        """挂上 Mac 播放与执行端（tools/host/player.py）。
+
+        用鸭子类型而不是 import：state.py 要能在没有播放器的环境里单独跑（主机单测就是
+        这么用它的），不希望因为一个音频模块把整个状态层拖下水。
+        """
+        with self.lock:
+            self.player = player
 
     # ------------------------------------------------------------------ 喂数据
 
@@ -319,8 +345,13 @@ class HostState:
 
         if self.last_frame_at is not None:
             interval_ms = (now - self.last_frame_at) * 1000.0
-            if 0 < interval_ms < 5000:
+            if 0 < interval_ms < SILENCE_THRESHOLD_MS:
                 self.stats.intervals_ms.append(interval_ms)
+            elif interval_ms >= SILENCE_THRESHOLD_MS:
+                # 静默单独记账：它不属于"节拍分布"（会把 p50 拖坏），更不能被丢掉——
+                # 丢掉就等于面板看不见"自己跟丢了多久"。
+                self.stats.silences_ms.append(interval_ms)
+                self.stats.max_silence_ms = max(self.stats.max_silence_ms, interval_ms)
         self.last_frame_at = now
         self.latest = frame
 
@@ -453,17 +484,38 @@ class HostState:
 
     # ------------------------------------------------------------------ 读出
 
-    def is_stale(self, now: float | None = None) -> bool:
-        if self.last_frame_at is None:
-            return self.connected
+    def silence_ms(self, now: float | None = None) -> float | None:
+        """距离上一次收到控制帧多久。一帧都还没收到时，从**连接那一刻**算。
+
+        旧实现分叉成两套判据，于是自相矛盾：没有帧时 `is_stale()` 直接返回 `connected`
+        （一打开面板就报"已连接但没有帧"，而 `age_ms()` 偏偏返回 None，界面只能显示 "?"）；
+        有帧时又要求超过 10 秒。改成同一个起点之后，两个字段永远一致，告警里也永远有数字。
+        """
         now = now if now is not None else time.monotonic()
-        return (now - self.last_frame_at) * 1000.0 > STALE_TIMEOUT_MS
+        if self.last_frame_at is not None:
+            return (now - self.last_frame_at) * 1000.0
+        if self.connected_at is not None:
+            return (now - self.connected_at) * 1000.0
+        return None
+
+    def is_stale(self, now: float | None = None) -> bool:
+        """连接中且超过 STALE_TIMEOUT_MS 没有帧——这时才敢说"设备可能停了"。"""
+        value = self.silence_ms(now)
+        return bool(self.connected and value is not None and value > STALE_TIMEOUT_MS)
+
+    def is_silent(self, now: float | None = None) -> bool:
+        """连接中且静默超过 SILENCE_THRESHOLD_MS，但还没到 STALE。
+
+        与 `is_stale` **分开报**，因为结论不同：几秒的静默常见原因是上位机自己的读法或
+        调度（文档里记过：pyserial 的 read 粒度、2026-10-14 实测 5.9 秒静默），
+        直接说"设备可能停了"就是把读者引到错误的排查方向。
+        """
+        value = self.silence_ms(now)
+        return bool(self.connected and value is not None and value >= SILENCE_THRESHOLD_MS)
 
     def age_ms(self, now: float | None = None) -> float | None:
-        if self.last_frame_at is None:
-            return None
-        now = now if now is not None else time.monotonic()
-        return round((now - self.last_frame_at) * 1000.0, 1)
+        value = self.silence_ms(now)
+        return None if value is None else round(value, 1)
 
     def snapshot(self) -> dict[str, Any]:
         """构造给界面的一份完整状态。不返回内部对象，避免界面读到一半被改。"""
@@ -487,7 +539,12 @@ class HostState:
             "connected_detail": self.connected_detail,
             "age_ms": self.age_ms(now),
             "stale": self.is_stale(now),
+            # 静默与断流分开报：前者常见于上位机自己跟丢了，后者才指向设备。
+            "silent": self.is_silent(now),
+            "silence_threshold_ms": SILENCE_THRESHOLD_MS,
             "recording": self.recording,
+            #: Mac 播放与执行端的自报状态。为 None = 本次运行没启用播放器。
+            "player": self.player.snapshot() if self.player is not None else None,
             "control": {
                 "sent": self.control_sent,
                 "acknowledged": self.control_acknowledged,
@@ -553,8 +610,11 @@ class HostState:
                 "schema": frame.schema_version,
             },
             #: 只保留本产品真正有动作的上限。固件的降噪硬上限不出现在界面上。
+            #: speech_gain_db 用**实发**上限（8.0）：面板的增益条按它画，按 6.5 画会把
+            #: 8 dB 的正常帧画成满格越界。产品策略值单独给一个字段，供界面注明出处。
             "caps": {
-                "speech_gain_db": MAX_SPEECH_GAIN_DB,
+                "speech_gain_db": DEMO_SPEECH_GAIN_DB,
+                "policy_speech_gain_db": MAX_SPEECH_GAIN_DB,
             },
             "latency": None
             if latency is None
@@ -589,6 +649,12 @@ class HostState:
                 "lines": self.stats.lines,
                 "bad_lines": self.stats.bad_lines,
                 "unparsed_json": self.stats.unparsed_json,
+                # 静默单独一组：进不了节拍分布（会拖坏 p50），但也绝不能消失。
+                "silences": len(self.stats.silences_ms),
+                "max_silence_ms": round(self.stats.max_silence_ms, 1),
+                "last_silence_ms": round(self.stats.silences_ms[-1], 1)
+                if self.stats.silences_ms
+                else None,
                 "interval": self.stats.interval_stats(),
             },
             "samples": list(self.samples),

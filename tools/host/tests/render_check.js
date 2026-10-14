@@ -126,17 +126,59 @@ check(text("age") !== "", "顶部显示数据年龄");
 if (frame) {
   check(text("env") === frame.environment_text, `环境显示为 ${frame.environment_text}`);
   check(text("state") === frame.state_text, `动作显示为 ${frame.state_text}`);
-  check(text("gain").includes(frame.speech_gain_db.toFixed(2)), "人声增益按两位小数显示");
+  // 「现实人声增益意图」这一格显示的是 external_voice_gain_db。旧断言比的是
+  // speech_gain_db——提交 eb53704 把这一格换了语义之后它就成了假断言：真机上两者恰好都是
+  // 0.0 时它会"通过"，一有增益就报失败。比对一个字段就要比对照界面的那一个。
+  check(text("gain").includes(frame.external_voice_gain_db.toFixed(2)), "现实人声增益按两位小数显示");
   // 口径：本产品只有增益与调音，没有降噪。快照里不该有这个字段，界面上不该有这一格。
   check(frame.noise_reduction_db === undefined, "快照不得下发降噪量");
   check((elements.get("nr") || { textContent: "x" }).textContent === "x", "界面不得再有降噪格子");
-  check(text("media") === `${frame.media_percent} %`, "媒体音量显示");
+  // 同一格的第二次语义漂移：id 还叫 media，内容已经是「决策模式」= 设备上报的 mode。
+  check(text("media") === (frame.mode || "LEGACY"), "决策模式显示设备上报的 mode");
   check(text("link") === frame.link_text, "控制链路用中文口径");
   check(text("link-raw").includes(frame.link), "同时显示设备原始字段");
   check(text("seq").includes(String(frame.sequence)), "显示帧序号");
   if (frame.link_reported_connected === false) {
     check(htmlOf("alerts").includes("模拟"), "设备自称 simulated 时必须明确提示");
   }
+}
+
+// Mac 播放与执行端：面板必须说清"决策已产生"与"Mac 已执行"是两件事，
+// 而且第三件（AirPods 是否已播放）本链路无法验证，不得写成已验证。
+if (snapshot.player) {
+  const player = snapshot.player;
+  check(text("track").length > 0, "播放卡片显示曲目");
+  check(["▶ 播放", "⏸ 暂停"].includes(text("btn-play")), "播放按钮按播放状态切换文案");
+  const disabled = (elements.get("btn-play") || {}).disabled;
+  check(disabled === (player.available === false), "播放器不可用时按钮必须禁用");
+  const receipt = text("receipt");
+  check(receipt.includes(`设备自报 execution=${frame ? frame.execution : "unknown"}`),
+        "回执写明设备自报的 execution");
+  check(receipt.includes("AirPods 是否已播放：无法验证"),
+        "回执不得声称 AirPods 已播放（本链路没有回执通路）");
+  if (player.available) {
+    check(text("apply-note").includes("Mac 真正设进 EQ"),
+          "必须有说明告诉读者实心柱是 Mac 真正应用的值");
+    check(text("apply-note").includes("深度"),
+          "面板必须写明放大倍率是本机演示参数，不是设备的建议");
+  }
+  if (player.execution === "applied") {
+    check(receipt.includes("已执行"), "回执为 applied 时必须写明已执行");
+  }
+  if (player.execution === "idle") {
+    check(receipt.includes("未执行"), "没在播放时必须写明决策没有被执行");
+  }
+  // 进度条：位置时刻要显示，滑块要跟着 position/duration 走。用户明确要过这个控件。
+  check(text("track-pos").includes(":"), "进度条旁边显示 m:ss 时刻");
+  const seek = elements.get("player-seek");
+  check(seek !== undefined, "进度条存在且被渲染到");
+  if (seek && player.duration_s) {
+    const expected = Math.round(((player.position_s || 0) / player.duration_s) * 1000);
+    check(Math.abs(Number(seek.value) - expected) <= 2,
+          `进度条位置与 position/duration 一致（期望 ${expected}，实得 ${seek.value}）`);
+  }
+} else {
+  console.log("  （提示：这份快照没有 player 段，已跳过播放与回执断言）");
 }
 
 // 延迟表：逐行核对"零"的解释。两种零必须分开——本地阶段为 0 是未实现（声纹推理），

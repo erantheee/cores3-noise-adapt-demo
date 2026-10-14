@@ -23,6 +23,8 @@
     margin: 0; background: var(--bg); color: var(--text);
     font-family: -apple-system, "PingFang SC", "Helvetica Neue", Arial, sans-serif;
     font-size: 14px; line-height: 1.5;
+    /* 面板只在自己的视口里排布，绝不允许把浏览器撑出横向滚动条。 */
+    overflow-x: hidden;
   }
   header {
     display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
@@ -41,7 +43,12 @@
   main { padding: 16px 18px 40px; display: grid; gap: 14px; }
   .grid { display: grid; gap: 14px; }
   .cards { grid-template-columns: repeat(auto-fit, minmax(178px, 1fr)); }
-  .two { grid-template-columns: minmax(320px, 1.25fr) minmax(300px, 1fr); }
+  /* 播放卡片横跨剩下的空位（宽窗口下第二行正好补满），窗口窄了会自动落成整行。
+     不写死列数：列数由 auto-fit 决定，写死了换个窗口宽度就会错位或顶宽。 */
+  .card.wide { grid-column: span 5; }
+  /* 原来两列有 320px/300px 的硬下限：窗口一窄就顶出去，页面出现横向滚动条。
+     下限交给媒体查询处理，这里用 minmax(0, …) 让列可以真正收缩。 */
+  .two { grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); }
   @media (max-width: 900px) { .two { grid-template-columns: 1fr; } }
   .card {
     background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
@@ -51,9 +58,11 @@
     font-size: 12px; margin: 0 0 8px; color: var(--muted); font-weight: 600;
     letter-spacing: .06em; text-transform: none;
   }
-  .value { font-size: 26px; font-weight: 650; font-family: var(--mono); letter-spacing: -.01em; }
+  .value { font-size: 26px; font-weight: 650; font-family: var(--mono); letter-spacing: -.01em;
+           overflow-wrap: anywhere; }
   .value.small { font-size: 20px; }
-  .sub { color: var(--muted); font-size: 12px; margin-top: 4px; font-family: var(--mono); }
+  .sub { color: var(--muted); font-size: 12px; margin-top: 4px; font-family: var(--mono);
+         overflow-wrap: anywhere; }
   .meter { height: 6px; background: #1b2632; border-radius: 3px; overflow: hidden; margin-top: 8px; }
   .meter > span { display: block; height: 100%; background: var(--accent); width: 0; transition: width .12s linear; }
   .env-QUIET { color: var(--ok); } .env-NOISY { color: var(--accent); }
@@ -81,7 +90,10 @@
     max-height: 180px; overflow: auto; white-space: pre-wrap; word-break: break-all;
   }
   canvas { width: 100%; height: 150px; display: block; }
-  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; min-width: 0; }
+  /* 滑杆与它的兄弟都必须能被压缩，否则一行控件会把卡片顶宽、进而撑出横向滚动条。 */
+  .row > * { min-width: 0; }
+  input[type=range] { flex: 1 1 90px; min-width: 0; }
   button {
     background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
     border-radius: 7px; padding: 6px 12px; font-size: 13px; cursor: pointer;
@@ -137,6 +149,17 @@
       <div class="sub" id="eq-note">仅用于 Mac 本地歌曲；不等于现实人声增强</div>
     </div>
     <div class="card">
+      <h2>Mac 实际应用（24 段）</h2>
+      <canvas id="applied" height="52" style="height:52px"></canvas>
+      <div class="row" style="margin-top:6px">
+        <span class="sub">处方深度</span>
+        <input type="range" id="depth" min="1" max="4" step="0.1" value="2.5" style="flex:1">
+        <span class="sub" id="depth-text">2.5×</span>
+      </div>
+      <div class="sub" id="apply-note">—</div>
+      <div class="sub" id="receipt">—</div>
+    </div>
+    <div class="card">
       <h2>决策模式</h2>
       <div class="value" id="media">—</div>
       <div class="meter"><span id="media-bar"></span></div>
@@ -146,6 +169,26 @@
       <h2>控制链路</h2>
       <div class="value small" id="link">—</div>
       <div class="sub" id="link-raw">—</div>
+    </div>
+    <div class="card wide">
+      <h2>播放（Mac · 原版原曲）</h2>
+      <div class="row">
+        <span class="value small" id="track">—</span>
+        <span class="sub" id="track-pos" style="margin-top:0">—</span>
+      </div>
+      <!-- 进度条：0…1000 是千分比。拖动时不跟随状态更新，松手才下发 seek。 -->
+      <div class="row" style="margin-top:6px">
+        <input type="range" id="player-seek" min="0" max="1000" step="1" value="0" style="flex:1">
+      </div>
+      <div class="row" style="margin-top:6px">
+        <button id="btn-prev">上一首</button>
+        <button id="btn-play">▶ 播放</button>
+        <button id="btn-next">下一首</button>
+        <span class="sub">音量</span>
+        <input type="range" id="player-vol" min="0" max="100" step="5" value="30" style="flex:1 1 120px">
+        <span class="sub" id="player-vol-text">30%</span>
+      </div>
+      <div class="sub" id="player-note">—</div>
     </div>
     <div class="card">
       <h2>人声置信度</h2>
@@ -226,10 +269,22 @@
 <script>
 const $ = (id) => document.getElementById(id);
 let lastSnapshot = null;
+//: 用户正在拖进度条。拖动期间不接受状态回写，否则滑块会被每秒 10 次刷新拽回去。
+let playerSeeking = false;
 
 function fmt(value, digits = 2, suffix = "") {
   if (value === null || value === undefined) return "—";
   return Number(value).toFixed(digits) + suffix;
+}
+
+/// 秒 → m:ss（超过一小时才显示 h:mm:ss）。给人看的，不用决定性的位数。
+function formatClock(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const rest = total % 60;
+  const pad = (value) => String(value).padStart(2, "0");
+  return hours > 0 ? `${hours}:${pad(minutes)}:${pad(rest)}` : `${minutes}:${pad(rest)}`;
 }
 
 function renderAlerts(s) {
@@ -239,6 +294,14 @@ function renderAlerts(s) {
     items.push(["bad", s.connected_detail || "上位机与设备未连接"]);
   } else if (s.stale) {
     items.push(["bad", `已连接但 ${s.age_ms ?? "?"} ms 没有收到任何帧——设备可能停了，或者这个端口对应的是一个已经不存在的设备（项目文档记过这一条）。`]);
+  } else if (s.silent) {
+    // 与"设备可能停了"分开报：几秒静默最常见的原因是上位机自己这一侧（读法/调度/批量到达），
+    // 直接说成设备停了会把排查引到错误方向。阈值与判据都在后端，界面只负责如实转述。
+    items.push(["bad",
+      `已连接，但已经 ${s.age_ms} ms 没有新帧（阈值 ${s.silence_threshold_ms} ms，` +
+      `设备节拍 100 ms，等于连续丢了 ${Math.round((s.age_ms || 0) / 100)} 帧）。` +
+      `<b>先查上位机这一侧</b>：读取粒度、调度抖动、批量到达都会造成这种静默；` +
+      `项目文档记过一次同类事故——pyserial 的 read 粒度把 150 ms 的节拍读成了 202 ms。`]);
   }
   if (s.frame && s.frame.link_reported_connected === false) {
     items.push(["", "控制链路：设备自称 <b>模拟</b>。没有确认回执之前，不得写成已连接或已发送。"]);
@@ -293,6 +356,10 @@ function render(s) {
     $("state-raw").textContent = `${f.state} · ${f.conversation || "NONE"}`;
     $("gain").textContent = fmt(f.external_voice_gain_db, 2, " dB");
     $("gain-bar").style.width = Math.max(0, Math.min(100, (f.external_voice_gain_db / s.caps.speech_gain_db) * 100)) + "%";
+    // 两个上限要写在界面上，不靠人记：实发值（增益条按它画）+ 产品策略值（出处）。
+    $("gain-cap").textContent = s.caps.policy_speech_gain_db !== undefined
+      ? `固件实发上限 +${s.caps.speech_gain_db} dB（产品策略 +${s.caps.policy_speech_gain_db} dB）`
+      : `固件实发上限 +${s.caps.speech_gain_db} dB`;
     $("media").textContent = f.mode || "LEGACY";
     $("media-bar").style.width = f.mode === "SONG_EQ" ? "65%" : f.mode === "EXTERNAL_VOICE_INTENT" ? "100%" : "0%";
     $("link").textContent = f.link_text;
@@ -305,16 +372,134 @@ function render(s) {
   renderAlerts(s);
   renderLatency(s);
   drawEq(f ? f.tuning : null, 0);
+  // 「设备实测」四个字是有意的：设备报了 eq_gain_db 才算实测，没报只能是推导值。
+  // 把推导值写成实测值，是这块面板最容易犯的错。
   $("eq-note").textContent = !f
     ? "等待设备数据"
     : f.tuning
-      ? `S3歌曲EQ建议：抬起 ${f.tuning.lifted_bands} 个频段，最高 +${f.tuning.peak_gain_db.toFixed(1)} dB；Mac尚需结合歌曲内容执行`
+      ? `设备实测：S3 报的 24 段建议抬起 ${f.tuning.lifted_bands} 个频段，最高 +${f.tuning.peak_gain_db.toFixed(1)} dB`
       : "这一帧没有调音数据（旧固件不发 eq_gain_db）；图形是由语音段增益推导的";
   $("control-warn").style.display = s.control && s.control.unresponsive ? "block" : "none";
+  renderPlayer(s);
+  drawApplied(s);
+  $("apply-note").textContent = applyNote(s);
+  $("receipt").textContent = receiptText(s);
   renderCapture(s);
   renderLists(s);
   renderStats(s);
   drawChart(s.samples || []);
+}
+
+// 回执：设备报了"决策已产生"，Mac 这边必须能说出"执行到哪一步"。三件事分开写，
+// 不许合成一句话——"决策已产生""Mac 已执行""AirPods 已播放"是三件不同的事，
+// 而第三件本链路无法验证（没有回执通路）。
+const EXECUTION_LABEL = {
+  applied: "已执行（24 段已设、引擎在跑、实测有信号）",
+  idle: "未执行（Mac 没在播放，决策没有落到任何声音上）",
+  bypass: "未执行（处于直通对照）",
+  silent: "未执行（在播但实测峰值过小，等于没出声）",
+  unavailable: "不可用（播放器没起来）",
+};
+
+function receiptText(s) {
+  const player = s.player;
+  const device = s.frame ? s.frame.execution : "unknown";
+  if (!player) {
+    return `设备自报 execution=${device} · Mac：本次运行没有启用播放器 · AirPods 是否已播放：无法验证`;
+  }
+  const state = EXECUTION_LABEL[player.execution] || `未知状态（${player.execution}）`;
+  return `设备自报 execution=${device} · Mac：${state} · AirPods 是否已播放：无法验证（链路无回执）`;
+}
+
+function applyNote(s) {
+  const player = s.player;
+  if (!player || !player.available) {
+    return "没有执行端：这条曲线画不出来。音频被谁改了，面板就必须能说清——说不清就不画。";
+  }
+  const applied = Array.isArray(player.applied_bands) ? player.applied_bands : [];
+  if (applied.length === 0) return "还没有下发过调音。";
+  const peak = Number(player.applied_peak_db) || 0;
+  return `绿柱＝Mac 真正设进 EQ 的值（峰值 +${peak.toFixed(2)} dB）；蓝线＝S3 报的原始建议。` +
+    `形状来自 S3，深度 ${(player.depth || 0).toFixed(1)}× 是本机为"听得出来"设的演示参数，` +
+    `面板不把它说成设备的建议。`;
+}
+
+function renderPlayer(s) {
+  const player = s.player;
+  const buttons = ["btn-play", "btn-prev", "btn-next"];
+  if (!player) {
+    $("track").textContent = "—";
+    $("track-pos").textContent = "本次运行没有启用 Mac 播放器";
+    $("player-note").textContent = "用 --no-player 起的，所以没有播放器可用。";
+    buttons.forEach((id) => ($(id).disabled = true));
+    $("player-seek").disabled = true;
+    $("player-seek").value = 0;
+    return;
+  }
+  const available = player.available !== false;
+  buttons.forEach((id) => ($(id).disabled = !available));
+  $("btn-play").textContent = player.playing ? "⏸ 暂停" : "▶ 播放";
+  $("track").textContent = !available
+    ? "播放器不可用"
+    : (player.track_title
+        ? `${(player.track_index ?? 0) + 1}/${player.track_count || 0} ${player.track_title}`
+        : "曲库是空的");
+  $("track-pos").textContent = available && player.duration_s
+    ? `${formatClock(Number(player.position_s) || 0)} / ${formatClock(Number(player.duration_s))}` +
+      ` · 共 ${player.track_count || 0} 首`
+    : (player.reason || "—");
+  // 拖动进度条时不要被每秒 10 次的状态更新拽回去；松手才 seek（见 change 监听）。
+  const duration = Number(player.duration_s) || 0;
+  if (!playerSeeking) {
+    $("player-seek").value = duration > 0
+      ? Math.round(((Number(player.position_s) || 0) / duration) * 1000)
+      : 0;
+  }
+  $("player-seek").disabled = !available || duration <= 0;
+  $("player-note").textContent = available
+    ? `输出 ${player.output_device || "未知"} · 峰值 ${fmt(player.peak_window_db, 1, " dB")}` +
+      `（最近 2.5 秒最大，瞬时 ${fmt(player.peak_db, 1)}）· ` +
+      `音量 ${Math.round(player.volume_percent)}% · 状态 ${player.state_age_s ?? "?"} s 前`
+    : (player.reason || "播放器不可用");
+  $("depth-text").textContent = (Number(player.depth) || 0).toFixed(1) + "×";
+  $("player-vol-text").textContent = Math.round(player.volume_percent) + "%";
+}
+
+function drawApplied(s) {
+  const canvas = $("applied");
+  if (!canvas || !canvas.getContext) return;
+  const player = s.player || {};
+  const applied = Array.isArray(player.applied_bands) ? player.applied_bands : [];
+  const source = Array.isArray(player.source_bands) ? player.source_bands : [];
+  const dpr = window.devicePixelRatio || 1;
+  const width = canvas.clientWidth || 300;
+  const height = 52;
+  canvas.width = width * dpr;
+  canvas.height = height * dpr;
+  const ctx = canvas.getContext("2d");
+  if (!ctx.setTransform) return;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+  // 纵轴按播放器自报的硬上限（+10 dB），不是 S3 的上限：S3 建议 +4 dB 经深度放大后
+  // 会超过它，若按 6.5 画，柱子会被截平，看起来像是"设备建议有这么高"。
+  const maxDb = Math.max(1, Number(player.max_applied_gain_db) || 10);
+  const bands = 24;
+  const slot = width / bands;
+  const barWidth = Math.max(2, slot - 2);
+  for (let band = 0; band < bands; band++) {
+    const value = Math.max(0, Math.min(maxDb, Number(applied[band]) || 0));
+    const barHeight = (value / maxDb) * (height - 10);
+    ctx.fillStyle = applied.length === 0 ? "#243244" : "#3ddc84";
+    ctx.fillRect(band * slot + 1, height - 5 - barHeight, barWidth, Math.max(2, barHeight));
+    const suggested = Math.max(0, Math.min(maxDb, Number(source[band]) || 0));
+    const suggestedY = height - 5 - (suggested / maxDb) * (height - 10);
+    ctx.fillStyle = "#4cc2ff";
+    ctx.fillRect(band * slot + 1, suggestedY, barWidth, 1.5);
+  }
+  ctx.fillStyle = "#8ea3b8";
+  ctx.font = "10px ui-monospace, Menlo, monospace";
+  ctx.fillText("0 dB", 2, height - 1);
+  ctx.fillText(`+${maxDb.toFixed(1)} dB`, width - 58, 10);
 }
 
 function renderLatency(s) {
@@ -562,6 +747,56 @@ $("btn-release").addEventListener("click", async () => {
   } catch (error) {
     toast.textContent = "上位机已退出（连接中断属正常）";
   }
+});
+
+// ---------------------------------------------------------------- 播放（Mac 执行端）
+// 面板只发动作，不自作主张：EQ 的形状永远来自 S3 的那一帧，这里只负责把它落到音频上。
+// 回控与设备侧同一条原则——白名单；失败原因原样显示，不把"点过了"当成"做到了"。
+function sendPlayer(payload) {
+  return fetch("/api/player", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  })
+    .then((response) => response.json())
+    .catch((error) => ({ ok: false, error: "请求没发出去：" + error }));
+}
+
+function playerToast(result) {
+  const note = $("player-note");
+  if (!note) return;
+  if (result.ok) {
+    const sent = result.result && result.result.sent ? result.result.sent : result.result;
+    note.textContent = "已发送：" + JSON.stringify(sent);
+    note.style.color = "#8ea3b8";
+  } else {
+    note.textContent = "没执行：" + (result.error || "未知原因");
+    note.style.color = "#ff6b6b";
+  }
+}
+
+$("btn-play").addEventListener("click", async () => playerToast(await sendPlayer({ cmd: "toggle" })));
+$("btn-prev").addEventListener("click", async () => playerToast(await sendPlayer({ cmd: "prev" })));
+$("btn-next").addEventListener("click", async () => playerToast(await sendPlayer({ cmd: "next" })));
+$("player-vol").addEventListener("change", async (event) =>
+  playerToast(await sendPlayer({ cmd: "volume", percent: Number(event.target.value) })));
+$("depth").addEventListener("change", async (event) =>
+  playerToast(await sendPlayer({ cmd: "depth", depth: Number(event.target.value) })));
+
+// 进度条：拖动时只更新文字（并暂停跟随状态），松手才真的 seek——一次拖动不该发几十条命令。
+$("player-seek").addEventListener("input", () => {
+  playerSeeking = true;
+  const player = (lastSnapshot && lastSnapshot.player) || {};
+  const duration = Number(player.duration_s) || 0;
+  const target = (Number($("player-seek").value) / 1000) * duration;
+  $("track-pos").textContent = `${formatClock(target)} / ${formatClock(duration)} · 松手即跳转`;
+});
+$("player-seek").addEventListener("change", async () => {
+  const player = (lastSnapshot && lastSnapshot.player) || {};
+  const duration = Number(player.duration_s) || 0;
+  const target = (Number($("player-seek").value) / 1000) * duration;
+  playerSeeking = false;
+  playerToast(await sendPlayer({ cmd: "seek", seconds: target }));
 });
 
 // 暴露给渲染校验（tools/host/tests/render_check.js）：那台脚本用 DOM 桩把 render()
