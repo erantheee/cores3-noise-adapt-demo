@@ -155,7 +155,7 @@ def main(argv: list[str] | None = None) -> int:
         print("CoreS3 上位机")
         print(f"  数据源    {state.source}  {source.detail or ''}")
         print(f"  面板      {url}")
-        print("  帧率      设备每 150 ms 一帧；录音时放宽到 250 ms（预期行为）")
+        print("  帧率      设备每 100 ms 一帧；录音时放宽到 250 ms（预期行为）")
         print("  回控      可发 rec start [秒数] / rec stop" if can_control else "  回控      不可用（当前数据源没有设备可写）")
         if isinstance(source, ReplaySource):
             print("  注意      回放只是把历史日志搬到界面上，不代表设备现在的状态")
@@ -185,7 +185,7 @@ def main(argv: list[str] | None = None) -> int:
     # real default output to its second page whenever that route changes.
     def monitor_mac_route() -> None:
         last_device: str | None | object = object()
-        while not stop.wait(2.0):
+        while not stop.wait(5.0):
             device = default_output()
             if device == last_device or not writer.available:
                 continue

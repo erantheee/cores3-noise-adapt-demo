@@ -33,6 +33,7 @@ from host.protocol import (  # noqa: E402
     CommandFrame,
     LatencyReport,
     MicChunk,
+    RouteEvent,
     d2,
     iter_json_objects,
     parse_line,
@@ -95,7 +96,10 @@ def test_mac_default_output_route() -> None:
     report = """Audio:\n\n    Devices:\n\n        MacBook Air扬声器:\n\n          Output Channels: 2\n\n        AirPods Pro:\n\n          Default Output Device: Yes\n          Output Channels: 2\n"""
     eq(parse_default_output(report), "AirPods Pro", "识别 Mac 默认音频输出")
     eq(route_command("AirPods Pro"), b"route active AirPods Pro\r\n", "生成路由回传命令")
-    eq(route_command(None), b"route offline\r\n", "没有默认输出时明确离线")
+    eq(route_command(None), b"route inactive AirPods Pro\r\n", "AirPods 不是默认输出时明确未连接")
+    parsed = parse_line('{"type":"route","state":"active","device":"AirPods Pro"}')
+    check(isinstance(parsed.value, RouteEvent), "route 回执能解析")
+    eq(parsed.error, None, "route 回执不再记为坏帧")
 
 
 def test_command_frame_full() -> None:
@@ -422,13 +426,14 @@ def test_staleness_distinguishes_quiet_from_dead() -> None:
                     '"noise_reduction_db":0,"media_percent":100,"state":"OBSERVING",'
                     '"environment":"QUIET","confidence":0.5,"link":"simulated"}')
     check(not state.is_stale(), "刚收到帧就不该判为陈旧")
-    check(state.is_stale(time.monotonic() + 5.0), "超过 5 个节拍没帧必须判为陈旧")
+    check(not state.is_stale(time.monotonic() + 5.0), "短暂 5 秒停顿不误报设备死亡")
+    check(state.is_stale(time.monotonic() + 11.0), "持续 10 秒以上没帧才判为陈旧")
 
     # 录音时设备把节拍放宽到 250 ms，判陈旧的窗口要跟着放宽，否则界面会误报。
     state.feed_capture(CaptureEvent(state="started", seconds=10, rate=16000))
     check(state.recording, "录音状态置位")
     check(not state.is_stale(time.monotonic() + 1.0), "录音时 1 秒没帧不算陈旧")
-    check(state.is_stale(time.monotonic() + 5.0), "录音时超过 5 个放宽节拍仍算陈旧")
+    check(state.is_stale(time.monotonic() + 11.0), "录音时持续 10 秒以上没帧才算陈旧")
 
 
 def test_capture_accounting() -> None:

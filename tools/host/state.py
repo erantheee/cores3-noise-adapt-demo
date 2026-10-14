@@ -40,16 +40,17 @@ from .protocol import (
     LatencyReport,
     MicChunk,
     ParseError,
+    RouteEvent,
     parse_line,
 )
 
-#: 控制节拍。与固件一致：正常 150 ms，录音时放宽到 250 ms（main/app_main.cpp）。
-CONTROL_PERIOD_MS = 150.0
+#: 控制节拍。与固件一致：正常 100 ms，录音时放宽到 250 ms（main/app_main.cpp）。
+CONTROL_PERIOD_MS = 100.0
 CAPTURE_PERIOD_MS = 250.0
-#: 连续多少个节拍没有新帧就判为陈旧。5 拍＝750 ms，足够跨过一次调度抖动，
-#: 又不至于让演示现场盯着一个已经不动的数字超过一秒。
-STALE_PERIODS = 5.0
-#: 面板保留的样本数。150 ms 一帧，600 帧约 90 秒，够画趋势又不至于让浏览器变慢。
+#: 与串口层的 no-data 判据一致。短暂的路由探测、浏览器切页或一次调度抖动不应
+#: 把仍在工作的设备判死；持续 10 秒没有控制帧才显示断流告警。
+STALE_TIMEOUT_MS = 10_000.0
+#: 面板保留的样本数。100 ms 一帧，600 帧约 60 秒，够画趋势又不至于让浏览器变慢。
 SAMPLE_CAPACITY = 600
 #: 事件保留条数。
 EVENT_CAPACITY = 200
@@ -294,6 +295,8 @@ class HostState:
             self.feed_capture(value)
         elif isinstance(value, MicChunk):
             self.feed_chunk(value)
+        elif isinstance(value, RouteEvent):
+            self.log("route", "设备确认 Mac 音频路由", value.device or value.state)
 
     def feed_command(self, frame: CommandFrame, problems: tuple[str, ...] = ()) -> None:
         now = time.monotonic()
@@ -454,8 +457,7 @@ class HostState:
         if self.last_frame_at is None:
             return self.connected
         now = now if now is not None else time.monotonic()
-        period_ms = CAPTURE_PERIOD_MS if self.recording else CONTROL_PERIOD_MS
-        return (now - self.last_frame_at) * 1000.0 > period_ms * STALE_PERIODS
+        return (now - self.last_frame_at) * 1000.0 > STALE_TIMEOUT_MS
 
     def age_ms(self, now: float | None = None) -> float | None:
         if self.last_frame_at is None:

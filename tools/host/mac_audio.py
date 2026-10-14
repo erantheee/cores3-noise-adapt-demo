@@ -34,8 +34,7 @@ def default_output() -> str | None:
     return parse_default_output(result.stdout)
 
 
-def route_command(device: str | None) -> bytes:
-    if not device:
-        return b"route offline\r\n"
-    safe = " ".join(device.replace("\r", " ").replace("\n", " ").split())[:47]
-    return f"route active {safe}\r\n".encode("utf-8")
+def route_command(device: str | None, target: str = "AirPods Pro") -> bytes:
+    safe_target = " ".join(target.replace("\r", " ").replace("\n", " ").split())[:47]
+    state = "active" if device == target else "inactive"
+    return f"route {state} {safe_target}\r\n".encode("utf-8")

@@ -108,7 +108,7 @@ class MockDevice:
     def advance(self, elapsed_s: float) -> list[str]:
         """推进到 elapsed_s，返回这一拍要吐出的所有行。"""
         lines: list[str] = []
-        dt = 0.15
+        dt = 0.10
         while self._next_emit_s <= elapsed_s:
             lines.extend(self._emit(self._next_emit_s, dt))
             self._next_emit_s += dt

@@ -4,7 +4,7 @@
 `tools/record_from_device.py`（只认 mic_chunk）与 `tools/drift_capture.py`（只认
 earbud_command）。上位机是第三个，而且它必须同时处理**全部四类**行：
 
-    earbud_command   每 ~150 ms 一帧的控制指令（README「EarbudCommand v1」）
+    earbud_command   每 ~100 ms 一帧的控制指令
     latency          每 10 s 一次的逐阶段延迟汇总（main/app_main.cpp: emit_latency_report）
     capture          录音状态变化（started / stopped / finished / encode_failed）
     mic_chunk        录音数据块，16 kHz 单声道 base64（main/app_main.cpp: emit_capture_chunk）
@@ -165,6 +165,12 @@ class CaptureEvent:
     #: 所以按原样带出来给界面显示，而不是每个字段都建一个成员——固件加一个计数器时
     #: 上位机不该因为不认识就把它丢掉。
     progress: dict[str, int] | None = None
+
+
+@dataclass(frozen=True)
+class RouteEvent:
+    state: str
+    device: str | None = None
 
 
 @dataclass(frozen=True)
@@ -450,6 +456,18 @@ def _parse_capture(payload: dict[str, Any]) -> ParsedLine:
     )
 
 
+def _parse_route(payload: dict[str, Any]) -> ParsedLine:
+    state = _as_str(payload, "state")
+    if state not in ("active", "inactive", "offline"):
+        return ParsedLine(
+            error=ParseError(f"route 的 state 无效: {state!r}", ""), json_line=True
+        )
+    return ParsedLine(
+        value=RouteEvent(state=state, device=_as_str(payload, "device")),
+        json_line=True,
+    )
+
+
 def _parse_mic_chunk(payload: dict[str, Any]) -> ParsedLine:
     encoded = _as_str(payload, "pcm")
     if encoded is None:
@@ -519,6 +537,8 @@ def parse_line(line: str) -> ParsedLine:
         return _parse_latency(payload)
     if kind == "capture":
         return _parse_capture(payload)
+    if kind == "route":
+        return _parse_route(payload)
     if kind == "mic_chunk":
         return _parse_mic_chunk(payload)
     return ParsedLine(

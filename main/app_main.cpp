@@ -33,7 +33,7 @@ constexpr std::size_t kFrameSamples = 2048;
 constexpr std::size_t kReadBlockSamples = 512;
 /// Largest analysis frame the accumulator can hold.
 constexpr std::size_t kFrameSamplesMax = kFrameSamples + kReadBlockSamples;
-constexpr float kControlPeriodMs = 150.0f;
+constexpr float kControlPeriodMs = 100.0f;
 /// During capture the analysis cadence is relaxed. The capture path costs a decimation
 /// plus a base64 encode and a console write per chunk, so the two must not both run flat
 /// out. 250 ms still resolves a change of environment, and it keeps the instrumentation
