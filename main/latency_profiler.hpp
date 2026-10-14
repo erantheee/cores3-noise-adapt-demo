@@ -13,7 +13,7 @@
 ///
 /// The pipeline stages, in the order energy actually flows:
 ///
-///   0 capture      hardware buffering before the frame reaches the CPU
+///   0 capture      interval between consecutive analyses at the current cadence
 ///   1 analyse      24-band analysis for one frame
 ///   2 embed        speaker-embedding inference for one frame (0 when disabled)
 ///   3 decide       controller update
@@ -23,6 +23,11 @@
 ///
 /// Stages 4-6 are reported by the peer and fed in through `record_peer_latency`. Stages
 /// 0-3 are measured on this device.
+///
+/// On what `capture` actually measures: it is the wall interval between two analyses, so
+/// it is a true loop period, but it is not the hardware buffering delay on its own. That
+/// would need I2S DMA introspection, which this round does not do. Read it as "how often
+/// the decision is refreshed", not as "how old the oldest sample in the frame is".
 namespace latency {
 
 constexpr std::size_t kStageCount = 7;

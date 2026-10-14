@@ -13,6 +13,7 @@ set(COMMON_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/latency_profiler.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/mic_capture.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/mic_decimator.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../main/voiceprint_gate.cpp
 )
 
 enable_testing()
@@ -36,3 +37,7 @@ add_test(NAME mic_capture_test COMMAND mic_capture_test)
 add_executable(mic_decimator_test mic_decimator_test.cpp ${COMMON_SOURCES})
 target_include_directories(mic_decimator_test PRIVATE ../main)
 add_test(NAME mic_decimator_test COMMAND mic_decimator_test)
+
+add_executable(voiceprint_gate_test voiceprint_gate_test.cpp ${COMMON_SOURCES})
+target_include_directories(voiceprint_gate_test PRIVATE ../main)
+add_test(NAME voiceprint_gate_test COMMAND voiceprint_gate_test)

@@ -9,6 +9,7 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "latency_profiler.hpp"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "mic_capture.hpp"
@@ -21,14 +22,22 @@ constexpr std::size_t kFrameSamples = 2048;
 constexpr float kControlPeriodMs = 150.0f;
 /// During capture the analysis cadence is relaxed. The capture path costs a decimation
 /// plus a base64 encode and a console write per chunk, so the two must not both run flat
-/// out; 300 ms still resolves a change of environment.
-constexpr float kCapturePeriodMs = 300.0f;
+/// out. 250 ms still resolves a change of environment, and it keeps the instrumentation
+/// inside its 1%-of-budget check: the probe plus the analysis of one 2048-sample frame
+/// costs on the order of 10-20 ms, which is under 8% of 250 ms rather than 13% of 150 ms.
+constexpr float kCapturePeriodMs = 250.0f;
 /// Samples accumulated before a chunk is sent: 1024 at 16 kHz is 64 ms, which is exactly
 /// three 2048-sample input frames at the 3:1 decimation, so blocks line up with no
 /// leftover. Choose a size that is not a multiple of the decimation ratio and the capture
 /// would still be correct but carry a partial chunk across frames.
 constexpr std::size_t kCaptureChunkSamples = 1024;
 constexpr std::size_t kDecimatedPerFrame = kFrameSamples / capture::kDecimation;
+/// How often the latency breakdown is reported. 10 s is frequent enough to watch a
+/// rehearsal drift and rare enough that the report itself is not noise in the log.
+constexpr int64_t kLatencyReportPeriodUs = 10 * 1000 * 1000;
+/// Instrumentation may not cost more than this share of the analysis period. Checked
+/// rather than assumed: a profiler that perturbs what it measures is worse than none.
+constexpr float kProfilerBudgetShare = 0.01f;
 const char* kTag = "cores3_noise_adapt";
 
 void emit_command_json(const EarbudCommand& command) {
@@ -43,6 +52,32 @@ void emit_command_json(const EarbudCommand& command) {
                 command.speech_gain_db, command.noise_reduction_db, command.media_percent,
                 adapt_state_name(command.state), environment_name(command.environment),
                 command.confidence);
+}
+
+/// Report the per-stage breakdown, then clear the window so the next report covers the
+/// next interval. A rolling window that never resets would blend the whole session and
+/// hide a regression that started an hour in.
+void emit_latency_report(latency::LatencyProfiler& profiler,
+                         const latency::ProfilerOverhead& overhead, uint32_t frames) {
+    std::printf("{\"type\":\"latency\",\"frames\":%lu,\"total_p50_ms\":%.2f,"
+                "\"total_p95_ms\":%.2f,\"overhead_mean_us\":%.1f,\"overhead_max_us\":%.1f,"
+                "\"budget_share\":%.5f,\"within_budget\":%s,\"stages\":[",
+                static_cast<unsigned long>(frames), profiler.total_p50_ms(),
+                profiler.total_p95_ms(), static_cast<double>(overhead.mean_ms()) * 1000.0,
+                static_cast<double>(overhead.max_ms()) * 1000.0,
+                static_cast<double>(overhead.budget_share()),
+                overhead.within_budget(kProfilerBudgetShare) ? "true" : "false");
+    for (std::size_t i = 0; i < latency::kStageCount; ++i) {
+        const auto stage = static_cast<latency::Stage>(i);
+        const latency::StageStats stats = profiler.stats(stage);
+        std::printf("%s{\"stage\":\"%s\",\"n\":%lu,\"p50_ms\":%.3f,\"p95_ms\":%.3f,"
+                    "\"max_ms\":%.3f}",
+                    i == 0 ? "" : ",", latency::stage_name(stage),
+                    static_cast<unsigned long>(stats.samples),
+                    static_cast<double>(stats.p50_ms), static_cast<double>(stats.p95_ms),
+                    static_cast<double>(stats.max_ms));
+    }
+    std::printf("]}\n");
 }
 
 // ---------------------------------------------------------------------------------
@@ -105,12 +140,13 @@ bool poll_console_command() {
     return handled;
 }
 
-void emit_capture_chunk(const int16_t* samples, std::size_t count, uint32_t sequence) {
-    // Sized for the worst case so encode_chunk never refuses. Static rather than on the
-    // stack: the audio task's stack is 12 KB and this is 2.7 KB of it for no benefit.
-    static char encoded[mic_capture::kMaxEncodedChars];
+/// `encoded` must hold mic_capture::kMaxEncodedChars. Passed in rather than held as a
+/// file-scope static: the buffer is only needed for the duration of the call, and a
+/// module-level 2.7 KB array hides what the capture path actually costs.
+void emit_capture_chunk(const int16_t* samples, std::size_t count, uint32_t sequence,
+                        char* encoded) {
     const std::size_t length =
-        mic_capture::encode_chunk(samples, count, encoded, sizeof(encoded));
+        mic_capture::encode_chunk(samples, count, encoded, mic_capture::kMaxEncodedChars);
     if (length == 0) {
         // Should be unreachable: the buffer is sized for the chunk size. Report rather
         // than emit a malformed line that the host would silently skip.
@@ -166,13 +202,19 @@ void processing_task(void*) {
     auto* pending = static_cast<int16_t*>(
         heap_caps_malloc(kCaptureChunkSamples * sizeof(int16_t),
                          MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-    if (decimated == nullptr || pending == nullptr) {
+    auto* encode_buffer =
+        static_cast<char*>(heap_caps_malloc(mic_capture::kMaxEncodedChars, MALLOC_CAP_8BIT));
+    if (decimated == nullptr || pending == nullptr || encode_buffer == nullptr) {
         ESP_LOGE(kTag, "Capture buffer allocation failed");
         vTaskDelete(nullptr);
     }
 
     NoiseAnalyzer analyzer;
     AdaptController controller;
+    latency::LatencyProfiler profiler;
+    latency::ProfilerOverhead overhead(kControlPeriodMs);
+    int64_t next_latency_report_us = esp_timer_get_time() + kLatencyReportPeriodUs;
+    uint32_t analysed_frames = 0;
     capture::Decimator decimator;
     uint32_t capture_sequence = 0;
     std::size_t pending_samples = 0;
@@ -206,13 +248,15 @@ void processing_task(void*) {
             for (std::size_t i = 0; i < produced; ++i) {
                 pending[pending_samples++] = decimated[i];
                 if (pending_samples == kCaptureChunkSamples) {
-                    emit_capture_chunk(pending, pending_samples, ++capture_sequence);
+                    emit_capture_chunk(pending, pending_samples, ++capture_sequence,
+                                       encode_buffer);
                     pending_samples = 0;
                 }
             }
             if (capture_deadline_us != 0 && now_us >= capture_deadline_us) {
                 if (pending_samples > 0) {
-                    emit_capture_chunk(pending, pending_samples, ++capture_sequence);
+                    emit_capture_chunk(pending, pending_samples, ++capture_sequence,
+                                       encode_buffer);
                     pending_samples = 0;
                 }
                 g_record_seconds = -1;
@@ -228,19 +272,50 @@ void processing_task(void*) {
                          static_cast<int64_t>(period_ms * 1000.0f);
         if (!due) continue;
 
-        const int64_t started_us = esp_timer_get_time();
+        // The probe is read before anything else is timed, so the overhead figure below
+        // measures the instrumentation and not the work it is measuring.
+        const int64_t probe_us = esp_timer_get_time();
+        const float capture_ms = static_cast<float>(probe_us - last_control_us) / 1000.0f;
+
+        const int64_t analyse_started_us = esp_timer_get_time();
         AnalysisFrame frame = analyzer.analyze(samples, kFrameSamples,
             static_cast<uint32_t>(now_us / 1000));
         if (read_result != ESP_OK) frame.mic_valid = false;
+        const int64_t analyse_done_us = esp_timer_get_time();
+
         const float elapsed_ms = static_cast<float>(now_us - last_control_us) / 1000.0f;
         EarbudCommand command = controller.update(frame, elapsed_ms);
-        const float processing_ms = static_cast<float>(esp_timer_get_time() - started_us) / 1000.0f;
+        const int64_t decide_done_us = esp_timer_get_time();
+
+        const float analyse_ms = static_cast<float>(analyse_done_us - analyse_started_us) / 1000.0f;
+        const float decide_ms = static_cast<float>(decide_done_us - analyse_done_us) / 1000.0f;
+        const float processing_ms = static_cast<float>(decide_done_us - analyse_started_us) / 1000.0f;
+
+        // Interval between analyses, i.e. how often the decision is refreshed. See the
+        // note on Stage::capture: this is not the hardware buffering delay alone.
+        profiler.record(latency::Stage::capture, capture_ms);
+        profiler.record(latency::Stage::analyse, analyse_ms);
+        // The embedding stage stays at zero until speaker embeddings exist on the device.
+        // It is reported anyway so the column is present and its absence is visible rather
+        // than being mistaken for "costs nothing".
+        profiler.record(latency::Stage::embed, 0.0f);
+        profiler.record(latency::Stage::decide, decide_ms);
+        overhead.record(static_cast<float>(esp_timer_get_time() - probe_us) / 1000.0f);
+        ++analysed_frames;
+
         emit_command_json(command);
 
         if (bsp_display_lock(100)) {
             demo_ui_update(frame, command, processing_ms, esp_get_free_heap_size());
             bsp_display_unlock();
         }
+
+        if (esp_timer_get_time() >= next_latency_report_us) {
+            emit_latency_report(profiler, overhead, analysed_frames);
+            profiler.reset();
+            next_latency_report_us = esp_timer_get_time() + kLatencyReportPeriodUs;
+        }
+
         last_control_us = now_us;
     }
 }
