@@ -193,6 +193,30 @@ int main() {
               "after reset the filter reproduces the same response");
     }
 
+    // Regression: the caller's output capacity must cover the phase carryover.
+    //
+    // The device capture path used to size its buffer as count / kDecimation + 1 = 171 for a
+    // 512-sample block. 512 % 3 == 2, so the phase carries over and the decimator's worst case
+    // reaches 172 -- it then returned 0 without writing anything, on every call, forever:
+    // because the phase never advanced again, every block was discarded from the second one on.
+    // Measured on device, a 10-second recording produced exactly one chunk of 170 samples.
+    {
+        std::vector<int16_t> block(512, 1000);
+        std::vector<int16_t> out(200, 0);
+
+        capture::Decimator too_small;
+        std::size_t produced_171 = 0;
+        for (int i = 0; i < 10; ++i) produced_171 += too_small.process(block.data(), 512, out.data(), 171);
+        check(produced_171 == 170,
+              "a 171-sample buffer silently loses every block after the first");
+
+        capture::Decimator sufficient;
+        std::size_t produced_173 = 0;
+        for (int i = 0; i < 10; ++i) produced_173 += sufficient.process(block.data(), 512, out.data(), 173);
+        check(produced_173 == 1706, "a 173-sample buffer converts all ten blocks");
+        check(produced_173 > produced_171 * 9, "the difference is not a rounding error");
+    }
+
     std::cout << "MicDecimator: " << passed << "/" << (passed + failed) << " passed\n";
     return failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

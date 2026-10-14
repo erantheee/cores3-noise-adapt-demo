@@ -220,9 +220,23 @@ void processing_task(void*) {
         ESP_LOGE(kTag, "Audio buffer allocation failed");
         vTaskDelete(nullptr);
     }
-    // 2048 input samples decimate to at most 683 output samples.
+    // Capacity for one read block's decimation, plus the phase carryover.
+    //
+    // `+ 2` is not padding, it is the fix for a silent total loss of the recording. The
+    // decimator computes its worst case as (count + phase) / kDecimation and returns 0 --
+    // writing nothing at all -- when the buffer is too small. 512 is not a multiple of 3, so
+    // the phase carries over (512 % 3 = 2), and the worst case reaches 172 while `+ 1` sized
+    // the buffer for 171. It therefore returned 0 on every call from that point on, for good:
+    // the phase never advanced again, so the block was永远 discarded, one block in every one.
+    //
+    // Measured on device: a 10-second recording produced exactly one chunk of 170 samples,
+    // with the capture diagnostic reporting `reads` climbing while `decimated` stayed at 170.
+    constexpr std::size_t kDecimatedCapacity = kReadBlockSamples / capture::kDecimation + 2;
+    static_assert(kDecimatedCapacity >=
+                      (kReadBlockSamples + capture::kDecimation - 1) / capture::kDecimation + 1,
+                  "the decimated buffer must cover a block plus the phase carryover");
     auto* decimated = static_cast<int16_t*>(
-        heap_caps_malloc((kReadBlockSamples / capture::kDecimation + 1) * sizeof(int16_t),
+        heap_caps_malloc(kDecimatedCapacity * sizeof(int16_t),
                          MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     auto* pending = static_cast<int16_t*>(
         heap_caps_malloc(kCaptureChunkSamples * sizeof(int16_t),
@@ -309,7 +323,7 @@ void processing_task(void*) {
             // what made the recording contain stale audio.
             ++capture_reads;
             const std::size_t produced = decimator.process(read_block, got, decimated,
-                                                           kReadBlockSamples / capture::kDecimation + 1);
+                                                           kDecimatedCapacity);
             capture_decimated_samples += static_cast<uint32_t>(produced);
             for (std::size_t i = 0; i < produced; ++i) {
                 pending[pending_samples++] = decimated[i];

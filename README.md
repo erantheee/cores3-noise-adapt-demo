@@ -144,7 +144,7 @@ idf.py -p /dev/cu.usbmodemXXX flash monitor
 `main/controller.cpp` 刻意不依赖 ESP-IDF，所以整条决策路径可以在开发机上秒级验证。
 **新增判据或阈值时必须在这里补用例。**
 
-当前 6 个套件、**178 条断言**：
+当前 6 个套件、**181 条断言**：
 
 ```bash
 cmake -S test -B build-host-tests

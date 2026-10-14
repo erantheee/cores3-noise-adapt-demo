@@ -61,6 +61,12 @@ public:
     /// Convert `count` input samples. Returns the number of output samples written.
     /// Returns 0 when the inputs are unusable or the output buffer is too short; it never
     /// writes a partial result, because a short block would shift every later sample.
+    ///
+    /// Note for callers: the "too short" case is not a rare edge. The worst case is
+    /// (count + phase + kDecimation - 1) / kDecimation and the phase carries over between
+    /// calls whenever `count` is not a multiple of kDecimation, so a capacity of
+    /// count / kDecimation + 1 is *not* enough -- it silently returns 0 forever after the
+    /// first full block, because the phase never advances again. Size for count/k + 2.
     std::size_t process(const int16_t* input, std::size_t count, int16_t* output,
                         std::size_t output_capacity);
 
