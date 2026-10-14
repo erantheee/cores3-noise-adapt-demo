@@ -113,6 +113,39 @@ c++ -std=c++17 -I main test/controller_test.cpp main/controller.cpp -o /tmp/cont
 c++ -std=c++17 -I main test/noise_analyzer_test.cpp main/controller.cpp -o /tmp/noise_test && /tmp/noise_test
 ```
 
+## 端侧录音
+
+声纹可分性、近场信噪比、判据标定这三笔账**都必须用设备自己听到的音频**。笔记本录的是笔记本
+的声学，对端侧结论无效。固件因此内置了一条录音通路：
+
+```bash
+# 1) 用 921600 打开串口（16 kHz 录音在 115200 下会丢块）
+python3 tools/monitor.sh          # 或直接用下面的录音脚本
+
+# 2) 让设备开始录，然后录音脚本落盘
+#    在串口里发命令：rec start 10     （录 10 秒）
+#                    rec start        （一直录，直到 rec stop）
+#                    rec stop
+python3 tools/record_from_device.py --port /dev/cu.usbmodem1101 \
+    --baud 921600 --seconds 12 --out 记录/甲-安静.wav
+```
+
+设备每 64 ms 发一行 base64 分块（16 kHz 单声道）。**为什么是 16 kHz**：48 kHz 单声道
+base64 约 128 kB/s，而串口可用吞吐约 92 kB/s（139%，不可用）；16 kHz 占 46%。
+
+录音脚本会**报告丢块**。丢块会让声纹类内抖动与信噪比失真，所以有丢块的录音不能用于结论，
+脚本遇到丢块返回非零退出码。
+
+### 录什么
+
+| 用途 | 怎么录 |
+|---|---|
+| 判据标定 | 安静房间本底、白噪声、1 kHz 纯音、真人语音，各 10 秒 |
+| 近场信噪比 | 设备拿在手里对 10–20 cm 说话、1 m 外说话、嘈杂本底，各 30 秒 |
+| 声纹可分性 | **同一人分两次录**（换距离、换音量）至少 3 条；另一人 3 条 |
+
+声纹那组一定要**刻意改变条件**——只在一个条件下录出来的"稳定"声纹，在真实使用中不成立。
+
 ## 声纹可分性测量
 
 在投入端侧声纹工程**之前**先跑这个：

@@ -11,6 +11,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(COMMON_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/controller.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/latency_profiler.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../main/mic_capture.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../main/mic_decimator.cpp
 )
 
 enable_testing()
@@ -26,3 +28,11 @@ add_test(NAME noise_analyzer_test COMMAND noise_analyzer_test)
 add_executable(latency_profiler_test latency_profiler_test.cpp ${COMMON_SOURCES})
 target_include_directories(latency_profiler_test PRIVATE ../main)
 add_test(NAME latency_profiler_test COMMAND latency_profiler_test)
+
+add_executable(mic_capture_test mic_capture_test.cpp ${COMMON_SOURCES})
+target_include_directories(mic_capture_test PRIVATE ../main)
+add_test(NAME mic_capture_test COMMAND mic_capture_test)
+
+add_executable(mic_decimator_test mic_decimator_test.cpp ${COMMON_SOURCES})
+target_include_directories(mic_decimator_test PRIVATE ../main)
+add_test(NAME mic_decimator_test COMMAND mic_decimator_test)
