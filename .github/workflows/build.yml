@@ -1,9 +1,28 @@
-name: ESP-IDF build
+name: build
+
 on:
   push:
   pull_request:
+
 jobs:
+  # Runs first and gates the firmware job. The analyser and controller are free of
+  # ESP-IDF dependencies, so the whole decision path is testable on a plain host in
+  # seconds. Before this job existed, a regression in the environment decision reached
+  # firmware unchecked.
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S test -B build-host-tests
+      - name: Build
+        run: cmake --build build-host-tests --parallel
+      - name: Run tests
+        working-directory: build-host-tests
+        run: ctest --output-on-failure
+
   firmware:
+    needs: host-tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -4,3 +4,6 @@ managed_components/
 dependencies.lock
 sdkconfig
 .DS_Store
+__pycache__/
+*.pyc
+build-host-tests/
