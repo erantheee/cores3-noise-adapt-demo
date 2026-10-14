@@ -129,10 +129,11 @@ def read_serial(port: str, baud: int, seconds: float, recorder: Recorder, dry_ru
         ) from exc
 
     connection = serial.Serial(port=port, baudrate=baud, timeout=0.2)
-    # Match tools/monitor.sh: leave DTR/RTS alone so opening the port does not reset
-    # the board out from under an in-progress recording.
-    connection.dtr = False
-    connection.rts = False
+    # Match tools/monitor.sh: assert DTR/RTS. The ESP32-S3's built-in USB Serial/JTAG
+    # does not transmit while DTR is deasserted -- this used to be `dtr = False`, which
+    # made the port open cleanly and then deliver nothing at all, for any duration.
+    connection.dtr = True
+    connection.rts = True
     print(f"监听 {port} @ {baud}，最多 {seconds:g} 秒（Ctrl+C 提前结束）")
     deadline = time.monotonic() + seconds
     try:

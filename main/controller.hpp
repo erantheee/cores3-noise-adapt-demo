@@ -8,7 +8,6 @@ constexpr std::size_t kBandCount = 24;
 /// Largest analysis frame the window table will hold. The audio task uses 2048 samples.
 constexpr std::size_t kMaxAnalysisFrame = 4096;
 constexpr float kMaxSpeechGainDb = 6.5f;
-constexpr float kMaxNoiseReductionDb = 8.0f;
 
 enum class AdaptState : uint8_t {
     observing,
@@ -76,7 +75,6 @@ struct EarbudCommand {
     uint32_t sequence = 0;
     uint32_t timestamp_ms = 0;
     float speech_gain_db = 0.0f;
-    float noise_reduction_db = 0.0f;
     uint8_t media_percent = 100;
     std::array<float, kBandCount> eq_gain_db{};
     AdaptState state = AdaptState::observing;
@@ -99,7 +97,6 @@ public:
 private:
     uint32_t sequence_ = 0;
     float speech_gain_db_ = 0.0f;
-    float noise_reduction_db_ = 0.0f;
     float media_percent_ = 100.0f;
     float valid_ms_ = 0.0f;
     float invalid_ms_ = 0.0f;

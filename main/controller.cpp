@@ -271,7 +271,6 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
         invalid_ms_ += dt_ms;
         valid_ms_ = 0.0f;
         speech_gain_db_ = slew(speech_gain_db_, 0.0f, dt_ms, 100.0f, 250.0f);
-        noise_reduction_db_ = slew(noise_reduction_db_, 0.0f, dt_ms, 100.0f, 250.0f);
         media_percent_ = slew(media_percent_, 100.0f, dt_ms, 100.0f, 250.0f);
         command.state = invalid_ms_ >= 250.0f ? AdaptState::mic_fault : AdaptState::recovering;
     } else {
@@ -279,11 +278,13 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
         valid_ms_ += dt_ms;
         const float noise = clamp01((frame.broadband_dbfs + 58.0f) / 30.0f);
         const float voice = clamp01(frame.voice_likelihood);
+        // The only two actions this product has: lift the speech band, and make room for it
+        // by pulling the media level back. There is no noise reduction -- an earlier revision
+        // also computed one and reported it as `noise_reduction_db`, but nothing in the chain
+        // ever consumed it, and it made the device claim a capability it does not have.
         const float speech_target = std::min(kMaxSpeechGainDb, noise * (2.5f + 4.0f * voice));
-        const float nr_target = std::min(kMaxNoiseReductionDb, noise * (7.0f - 2.0f * voice));
         const float media_target = 100.0f - 28.0f * noise * voice;
         speech_gain_db_ = slew(speech_gain_db_, speech_target, dt_ms, 350.0f, 1200.0f);
-        noise_reduction_db_ = slew(noise_reduction_db_, nr_target, dt_ms, 450.0f, 1500.0f);
         media_percent_ = slew(media_percent_, media_target, dt_ms, 250.0f, 800.0f);
 
         if (frame.broadband_dbfs < -56.0f) command.environment = EnvironmentKind::quiet;
@@ -292,7 +293,7 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
         else command.environment = EnvironmentKind::steady_noise;
 
         const bool moving = std::abs(speech_target - speech_gain_db_) > 0.25f ||
-                            std::abs(nr_target - noise_reduction_db_) > 0.25f;
+                            std::abs(media_target - media_percent_) > 2.0f;
         command.state = valid_ms_ < 500.0f ? AdaptState::observing
                                            : (moving ? AdaptState::adjusting : AdaptState::holding);
         command.confidence = clamp01(valid_ms_ / 1200.0f) * (1.0f - clamp01(frame.motion / 4.0f) * 0.35f);
@@ -304,7 +305,6 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
     }
 
     command.speech_gain_db = std::clamp(speech_gain_db_, 0.0f, kMaxSpeechGainDb);
-    command.noise_reduction_db = std::clamp(noise_reduction_db_, 0.0f, kMaxNoiseReductionDb);
     command.media_percent = static_cast<uint8_t>(std::lround(std::clamp(media_percent_, 65.0f, 100.0f)));
     return command;
 }
@@ -312,7 +312,6 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
 void AdaptController::reset() {
     sequence_ = 0;
     speech_gain_db_ = 0.0f;
-    noise_reduction_db_ = 0.0f;
     media_percent_ = 100.0f;
     valid_ms_ = 0.0f;
     invalid_ms_ = 0.0f;

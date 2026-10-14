@@ -11,7 +11,7 @@ namespace {
 lv_obj_t* env_value;
 lv_obj_t* action_value;
 lv_obj_t* voice_value;
-lv_obj_t* nr_value;
+lv_obj_t* tune_value;
 lv_obj_t* media_value;
 lv_obj_t* link_value;
 lv_obj_t* detail_value;
@@ -84,12 +84,12 @@ void demo_ui_create() {
     make_card(screen, 10, 31, 92, 60, "环境", &env_value);
     make_card(screen, 108, 31, 202, 60, "当前动作", &action_value);
     make_card(screen, 10, 97, 96, 60, "人声增益", &voice_value);
-    make_card(screen, 112, 97, 96, 60, "降噪", &nr_value);
+    make_card(screen, 112, 97, 96, 60, "调音", &tune_value);
     make_card(screen, 214, 97, 96, 60, "媒体音量", &media_value);
     make_card(screen, 10, 163, 96, 52, "控制链路", &link_value);
 
     lv_obj_set_style_text_font(voice_value, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_font(nr_value, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(tune_value, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_font(media_value, &lv_font_montserrat_20, 0);
 
     detail_value = lv_label_create(screen);
@@ -124,8 +124,18 @@ void demo_ui_update(const AnalysisFrame& frame, const EarbudCommand& command,
 
     std::snprintf(text, sizeof(text), "+%.1f dB", command.speech_gain_db);
     lv_label_set_text(voice_value, text);
-    std::snprintf(text, sizeof(text), "-%.1f dB", command.noise_reduction_db);
-    lv_label_set_text(nr_value, text);
+    // Tuning, not noise reduction: this is how much the speech band is lifted.
+    //
+    // The text is deliberately digits and Latin only. An earlier draft wrote "9段 +4.2",
+    // and 段 is NOT in lv_font_ui_16's 115-glyph subset -- it would have rendered as a
+    // blank box on the device, which is exactly the failure the font note in the README
+    // warns about. Carrying no CJK here also lets this card keep the crisp 20px numeric font.
+    float lifted_db = 0.0f;
+    for (std::size_t band = 0; band < kBandCount; ++band) {
+        if (command.eq_gain_db[band] > lifted_db) lifted_db = command.eq_gain_db[band];
+    }
+    std::snprintf(text, sizeof(text), "+%.1f dB", static_cast<double>(lifted_db));
+    lv_label_set_text(tune_value, text);
     std::snprintf(text, sizeof(text), "%u%%", command.media_percent);
     lv_label_set_text(media_value, text);
 

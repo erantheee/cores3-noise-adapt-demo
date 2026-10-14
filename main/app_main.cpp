@@ -1,3 +1,4 @@
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 
@@ -49,18 +50,32 @@ constexpr std::size_t kCaptureChunkSamples = 1024;
 constexpr int64_t kLatencyReportPeriodUs = 10 * 1000 * 1000;
 const char* kTag = "cores3_noise_adapt";
 
+/// Emit one frame of EarbudCommand v1.
+///
+/// Two deliberate changes from the previous revision:
+///   * `noise_reduction_db` is gone. This product's actions are gain and tuning; the field
+///     was computed, printed and shown on the device screen while nothing consumed it.
+///   * `eq_gain_db` is now transmitted. It was always computed (24 per-band gains) and
+///     applied to the command, but never sent -- so the host could not show the tuning at
+///     all, and the panel had to infer its shape from the scalar `speech_gain_db`.
+///
+/// Band gains are printed with one decimal on purpose: they only ever hold 0 or the same
+/// scalar speech gain, and one decimal keeps a frame near 250 bytes.
 void emit_command_json(const EarbudCommand& command) {
     std::printf("{\"type\":\"earbud_command\",\"schema\":%lu,\"sequence\":%lu,"
                 "\"timestamp_ms\":%lu,\"speech_gain_db\":%.2f,"
-                "\"noise_reduction_db\":%.2f,\"media_percent\":%u,"
-                "\"state\":\"%s\",\"environment\":\"%s\","
-                "\"confidence\":%.2f,\"link\":\"simulated\"}\n",
+                "\"media_percent\":%u,\"state\":\"%s\",\"environment\":\"%s\","
+                "\"confidence\":%.2f,\"link\":\"simulated\",\"eq_gain_db\":[",
                 static_cast<unsigned long>(command.schema_version),
                 static_cast<unsigned long>(command.sequence),
                 static_cast<unsigned long>(command.timestamp_ms),
-                command.speech_gain_db, command.noise_reduction_db, command.media_percent,
+                command.speech_gain_db, command.media_percent,
                 adapt_state_name(command.state), environment_name(command.environment),
                 command.confidence);
+    for (std::size_t band = 0; band < kBandCount; ++band) {
+        std::printf("%s%.1f", band == 0 ? "" : ",", static_cast<double>(command.eq_gain_db[band]));
+    }
+    std::printf("]}\n");
 }
 
 /// Report the per-stage breakdown, then clear the window so the next report covers the

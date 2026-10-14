@@ -21,8 +21,13 @@ import serial
 
 port, baud = sys.argv[1], int(sys.argv[2])
 ser = serial.Serial(port=port, baudrate=baud, timeout=0.2)
-ser.dtr = False
-ser.rts = False
+# Both lines MUST be asserted on this board. The ESP32-S3's built-in USB Serial/JTAG
+# only transmits while DTR is asserted, so pyserial's previous `dtr = False` -- added
+# in the belief that it was the polite, non-resetting choice -- silently produced a
+# port that opened fine and delivered zero bytes forever. Measured on this CoreS3:
+# dtr=False -> 0 bytes in 10 s, dtr=True -> 17 kB in 10 s with the same firmware.
+ser.dtr = True
+ser.rts = True
 print(f"listening on {port} @ {baud}, Ctrl+C to exit", flush=True)
 try:
     while True:

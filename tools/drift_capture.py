@@ -47,9 +47,22 @@ def collect(port: str, baud: int, seconds: float, out: Path) -> int:
 
     out.parent.mkdir(parents=True, exist_ok=True)
     connection = serial.Serial(port=port, baudrate=baud, timeout=0.5)
-    # Do not touch DTR/RTS: opening the port must not reset a running device.
-    connection.dtr = False
-    connection.rts = False
+    # Assert DTR/RTS, but only for the built-in USB-Serial/JTAG.
+    #
+    # This used to be `dtr = False` under the comment "do not touch DTR/RTS", on the belief
+    # that leaving them alone was the polite choice. On this board it is the opposite: the
+    # ESP32-S3's built-in USB Serial/JTAG does not transmit while DTR is deasserted, so the
+    # port opened, accepted writes, and then delivered zero bytes for the whole run --
+    # measured on this machine: dtr=False -> 0 bytes in 10 s, dtr=True -> 17115 bytes in 10 s,
+    # same board, same firmware. That is exactly the failure this script's own fail-fast
+    # check reports, which sent the reader looking at the device instead of at the tool.
+    #
+    # It must NOT be unconditional: on a classic USB-UART bridge (CP2102/CH340/FTDI, where
+    # DTR->IO0 and RTS->EN) asserting RTS holds EN low, i.e. holds the chip in reset, and
+    # the symptom is once again "zero bytes". Only the native USB-Serial/JTAG wants this.
+    if port.startswith("/dev/cu.usbmodem") or port.startswith("/dev/tty.usbmodem"):
+        connection.dtr = True
+        connection.rts = True
 
     kept = 0
     deadline = time.monotonic() + seconds
@@ -69,9 +82,12 @@ def collect(port: str, baud: int, seconds: float, out: Path) -> int:
                 if not raw:
                     if kept == 0 and time.monotonic() > first_data_deadline:
                         print(
-                            "10 秒内没有收到任何数据。设备可能未连接、未上电或未在运行。\n"
-                            "注意：/dev/cu.usbmodem* 节点在设备拔掉后仍可能存在，端口能打开"
-                            "并不代表设备在。",
+                            "10 秒内没有收到任何数据。按可能性排序：\n"
+                            "  1. 设备可能未连接、未上电或未在运行；\n"
+                            "  2. /dev/cu.usbmodem* 节点在设备拔掉后仍可能存在——端口能打开"
+                            "并不代表设备在；\n"
+                            "  3. 如果你改过端口判定（例如把内置 JTAG 当成了经典串口桥），"
+                            "modem 线没置位也会是这个症状。",
                             file=sys.stderr,
                         )
                         return 1

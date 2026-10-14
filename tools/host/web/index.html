@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CoreS3 上位机 · 端侧算法验证机</title>
+<style>
+  :root {
+    --bg: #0b0f14;
+    --panel: #121922;
+    --panel-2: #16202b;
+    --line: #223040;
+    --text: #e8eef5;
+    --muted: #8ea3b8;
+    --accent: #4cc2ff;
+    --ok: #3ddc84;
+    --warn: #ffb020;
+    --bad: #ff5c6c;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, "PingFang SC", "Helvetica Neue", Arial, sans-serif;
+    font-size: 14px; line-height: 1.5;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 12px 18px; background: var(--panel); border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; z-index: 5;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: .02em; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 3px 10px; border-radius: 999px; font-size: 12px;
+    border: 1px solid var(--line); background: var(--panel-2); color: var(--muted);
+  }
+  .badge b { color: var(--text); font-weight: 600; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.bad { background: var(--bad); }
+  main { padding: 16px 18px 40px; display: grid; gap: 14px; }
+  .grid { display: grid; gap: 14px; }
+  .cards { grid-template-columns: repeat(auto-fit, minmax(178px, 1fr)); }
+  .two { grid-template-columns: minmax(320px, 1.25fr) minmax(300px, 1fr); }
+  @media (max-width: 900px) { .two { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 12px 14px; min-width: 0;
+  }
+  .card h2 {
+    font-size: 12px; margin: 0 0 8px; color: var(--muted); font-weight: 600;
+    letter-spacing: .06em; text-transform: none;
+  }
+  .value { font-size: 26px; font-weight: 650; font-family: var(--mono); letter-spacing: -.01em; }
+  .value.small { font-size: 20px; }
+  .sub { color: var(--muted); font-size: 12px; margin-top: 4px; font-family: var(--mono); }
+  .meter { height: 6px; background: #1b2632; border-radius: 3px; overflow: hidden; margin-top: 8px; }
+  .meter > span { display: block; height: 100%; background: var(--accent); width: 0; transition: width .12s linear; }
+  .env-QUIET { color: var(--ok); } .env-NOISY { color: var(--accent); }
+  .env-VOICE { color: #ffd166; } .env-LOUD { color: var(--bad); }
+  .statelink { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  .warnbox {
+    border: 1px solid #5a3b12; background: #2a1d08; color: #ffd9a0;
+    border-radius: 8px; padding: 10px 12px; font-size: 13px;
+  }
+  .warnbox.bad { border-color: #5c1f27; background: #2b1013; color: #ffc9d0; }
+  .warnbox.ok { border-color: #1d4a32; background: #0f2419; color: #b8f0cd; }
+  table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12.5px; }
+  th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid #1b2632; }
+  th { color: var(--muted); font-weight: 500; }
+  td.num, th.num { text-align: right; }
+  ul.list { list-style: none; margin: 0; padding: 0; font-size: 12.5px; max-height: 230px; overflow: auto; }
+  ul.list li { padding: 5px 0; border-bottom: 1px solid #1b2632; display: flex; gap: 8px; }
+  ul.list li time { color: var(--muted); font-family: var(--mono); flex: 0 0 62px; }
+  ul.list li.kind-state span { color: #ffd166; }
+  ul.list li.kind-environment span { color: var(--accent); }
+  ul.list li.kind-capture span { color: var(--ok); }
+  ul.list li.kind-control span { color: #c9a6ff; }
+  pre.raw {
+    margin: 0; font-family: var(--mono); font-size: 11.5px; color: var(--muted);
+    max-height: 180px; overflow: auto; white-space: pre-wrap; word-break: break-all;
+  }
+  canvas { width: 100%; height: 150px; display: block; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  button {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 7px; padding: 6px 12px; font-size: 13px; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  input[type=number] {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 7px; padding: 6px 8px; width: 72px; font-family: var(--mono);
+  }
+  #toast { font-size: 12.5px; color: var(--muted); }
+  .legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .legend i { display: inline-block; width: 10px; height: 3px; vertical-align: middle; margin-right: 5px; }
+  footer { color: var(--muted); font-size: 12px; padding: 0 18px 24px; }
+  code { font-family: var(--mono); background: #16202b; padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>CoreS3 上位机</h1>
+  <span class="badge"><i class="dot" id="conn-dot"></i><span id="conn-text">连接中…</span></span>
+  <span class="badge">数据源 <b id="source-text">—</b></span>
+  <span class="badge">已连接 <b id="uptime">0 s</b></span>
+  <span class="badge">控制帧 <b id="frames">0</b></span>
+  <span class="badge">丢帧 <b id="lost">0</b></span>
+  <span class="badge">数据年龄 <b id="age">—</b></span>
+  <span class="badge">端口 <b id="port">—</b></span>
+</header>
+
+<main>
+  <div id="alerts" class="grid"></div>
+
+  <div class="grid cards">
+    <div class="card">
+      <h2>环境</h2>
+      <div class="value" id="env">—</div>
+      <div class="sub" id="env-raw">—</div>
+    </div>
+    <div class="card">
+      <h2>当前动作</h2>
+      <div class="value small" id="state">—</div>
+      <div class="sub" id="state-raw">—</div>
+    </div>
+    <div class="card">
+      <h2>人声增益</h2>
+      <div class="value" id="gain">—</div>
+      <div class="meter"><span id="gain-bar"></span></div>
+      <div class="sub" id="gain-cap">硬上限 +6.5 dB</div>
+    </div>
+    <div class="card">
+      <h2>调音（24 频段 EQ）</h2>
+      <canvas id="eq" height="52" style="height:52px"></canvas>
+      <div class="sub" id="eq-note">固件只抬语音段（8–16 号频段），其余频段保持 0 dB</div>
+    </div>
+    <div class="card">
+      <h2>建议媒体音量</h2>
+      <div class="value" id="media">—</div>
+      <div class="meter"><span id="media-bar"></span></div>
+      <div class="sub">增益的配套让位</div>
+    </div>
+    <div class="card">
+      <h2>控制链路</h2>
+      <div class="value small" id="link">—</div>
+      <div class="sub" id="link-raw">—</div>
+    </div>
+    <div class="card">
+      <h2>人声置信度</h2>
+      <div class="value small" id="conf">—</div>
+      <div class="meter"><span id="conf-bar"></span></div>
+      <div class="sub" id="seq">帧序号 —</div>
+    </div>
+  </div>
+
+  <div class="grid two">
+    <div class="card">
+      <h2>趋势（最近 90 秒）</h2>
+      <canvas id="chart" width="900" height="150"></canvas>
+      <div class="legend">
+        <span><i style="background:#4cc2ff"></i>语音段增益 dB（调音幅度）</span>
+        <span><i style="background:#3ddc84"></i>建议媒体音量 %</span>
+      </div>
+    </div>
+    <div class="card">
+      <h2>端侧分段延迟（设备每 10 秒汇总一次）</h2>
+      <table>
+        <thead><tr><th>阶段</th><th class="num">p50</th><th class="num">p95</th><th class="num">max</th><th class="num">n</th></tr></thead>
+        <tbody id="latency-body"><tr><td colspan="5">尚未收到汇总（设备每 10 秒发一次）</td></tr></tbody>
+      </table>
+      <div class="sub" id="latency-note">—</div>
+    </div>
+  </div>
+
+  <div class="grid two">
+    <div class="card">
+      <h2>设备录音（控制设备自己的麦克风）</h2>
+      <div class="row">
+        <input type="number" id="rec-seconds" value="10" min="1" max="3600">
+        <button id="btn-rec-start">开始录音</button>
+        <button id="btn-rec-stop">停止</button>
+        <span id="capture-text" class="sub">未在录音</span>
+      </div>
+      <div class="sub" id="capture-detail">—</div>
+      <div class="warnbox" style="margin-top:10px">
+        这里的录音块<b>不会自动落盘</b>——落盘由 <code>tools/record_from_device.py</code> 负责，
+        它同时报告丢块。上位机只负责把状态显示出来，避免两套写盘逻辑各记一半。
+        录音是设备自己的麦克风，与面板上的增益/调音是两条独立通路。
+      </div>
+      <div class="warnbox bad" id="control-warn" style="margin-top:8px; display:none">
+        <b>回控处于降级状态</b>：命令能写进串口，但设备没有任何回应。上位机会把每条命令的
+        结果如实报出来，不会因为 <code>write()</code> 成功就显示成已执行。
+      </div>
+      <div id="toast" style="margin-top:8px">—</div>
+    </div>
+    <div class="card">
+      <h2>异常与事件</h2>
+      <ul class="list" id="problems"></ul>
+      <h2 style="margin-top:12px">状态变化</h2>
+      <ul class="list" id="events"></ul>
+    </div>
+  </div>
+
+  <div class="grid two">
+    <div class="card">
+      <h2>统计</h2>
+      <table><tbody id="stats-body"></tbody></table>
+    </div>
+    <div class="card">
+      <h2>设备原始输出（最后几行，非协议行也算）</h2>
+      <pre class="raw" id="raw">—</pre>
+    </div>
+  </div>
+</main>
+
+<footer>
+  本机只做<b>增益与调音</b>，不做降噪——面板上不再有降噪那一格。
+  控制链路显示 <code>模拟</code> 表示设备自称没有接通可控耳机协议；上位机不会把它写成已连接或已发送。
+  界面上的每个数字都来自设备自己输出的 <code>EarbudCommand v1</code> 帧。
+</footer>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let lastSnapshot = null;
+
+function fmt(value, digits = 2, suffix = "") {
+  if (value === null || value === undefined) return "—";
+  return Number(value).toFixed(digits) + suffix;
+}
+
+function renderAlerts(s) {
+  const box = $("alerts");
+  const items = [];
+  if (!s.connected) {
+    items.push(["bad", s.connected_detail || "上位机与设备未连接"]);
+  } else if (s.stale) {
+    items.push(["bad", `已连接但 ${s.age_ms ?? "?"} ms 没有收到任何帧——设备可能停了，或者这个端口对应的是一个已经不存在的设备（项目文档记过这一条）。`]);
+  }
+  if (s.frame && s.frame.link_reported_connected === false) {
+    items.push(["", "控制链路：设备自称 <b>模拟</b>。没有确认回执之前，不得写成已连接或已发送。"]);
+  }
+  if (s.control && s.control.unresponsive) {
+    items.push(["bad",
+      `已向设备发送 ${s.control.sent} 条命令，但<b>一次都没有得到回应</b>：设备从未进入录音态。` +
+      `写成功不等于设备照做——本机实测 write() 成功而设备无反应，与控制台输入未接到 ` +
+      `USB-Serial/JTAG 的症状一致。这不是按钮失效。`]);
+  }
+  if (s.frame && s.frame.state === "MIC FAULT") {
+    items.push(["bad", "设备报 MIC FAULT：麦克风异常，当前建议值不应被采信。"]);
+  }
+  if (s.stats.gaps > 0) {
+    items.push(["", `控制帧序号跳变 ${s.stats.gaps} 次，共丢 ${s.stats.frames_lost} 帧（USB 丢数据，趋势线会出现断口）。`]);
+  }
+  if (s.capture.chunks_lost > 0) {
+    items.push(["bad", `录音丢块 ${s.capture.chunks_lost} 块：这一段录音有断裂，不能用于声纹或信噪比结论。`]);
+  }
+  if (s.problems.some((p) => p.text.includes("硬上限"))) {
+    items.push(["bad", "有帧超出固件的硬上限，已在异常列表里列出原始值。"]);
+  }
+  if (items.length === 0) {
+    items.push(["ok", "数据在流，未发现异常。"]);
+  }
+  box.innerHTML = items
+    .map(([kind, text]) => `<div class="warnbox ${kind}">${text}</div>`)
+    .join("");
+}
+
+function render(s) {
+  lastSnapshot = s;
+  $("source-text").textContent = s.source_text + (s.source_detail ? " · " + s.source_detail : "");
+  $("uptime").textContent = s.uptime_s + " s";
+  $("frames").textContent = s.stats.commands;
+  $("lost").textContent = s.stats.frames_lost;
+  $("age").textContent = s.age_ms === null ? "—" : s.age_ms + " ms";
+  $("port").textContent = s.connected ? "已打开" : "未打开";
+
+  const dot = $("conn-dot");
+  dot.className = "dot " + (!s.connected ? "bad" : s.stale ? "warn" : "ok");
+  $("conn-text").textContent = !s.connected ? "上位机未连接设备" : s.stale ? "已连接（无数据）" : "已连接";
+
+  const f = s.frame;
+  if (!f) {
+    ["env", "state", "gain", "media", "link", "conf"].forEach((id) => ($(id).textContent = "—"));
+  } else {
+    $("env").textContent = f.environment_text;
+    $("env").className = "value env-" + f.environment;
+    $("env-raw").textContent = f.environment;
+    $("state").textContent = f.state_text;
+    $("state-raw").textContent = f.state;
+    $("gain").textContent = fmt(f.speech_gain_db, 2, " dB");
+    $("gain-bar").style.width = Math.max(0, Math.min(100, (f.speech_gain_db / s.caps.speech_gain_db) * 100)) + "%";
+    $("media").textContent = f.media_percent + " %";
+    $("media-bar").style.width = f.media_percent + "%";
+    $("link").textContent = f.link_text;
+    $("link-raw").textContent = "设备字段 link=" + f.link;
+    $("conf").textContent = fmt(f.confidence, 2);
+    $("conf-bar").style.width = Math.max(0, Math.min(100, f.confidence * 100)) + "%";
+    $("seq").textContent = "帧序号 " + f.sequence + " · 设备时间 " + (f.timestamp_ms / 1000).toFixed(1) + " s";
+  }
+
+  renderAlerts(s);
+  renderLatency(s);
+  drawEq(f ? f.tuning : null, f ? f.speech_gain_db : 0);
+  $("eq-note").textContent = !f
+    ? "等待设备数据"
+    : f.tuning
+      ? `设备实测调音：抬起 ${f.tuning.lifted_bands} 个频段，最高 +${f.tuning.peak_gain_db.toFixed(1)} dB`
+      : "这一帧没有调音数据（旧固件不发 eq_gain_db）；图形是由语音段增益推导的";
+  $("control-warn").style.display = s.control && s.control.unresponsive ? "block" : "none";
+  renderCapture(s);
+  renderLists(s);
+  renderStats(s);
+  drawChart(s.samples || []);
+}
+
+function renderLatency(s) {
+  const body = $("latency-body");
+  if (!s.latency) {
+    body.innerHTML = '<tr><td colspan="5">尚未收到汇总（设备每 10 秒发一次）</td></tr>';
+    $("latency-note").textContent = "—";
+    return;
+  }
+  // 两种"零"必须分开说，标错了就是把没测到的写成已测到：
+  //   · 本地阶段（capture/analyse/embed/decide）由端侧自己测。embed 报 0 是**未实现**
+  //     —— 固件每帧 record(Stage::embed, 0.0f)，它的 n 是满的（见 main/app_main.cpp）。
+  //   · 对端阶段（transport/apply/render）要由对端上报，本机没有对端，所以 n=0；
+  //     那是**没有样本**，不是未实现（见 main/latency_profiler.hpp:24-25）。
+  const LOCAL = new Set(["capture", "analyse", "embed", "decide"]);
+  body.innerHTML = s.latency.stages
+    .map((st) => {
+      const isLocal = st.local !== undefined ? st.local : LOCAL.has(st.stage);
+      let label = st.stage;
+      if (!isLocal && st.n === 0) {
+        label = `${st.stage}<span style="color:#8ea3b8"> · 无样本（对端未接通）</span>`;
+      } else if (st.stage === "embed" && st.p50_ms === 0 && st.n > 0) {
+        label = `${st.stage}<span style="color:#ffb020"> · 未实现</span>`;
+      }
+      return `<tr><td>${label}</td><td class="num">${st.p50_ms.toFixed(3)}</td><td class="num">${st.p95_ms.toFixed(3)}</td><td class="num">${st.max_ms.toFixed(3)}</td><td class="num">${st.n}</td></tr>`;
+    })
+    .join("");
+  $("latency-note").textContent =
+    `最近一次汇总：${s.latency.frames} 帧前累计 · ${s.latency.age_s} 秒前收到 · 打点自身开销 ${s.latency.overhead_mean_us} µs（max ${s.latency.overhead_max_us} µs）。` +
+    "「未实现」＝端侧阶段测得的值为 0（声纹推理还没接进来），不是因为它免费；" +
+    "「无样本」＝该阶段要由对端上报，而当前没有接通的对端。";
+}
+
+// 24 频段调音：固件把语音段（8–16 号）抬 speech_gain_db，其余频段保持 0 dB
+// （main/controller.cpp: command.eq_gain_db[band] = speech_band ? speech_gain_db_ : 0.0f）。
+// 注意 eq_gain_db 是 24 个数的数组，而串口 JSON 只发标量 speech_gain_db —— 所以这里画的是
+// 由已知规则推出来的形状，不是设备逐频段报回来的值。设备没报的，界面不能装作收到了。
+function drawEq(tuning, fallbackGainDb) {
+  const canvas = $("eq");
+  if (!canvas || !canvas.getContext) return;
+  const dpr = window.devicePixelRatio || 1;
+  const width = canvas.clientWidth || 300;
+  const height = 52;
+  canvas.width = width * dpr;
+  canvas.height = height * dpr;
+  const ctx = canvas.getContext("2d");
+  if (!ctx.setTransform) return;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+  const maxDb = 6.5;
+  // 优先画设备报回来的每频段增益。设备没报（旧固件）时才退回"由标量增益推出的形状"，
+  // 并且在下方注明这是推导值——把推导值画得像实测值，是这块面板最容易犯的错。
+  const measured = tuning && Array.isArray(tuning.band_gain_db) ? tuning.band_gain_db : null;
+  const bands = measured ? measured.length : 24;
+  const slot = width / bands, barWidth = Math.max(2, slot - 2);
+  for (let band = 0; band < bands; band++) {
+    const inSpeech = band >= 8 && band <= 16;
+    const value = measured
+      ? Math.max(0, Math.min(maxDb, measured[band]))
+      : (inSpeech ? Math.max(0, Math.min(maxDb, fallbackGainDb)) : 0);
+    const barHeight = (value / maxDb) * (height - 10);
+    const x = band * slot + 1;
+    ctx.fillStyle = value > 0.05 ? "#4cc2ff" : "#243244";
+    ctx.fillRect(x, height - 5 - barHeight, barWidth, Math.max(2, barHeight));
+  }
+  ctx.fillStyle = "#8ea3b8";
+  ctx.font = "10px ui-monospace, Menlo, monospace";
+  ctx.fillText("0 dB", 2, height - 1);
+  ctx.fillText(`+${maxDb} dB`, width - 44, 10);
+}
+
+function renderCapture(s) {
+  $("capture-text").textContent = s.capture.text;
+  const parts = [];
+  if (s.capture.rate) parts.push(`${s.capture.rate} Hz`);
+  if (s.capture.seconds) parts.push(`计划 ${s.capture.seconds} s`);
+  parts.push(`已收 ${s.capture.chunks} 块`);
+  parts.push(`约 ${s.capture.audio_seconds} s`);
+  if (s.capture.chunks_lost) parts.push(`丢块 ${s.capture.chunks_lost}`);
+  $("capture-detail").textContent = parts.join(" · ");
+  $("btn-rec-stop").disabled = !s.connected || !s.recording;
+  $("btn-rec-start").disabled = !s.connected;
+}
+
+function renderLists(s) {
+  $("problems").innerHTML =
+    s.problems.length === 0
+      ? '<li><time>—</time><span style="color:#8ea3b8">没有异常</span></li>'
+      : s.problems
+          .slice()
+          .reverse()
+          .map((p) => `<li><time>${p.at}s</time><span>${p.text}</span></li>`)
+          .join("");
+  $("events").innerHTML =
+    s.events.length === 0
+      ? '<li><time>—</time><span style="color:#8ea3b8">还没有状态变化</span></li>'
+      : s.events
+          .slice()
+          .reverse()
+          .map((e) => `<li class="kind-${e.kind}"><time>${e.at}s</time><span>${e.text}</span>${e.detail ? ` <span style="color:#8ea3b8">${e.detail}</span>` : ""}</li>`)
+          .join("");
+  $("raw").textContent = (s.raw_tail || []).join("\n") || "—";
+}
+
+function renderStats(s) {
+  const iv = s.stats.interval;
+  const rows = [
+    ["控制帧总数", s.stats.commands],
+    ["解析总行数", s.stats.lines],
+    ["无法解析的 JSON", s.stats.unparsed_json],
+    ["坏行", s.stats.bad_lines],
+    // 这三行量的是**主机侧逐行到达间隔**，不是设备节拍。一次 read 返回多行时，
+    // 同一批里的行间隔接近 0，于是 p50 会被批量伪影拉高（实测 202 ms，而设备自报
+    // 采集间隔是 150.04 ms，且丢帧为 0）。要看设备节拍，看上面延迟表的 capture 阶段。
+    ["主机侧到达间隔 p50", iv.n ? iv.p50.toFixed(1) + " ms" : "—"],
+    ["主机侧到达间隔 p95", iv.n ? iv.p95.toFixed(1) + " ms" : "—"],
+    ["主机侧到达间隔 min / max", iv.n ? iv.min.toFixed(2) + " / " + iv.max.toFixed(1) + " ms" : "—"],
+    ["序号跳变", `${s.stats.gaps} 次，丢 ${s.stats.frames_lost} 帧，最大连丢 ${s.stats.max_gap}`],
+    ["延迟汇总次数", s.stats.latency_reports],
+    ["回控命令 已发 / 已应答", `${s.control.sent} / ${s.control.acknowledged}`],
+    ["最近一条命令", s.control.last ? `${s.control.last}（第 ${s.control.last_at}s）` : "—"],
+  ];
+  $("stats-body").innerHTML = rows.map(([k, v]) => `<tr><td>${k}</td><td class="num">${v}</td></tr>`).join("")
+    + `<tr><td colspan="2" style="color:#8ea3b8;font-size:11.5px">` +
+      `min 接近 0 ms 表示一次 read 返回了多行（USB CDC 批量到达）；设备节拍请读延迟表的 capture 阶段。` +
+      `</td></tr>`;
+}
+
+function drawChart(samples) {
+  const canvas = $("chart");
+  const dpr = window.devicePixelRatio || 1;
+  const width = canvas.clientWidth || 900;
+  const height = 150;
+  if (canvas.width !== width * dpr) {
+    canvas.width = width * dpr;
+    canvas.height = height * dpr;
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+
+  // 横轴固定 90 秒，而不是"已有数据的范围"：固定窗口才能看出设备是不是停了。
+  const windowS = 90;
+  const latest = samples.length ? samples[samples.length - 1].t : 0;
+  const startT = Math.max(0, latest - windowS);
+  const x = (t) => ((t - startT) / windowS) * width;
+
+  ctx.strokeStyle = "#1b2632";
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = (height / 4) * i + 0.5;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(width, y); ctx.stroke();
+  }
+
+  // 只画产品真正有的两个量：调音幅度（语音段增益）与配套的媒体让位。
+  // 固件还在算一个 noise_reduction_db，但它不属于这个产品，也不该出现在图上——
+  // 画一条没人负责的曲线，比不画更容易被误读成"这个产品会降噪"。
+  const series = [
+    { key: "g", color: "#4cc2ff", max: 8 },
+    { key: "m", color: "#3ddc84", max: 100 },
+  ];
+  const visible = samples.filter((s) => s.t >= startT);
+  for (const line of series) {
+    ctx.strokeStyle = line.color;
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    visible.forEach((s, index) => {
+      const px = x(s.t);
+      const py = height - (Math.max(0, Math.min(line.max, s[line.key])) / line.max) * (height - 8) - 4;
+      if (index === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    });
+    ctx.stroke();
+  }
+  // 断口必须看得见：序号不连续处画一条竖线，而不是让曲线自己连过去。
+  ctx.strokeStyle = "rgba(255,92,108,.5)";
+  for (let i = 1; i < visible.length; i++) {
+    if (visible[i].seq !== visible[i - 1].seq + 1) {
+      const px = x(visible[i].t);
+      ctx.beginPath(); ctx.moveTo(px, 0); ctx.lineTo(px, height); ctx.stroke();
+    }
+  }
+  ctx.fillStyle = "#8ea3b8";
+  ctx.font = "11px ui-monospace, Menlo, monospace";
+  ctx.fillText(`${windowS} 秒窗口 · ${visible.length} 帧`, 6, 12);
+}
+
+async function sendCommand(command) {
+  const toast = $("toast");
+  toast.textContent = "发送中…";
+  try {
+    const response = await fetch("/api/command", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ command }),
+    });
+    const payload = await response.json();
+    if (payload.ok) {
+      toast.textContent = `设备已回应：${payload.command}`;
+      toast.style.color = "#3ddc84";
+    } else {
+      toast.textContent = payload.warning || payload.error || "未发送";
+      toast.style.color = "#ff5c6c";
+    }
+  } catch (error) {
+    toast.textContent = `请求失败：${error}`;
+    toast.style.color = "#ff5c6c";
+  }
+}
+
+$("btn-rec-start").addEventListener("click", () => {
+  const seconds = Number($("rec-seconds").value || 0);
+  sendCommand(seconds > 0 ? `rec start ${Math.floor(seconds)}` : "rec start");
+});
+$("btn-rec-stop").addEventListener("click", () => sendCommand("rec stop"));
+
+// 暴露给渲染校验（tools/host/tests/render_check.js）：那台脚本用 DOM 桩把 render()
+// 真跑一遍，断言"喂进真实快照时界面上会出现什么"。界面里唯一会算错的就是这一层。
+window.__render = render;
+
+function connect() {
+  const source = new EventSource("/events");
+  source.onmessage = (event) => {
+    try { render(JSON.parse(event.data)); } catch (error) { console.error(error); }
+  };
+  source.onerror = () => {
+    $("conn-dot").className = "dot bad";
+    $("conn-text").textContent = "与上位机的连接断了，正在重连…";
+  };
+}
+connect();
+window.addEventListener("resize", () => { if (lastSnapshot) drawChart(lastSnapshot.samples || []); });
+</script>
+</body>
+</html>
