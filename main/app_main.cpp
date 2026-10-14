@@ -265,6 +265,8 @@ void processing_task(void*) {
     uint32_t capture_reads = 0;
     uint32_t capture_read_failures = 0;
     uint32_t capture_decimated_samples = 0;
+    uint32_t capture_read_us = 0;
+    uint32_t capture_last_produced = 0;
     int64_t next_capture_diag_us = 0;
 
     std::size_t filled = 0;  // samples currently in the analysis window
@@ -282,8 +284,12 @@ void processing_task(void*) {
         esp_err_t read_result = ESP_OK;
         std::size_t got = 0;
         if (filled + kReadBlockSamples <= kFrameSamplesMax) {
+            const int64_t read_started_us = esp_timer_get_time();
             read_result = esp_codec_dev_read(microphone, read_block,
                                              kReadBlockSamples * sizeof(int16_t));
+            if (g_record_seconds >= 0) {
+                capture_read_us += static_cast<uint32_t>(esp_timer_get_time() - read_started_us);
+            }
             if (read_result == ESP_OK) {
                 got = kReadBlockSamples;
                 for (std::size_t i = 0; i < got; ++i) {
@@ -306,6 +312,8 @@ void processing_task(void*) {
                 capture_reads = 0;
                 capture_read_failures = 0;
                 capture_decimated_samples = 0;
+                capture_read_us = 0;
+                capture_last_produced = 0;
                 next_capture_diag_us = now_us + 5 * 1000 * 1000;
             }
         }
@@ -325,6 +333,7 @@ void processing_task(void*) {
             const std::size_t produced = decimator.process(read_block, got, decimated,
                                                            kDecimatedCapacity);
             capture_decimated_samples += static_cast<uint32_t>(produced);
+            capture_last_produced = static_cast<uint32_t>(produced);
             for (std::size_t i = 0; i < produced; ++i) {
                 pending[pending_samples++] = decimated[i];
                 if (pending_samples == kCaptureChunkSamples) {
@@ -335,12 +344,19 @@ void processing_task(void*) {
             }
             if (now_us >= next_capture_diag_us) {
                 next_capture_diag_us = now_us + 5 * 1000 * 1000;
+                // `no_data` are reads that returned while the DMA had nothing ready; they are
+                // expected and are not errors. `read_ms` is the total time spent inside the
+                // blocking read, which is what tells a data-rate problem apart from a
+                // loop-iteration problem.
                 std::printf("{\"type\":\"capture\",\"state\":\"progress\","
-                            "\"reads\":%lu,\"failed_reads\":%lu,"
-                            "\"decimated\":%lu,\"pending\":%lu,\"chunks\":%lu}\n",
+                            "\"reads\":%lu,\"no_data\":%lu,\"read_ms\":%lu,"
+                            "\"decimated\":%lu,\"last_produced\":%lu,"
+                            "\"pending\":%lu,\"chunks\":%lu}\n",
                             static_cast<unsigned long>(capture_reads),
                             static_cast<unsigned long>(capture_read_failures),
+                            static_cast<unsigned long>(capture_read_us / 1000),
                             static_cast<unsigned long>(capture_decimated_samples),
+                            static_cast<unsigned long>(capture_last_produced),
                             static_cast<unsigned long>(pending_samples),
                             static_cast<unsigned long>(capture_sequence));
             }

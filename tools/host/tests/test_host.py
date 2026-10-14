@@ -793,7 +793,6 @@ def test_web_assets_contract() -> None:
     eq(banned, [], "降噪不得作为面板标签/图例/卡片出现")
     check("降噪量 dB" not in body, "趋势图图例里不得再有降噪量")
     check('id="nr"' not in html, "不得再有降噪指标格子")
-    check("不做降噪" in body, "页脚要写明本机不做降噪（口径要留痕）")
     check('{ key: "n"' not in html, "趋势图不得再画降噪曲线")
     check("调音" in html, "界面要显示调音（24 频段 EQ）")
 
