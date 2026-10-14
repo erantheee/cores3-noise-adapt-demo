@@ -249,34 +249,21 @@ void processing_task(void*) {
     bool logged_first_capture_frame = false;
     std::size_t filled = 0;  // samples currently in the analysis window
     while (true) {
-        // Read what the codec actually has, and advance by *that* count.
+        // Advance by what the codec actually delivered.
         //
-        // The previous revision called esp_codec_dev_read(.., kReadBlockSamples * 2) and then
-        // unconditionally did `filled += kReadBlockSamples`. A codec read is a partial read:
-        // it returns the number of bytes it delivered, which is routinely less than asked.
-        // Two things followed from ignoring it:
-        //
-        //   * the analysis window filled at the wrong rate, and
-        //   * the decimator was handed a full 512-sample block on every call regardless of
-        //     how many samples were new, so a recording mixed fresh audio with leftovers
-        //     from the previous read.
-        //
-        // Measured on device after flashing the USB-console fix: a 15-second `rec start 15`
-        // produced exactly one chunk of 170 samples -- one 512-sample block's worth of
-        // decimation -- while the control loop kept its 250 ms cadence throughout.
+        // The previous revision called esp_codec_dev_read for kReadBlockSamples and then did
+        // `filled += kReadBlockSamples` unconditionally: a codec read is a partial read, so
+        // the analysis window advanced at a rate the hardware never delivered, and the
+        // decimator was handed a full 512-sample block every pass whether or not those samples
+        // were new. Measured on device: a 15-second recording produced one chunk of 170
+        // samples -- exactly one block's worth of decimation -- while the loop held its
+        // 250 ms cadence.
         esp_err_t read_result = ESP_OK;
         std::size_t got = 0;
         if (filled + kReadBlockSamples <= kFrameSamplesMax) {
             const int bytes = esp_codec_dev_read(microphone, read_block,
                                                  kReadBlockSamples * sizeof(int16_t));
-            if (bytes <= 0) {
-                // Nothing available this pass. This is not a microphone fault: the codec can
-                // legitimately have nothing ready between DMA blocks. Feed nothing to the
-                // analysis or the decimator and wait for the next pass -- marking the frame
-                // invalid here would raise MIC FAULT on a healthy microphone, and the
-                // control loop would then zero the gain for no reason.
-                continue;
-            } else {
+            if (bytes > 0) {
                 got = static_cast<std::size_t>(bytes) / sizeof(int16_t);
                 if (got > kReadBlockSamples) got = kReadBlockSamples;
                 for (std::size_t i = 0; i < got; ++i) {
@@ -304,6 +291,9 @@ void processing_task(void*) {
         // below. Sitting behind that gate was a real bug: during capture the analysis
         // period is 300 ms while frames arrive every ~43 ms, so six frames in seven were
         // discarded and the recording came out with periodic holes.
+        // A zero-byte read is not a microphone fault and must not stop the loop: the timing
+        // above, the console poll and the capture deadline all have to keep running. Only the
+        // work that needs samples is guarded by `got > 0`.
         if (g_record_seconds >= 0 && got > 0) {
             // Feed only the samples that were actually read: passing the whole block here is
             // what made the recording contain stale audio.
