@@ -104,6 +104,11 @@ final class Player {
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
     private let eq = AVAudioUnitEQ(numberOfBands: bandCenters.count)
+    // **EQ 之后没有限幅器，这是有意的。** 实测：同一首、同一 30% 音量下，平直峰值 −10.4 dB，
+    // 抬 9 个语音段 +10 dB 后峰值到 +2.98 dB——会顶爆 3 dB。加一级限幅确实能压住（峰值回到
+    // −11.4 dB），但中位抬升从 ~12 dB 掉到 3.9 dB，**"明显"被削掉了大半**。
+    // 用户 2026-10-15 定的口径：demo 要的是明显，不是好听。所以这里保留全量处方，顶爆就顶爆；
+    // 面板照旧把峰值报出来（>0 dBFS 会让下面那行显示为正数），需要时看得见，但不自动压。
 
     private var tracks: [Track] = []
     private var commands: [[String: Any]] = []
@@ -157,10 +162,10 @@ final class Player {
             band.gain = 0
             band.bypass = false
         }
-        // eq → mainMixer 固定；player → eq 一开始就用一个**固定格式**（44.1 kHz 立体声
-        // Float32）连好。顺序很关键：**先连好再 start()**——引擎运行中才接节点，之后
-        // player.play() 会抛 "player started when in a disconnected state"（本机实测第一次
-        // play 就崩）。固定格式的好处见 connectionFormat 的注释：不再走"停引擎重连"那条路。
+        // player → eq → mainMixer 一次连好；player → eq 用**固定格式**
+        // （44.1 kHz 立体声 Float32）。顺序很关键：**先连好再 start()**——引擎运行中才接
+        // 节点，之后 player.play() 会抛 "player started when in a disconnected state"
+        // （本机实测第一次 play 就崩）。固定格式的好处见 connectionFormat 的注释。
         if let format = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 2) {
             engine.connect(player, to: eq, format: format)
             connectionFormat = format
