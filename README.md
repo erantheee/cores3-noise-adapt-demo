@@ -402,9 +402,12 @@ python3 tools/host/tests/test_host.py      # 39 组、2711 条断言，不需要
 node tools/host/tests/render_check.js <快照.json>   # 用 DOM 桩真跑一遍 render()：54 条通过、0 条失败
 ```
 
-它自带一份真机日志 `tools/host/tests/fixtures/device_real.log`（2026-10-14 抓的**节选**，
-41 帧连续原文，对应设备运行约 17.6–23.6 s；不是整段会话）。
+它自带一份真机日志 `tools/host/tests/fixtures/device_real.log`（**2026-10-15 从当前固件重抓**：
+100 ms 节拍、schema 2、带 24 段 `eq_gain_db`；41 帧连续原文 + 1 条 latency 汇总，对应设备运行
+约 703.1–707.1 s，不是整段会话）。**换固件后要重新抓一份，而不是改测试里的期望值去迁就。**
 解析器以后被改动时，必须仍然读得懂这台设备真正吐出来的字节，而不是只读得懂测试里手写的 JSON。
+旧固件（schema 1、只有 `noise_reduction_db`）的帧另用手写样本测，见
+`test_old_firmware_frame_still_reads`。
 
 ### 一个必须分清的口径：主机侧帧到达间隔 ≠ 设备节拍
 

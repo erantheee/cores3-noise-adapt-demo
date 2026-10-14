@@ -185,13 +185,23 @@ def test_old_firmware_frame_still_reads() -> None:
 
     这条挡的是"升级上位机之后，历史日志再也回放不了"——而回放是复核现场的唯一手段。
     """
+    # 用手写的旧帧，**不用** fixtures/device_real.log：那份现在是当前固件（schema 2、
+    # 带 24 段 eq_gain_db）的真机原文，拿它测"旧固件"就测错了对象。
+    old_log = [
+        '{"type":"earbud_command","schema":1,"sequence":1,"timestamp_ms":0,'
+        '"speech_gain_db":1.50,"noise_reduction_db":4.10,"media_percent":92,'
+        '"state":"ADJUSTING","environment":"NOISY","confidence":0.90,"link":"simulated"}',
+        '{"type":"earbud_command","schema":1,"sequence":2,"timestamp_ms":150,'
+        '"speech_gain_db":2.00,"noise_reduction_db":4.30,"media_percent":90,'
+        '"state":"ADJUSTING","environment":"VOICE","confidence":0.95,"link":"simulated"}',
+    ]
     state = HostState(source="replay")
-    for line in FIXTURE.read_text(encoding="utf-8").splitlines():
+    for line in old_log:
         state.feed_line(line)
     snapshot = state.snapshot()
     eq(snapshot["stats"]["unparsed_json"], 0, "旧固件日志不得出现解析失败")
     eq(snapshot["stats"]["bad_lines"], 0, "旧固件日志不得出现坏行")
-    eq(snapshot["stats"]["commands"], 41, "旧固件日志的帧数")
+    eq(snapshot["stats"]["commands"], 2, "旧固件日志的帧数")
     check(snapshot["frame"]["tuning"] is None, "旧帧没有调音数据，界面据此显示推导值")
     check("noise_reduction_db" not in snapshot["frame"], "旧帧的降噪字段也不端给界面")
 
@@ -323,18 +333,18 @@ def test_latency_report() -> None:
     parsed = parse_line(latency_lines[0])
     check(isinstance(parsed.value, LatencyReport), "latency 解析为 LatencyReport")
     report = parsed.value
-    eq(report.frames, 135, "汇总的帧数")
-    close(report.overhead_mean_us, 1.45, "打点自身开销均值")
+    eq(report.frames, 7047, "汇总的帧数（真机原文）")
+    close(report.overhead_mean_us, 1.53, "打点自身开销均值")
     capture = report.stage("capture")
     check(capture is not None, "必须能取到 capture 阶段")
-    # 这份 fixture 是 2026-10-14 抓的**真机原文**，抓取时固件节拍还是 150 ms。
-    # 断言它、而不是断言当前节拍：这条测的是"解析器读得懂设备真正吐出来的字节"，
-    # 换固件不该让它变绿——真机换节拍后要重新抓一份，而不是改这里的数字。
-    close(capture.p50_ms, 150.045, "真机日志原文原样读出（150 ms 时期抓取）", tolerance=0.01)
+    # 这份 fixture 是 2026-10-15 从**当前固件**重抓的真机原文（100 ms 节拍、schema 2）。
+    # 断言原文值而不是"当前节拍"：这条测的是解析器读得懂设备真正吐出来的字节；
+    # 以后换固件要重新抓一份，而不是改这里的数字来迁就。
+    close(capture.p50_ms, 100.034, "真机原文原样读出（当前固件，100 ms 节拍）", tolerance=0.01)
     analyse = report.stage("analyse")
-    close(analyse.p50_ms, 7.033, "24 频段分析 p50 与文档一致", tolerance=0.01)
+    close(analyse.p50_ms, 7.019, "24 频段分析 p50 与文档一致", tolerance=0.01)
     embed = report.stage("embed")
-    eq(embed.samples, 68, "声纹阶段仍有采样计数")
+    eq(embed.samples, 101, "声纹阶段仍有采样计数")
     close(embed.p50_ms, 0.0, "声纹推理未实现，如实报 0")
     transport = report.stage("transport")
     eq(transport.samples, 0, "未接通的阶段样本数为 0，不能伪装成 0 ms")
@@ -541,8 +551,8 @@ def test_latency_fed_into_state() -> None:
     snapshot = state.snapshot()
     check(snapshot["latency"] is not None, "真机日志喂进去后要有 latency")
     stages = {item["stage"]: item for item in snapshot["latency"]["stages"]}
-    close(stages["analyse"]["p50_ms"], 7.033, "面板拿到的分析与文档一致", tolerance=0.01)
-    eq(stages["embed"]["n"], 68, "声纹阶段有计数")
+    close(stages["analyse"]["p50_ms"], 7.019, "面板拿到的分析与真机原文一致", tolerance=0.01)
+    eq(stages["embed"]["n"], 101, "声纹阶段有计数")
     check(snapshot["stats"]["unparsed_json"] == 0, "真机日志不应产生无法解析的 JSON")
 
 
@@ -723,7 +733,7 @@ def test_mock_recording_produces_chunks() -> None:
 
 
 def test_real_device_log_parses_end_to_end() -> None:
-    """对真机原文的回归：这是 2026-10-14 实际抓下来的输出。"""
+    """对真机原文的回归：这是 2026-10-15 从当前固件实际抓下来的输出（100 ms、schema 2）。"""
     check(FIXTURE.exists(), f"真机日志存在（{FIXTURE}）")
     text = FIXTURE.read_text(encoding="utf-8")
     state = HostState(source="replay", detail=str(FIXTURE))
@@ -735,7 +745,7 @@ def test_real_device_log_parses_end_to_end() -> None:
     eq(snapshot["stats"]["unparsed_json"], 0, "真机日志没有解析不了的 JSON")
     eq(snapshot["stats"]["bad_lines"], 0, "真机日志没有坏行")
     check(snapshot["latency"] is not None, "真机日志里应当有 latency 汇总")
-    close(snapshot["latency"]["overhead_mean_us"], 1.45, "打点开销均值")
+    close(snapshot["latency"]["overhead_mean_us"], 1.53, "打点开销均值")
     # 设备自称链路是模拟的——上位机不得把它显示成已连接。
     eq(snapshot["frame"]["link_text"], "模拟", "真机当前 link=simulated")
     check(
