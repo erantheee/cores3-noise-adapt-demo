@@ -340,12 +340,18 @@ void processing_task(void*) {
         // window advances by the whole block. That is the original behaviour and it is right;
         // what was wrong before was feeding the decimator a full block *unconditionally*,
         // which is handled at the capture call site below.
+        // One read per pass, and never more than fits. Two rules, both learned from freezes:
+        //
+        //   * The loop must not depend on a consumer draining a buffer before it can finish an
+        //     iteration. Staging exists only for the recording's whole-block decimation and has
+        //     no consumer at all while idle; a `while (staged < kStageCapacity)` top-up therefore
+        //     spins forever once staging fills, `now_us` stops advancing, and the device goes
+        //     silent on the wire. That is exactly what the 8-block version did.
+        //   * Reading the whole staging buffer in one call is the shape that returns almost no
+        //     data (the codec hands back what the DMA has ready), so ask for at most one block.
         esp_err_t read_result = ESP_OK;
         std::size_t got = 0;
-        while (staged < kStageCapacity) {
-            // Never ask for more than one block. The codec returns less than requested
-            // (measured: ~512 of 512, but a 1024 request came back short too), and a request
-            // for the whole staging buffer is exactly the shape that produced almost no data.
+        if (staged < kStageCapacity && filled + kReadBlockSamples <= kFrameSamplesMax) {
             const std::size_t want = std::min(kReadBlockSamples, kStageCapacity - staged);
             const int64_t read_started_us = esp_timer_get_time();
             read_result = esp_codec_dev_read(microphone, stage + staged,
@@ -356,17 +362,14 @@ void processing_task(void*) {
                 // Empty read: count its own bucket. Keeping one total and one success total
                 // invited a uint32 subtraction that underflowed to 4294966 ms.
                 if (g_record_seconds >= 0) capture_no_data_us += read_us;
-                break;
+            } else {
+                staged += want;
+                ++capture_reads;
+                if (g_record_seconds >= 0) {
+                    ++capture_ok_reads;
+                    capture_ok_read_us += read_us;
+                }
             }
-            staged += want;
-            ++capture_reads;
-            if (g_record_seconds >= 0) {
-                ++capture_ok_reads;
-                capture_ok_read_us += read_us;
-            }
-            // A block is what the analysis and the decimator were calibrated on, so process
-            // at that boundary rather than draining the DMA into a longer backlog.
-            if (staged >= kReadBlockSamples) break;
         }
 
         // Top up the analysis window from staging. At most two blocks per pass: 2048 samples
