@@ -54,6 +54,10 @@ def collect(port: str, baud: int, seconds: float, out: Path) -> int:
     kept = 0
     deadline = time.monotonic() + seconds
     print(f"采集 {seconds:.0f}s -> {out}", flush=True)
+    # A stale device node is a real trap: /dev/cu.usbmodem* can exist after the board is
+    # unplugged, the port opens fine, and the capture then runs to completion writing an
+    # empty file. Fail fast instead, and say which check failed.
+    first_data_deadline = time.monotonic() + 10.0
     try:
         with out.open("w", encoding="utf-8") as handle:
             while time.monotonic() < deadline:
@@ -63,6 +67,14 @@ def collect(port: str, baud: int, seconds: float, out: Path) -> int:
                     print(f"读取异常，继续：{exc}", file=sys.stderr, flush=True)
                     continue
                 if not raw:
+                    if kept == 0 and time.monotonic() > first_data_deadline:
+                        print(
+                            "10 秒内没有收到任何数据。设备可能未连接、未上电或未在运行。\n"
+                            "注意：/dev/cu.usbmodem* 节点在设备拔掉后仍可能存在，端口能打开"
+                            "并不代表设备在。",
+                            file=sys.stderr,
+                        )
+                        return 1
                     continue
                 line = raw.decode("utf-8", errors="replace").strip()
                 if line.startswith('{"type":"latency"') or line.startswith(
