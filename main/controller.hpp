@@ -5,6 +5,8 @@
 #include <cstdint>
 
 constexpr std::size_t kBandCount = 24;
+/// Largest analysis frame the window table will hold. The audio task uses 2048 samples.
+constexpr std::size_t kMaxAnalysisFrame = 4096;
 constexpr float kMaxSpeechGainDb = 6.5f;
 constexpr float kMaxNoiseReductionDb = 8.0f;
 

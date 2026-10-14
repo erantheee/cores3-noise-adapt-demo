@@ -97,15 +97,41 @@ float slew(float current, float target, float dt_ms, float attack_ms, float rele
     return current + (target - current) * alpha;
 }
 
+/// Hann window for the analysis frame, computed once.
+///
+/// The window does not depend on the band frequency, so computing it inside the per-band
+/// loop meant 24 x 2048 = 49152 transcendentals per frame. That is what made the analysis
+/// take 57 ms on device, against a per-frame floating-point budget of roughly 0.2 MFLOP:
+/// the arithmetic was never the problem, the window was. Measured on the S3, moving the
+/// window out of the loop is the difference between the analysis dominating the control
+/// period and being a small part of it.
+///
+/// Built on first use rather than at namespace scope: the table is 8 KB and only the
+/// analysis task touches it, so there is no reason to force it into .data at boot.
+const float* hann_window(std::size_t count) {
+    static std::array<float, kMaxAnalysisFrame> table{};
+    static std::size_t built_for = 0;
+    static bool built = false;
+    if (!built || built_for != count) {
+        const float denominator = static_cast<float>(std::max<std::size_t>(count - 1, 1));
+        for (std::size_t i = 0; i < count && i < kMaxAnalysisFrame; ++i) {
+            table[i] = 0.5f - 0.5f * std::cos(2.0f * static_cast<float>(M_PI) *
+                                              static_cast<float>(i) / denominator);
+        }
+        built_for = count;
+        built = true;
+    }
+    return table.data();
+}
+
 float goertzel_dbfs(const int16_t* samples, std::size_t count, float frequency) {
     const float omega = 2.0f * static_cast<float>(M_PI) * frequency / kSampleRate;
     const float coeff = 2.0f * std::cos(omega);
+    const float* window = hann_window(count);
     float s1 = 0.0f;
     float s2 = 0.0f;
     for (std::size_t i = 0; i < count; ++i) {
-        const float window = 0.5f - 0.5f * std::cos(2.0f * static_cast<float>(M_PI) * i /
-                                                    std::max<std::size_t>(count - 1, 1));
-        const float x = (static_cast<float>(samples[i]) / 32768.0f) * window;
+        const float x = (static_cast<float>(samples[i]) / 32768.0f) * window[i];
         const float s0 = x + coeff * s1 - s2;
         s2 = s1;
         s1 = s0;

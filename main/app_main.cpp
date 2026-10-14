@@ -272,8 +272,10 @@ void processing_task(void*) {
                          static_cast<int64_t>(period_ms * 1000.0f);
         if (!due) continue;
 
-        // The probe is read before anything else is timed, so the overhead figure below
-        // measures the instrumentation and not the work it is measuring.
+        // Overhead probe. The previous version read the clock once before the analysis and
+        // again after the whole frame, which meant "overhead" was really the analysis time:
+        // it reported 57 ms while the analysis itself reported 57 ms. What this measures is
+        // the cost of the two clock reads, which is the honest figure for instrumentation.
         const int64_t probe_us = esp_timer_get_time();
         const float capture_ms = static_cast<float>(probe_us - last_control_us) / 1000.0f;
 
@@ -301,6 +303,8 @@ void processing_task(void*) {
         profiler.record(latency::Stage::embed, 0.0f);
         profiler.record(latency::Stage::decide, decide_ms);
         overhead.record(static_cast<float>(esp_timer_get_time() - probe_us) / 1000.0f);
+        // Note the scope: this validates that the two clock reads are cheap. It does NOT
+        // validate that the timed work is cheap, and it must not be quoted as if it did.
         ++analysed_frames;
 
         emit_command_json(command);

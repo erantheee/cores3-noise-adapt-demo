@@ -14,7 +14,7 @@
 /// The pipeline stages, in the order energy actually flows:
 ///
 ///   0 capture      interval between consecutive analyses at the current cadence
-///   1 analyse      24-band analysis for one frame
+///   1 analyse      24-band analysis for one frame (a SLICE OF stage 0, not additional time)
 ///   2 embed        speaker-embedding inference for one frame (0 when disabled)
 ///   3 decide       controller update
 ///   4 transport    command handed to the link until the acknowledgement arrives
@@ -75,7 +75,12 @@ public:
 
     StageStats stats(Stage stage) const;
 
-    /// Sum of the medians across the stages the caller names, for the headline figure.
+    /// Sum of the per-stage medians.
+    ///
+    /// NOT an end-to-end latency, and it must not be quoted as one. Stage 0 is the whole
+    /// loop period while stage 1 is a slice of that same period, so the sum counts the
+    /// analysis twice. It is kept because it makes a rising total obvious at a glance; the
+    /// per-stage numbers are what get reported.
     float total_p50_ms() const;
     float total_p95_ms() const;
 
