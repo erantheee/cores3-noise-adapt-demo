@@ -9,6 +9,10 @@ jobs:
   # ESP-IDF dependencies, so the whole decision path is testable on a plain host in
   # seconds. Before this job existed, a regression in the environment decision reached
   # firmware unchecked.
+  #
+  # 2026-10-15：这个 job 以前只跑 C++ 单测，而**上位机那一整层（解析器、状态归约、模拟源、
+  # 面板脚本）从来没进过 CI** —— 它恰恰是改动最多的地方。下面两步把它补上：自测是纯标准库
+  # Python，渲染校验用 DOM 桩 + 模拟源快照，都不需要设备、串口或显示器。
   host-tests:
     runs-on: ubuntu-latest
     steps:
@@ -20,6 +24,23 @@ jobs:
       - name: Run tests
         working-directory: build-host-tests
         run: ctest --output-on-failure
+      - name: Host panel self-test
+        run: python3 tools/host/tests/test_host.py
+      - name: Render check against a mock snapshot
+        run: |
+          python3 - <<'PY' > /tmp/snapshot.json
+          import json, sys
+          sys.path.insert(0, 'tools')
+          from host.simulating import MockDevice
+          from host.state import HostState
+
+          device, state = MockDevice(), HostState(source='mock')
+          for step in range(1, 60):
+              for line in device.advance(step * 0.1):
+                  state.feed_line(line)
+          print(json.dumps(state.snapshot(), ensure_ascii=False))
+          PY
+          node tools/host/tests/render_check.js /tmp/snapshot.json
 
   firmware:
     needs: host-tests
