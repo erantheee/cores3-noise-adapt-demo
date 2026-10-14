@@ -212,11 +212,23 @@ void processing_task(void*) {
     ESP_ERROR_CHECK(esp_codec_dev_set_in_gain(microphone, 36.0f));
     ESP_ERROR_CHECK(esp_codec_dev_open(microphone, &format));
 
-    auto* read_block = static_cast<int16_t*>(
-        heap_caps_malloc(kReadBlockSamples * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    // Staging for the codec read. Measured: the codec returns what the DMA has ready rather
+    // than filling the requested block -- ~20 successful reads per second of 512 samples is
+    // 10.2 k samples/s against the 48 k it is actually producing, so tying one block to one
+    // read capped the recording at about a fifth of real time. Reads are decoupled from the
+    // block size: take whatever arrives and hand a block on once one has accumulated.
+    constexpr std::size_t kStageCapacity = 2 * kReadBlockSamples;
+    constexpr std::size_t kStageHighWater = 3 * kReadBlockSamples;
+    // The move loops below top up the staging buffer with `while (staged < kStageCapacity)`.
+    // That only terminates because kStageCapacity is an exact multiple of kReadBlockSamples;
+    // a non-multiple would leave a remainder that never reaches the threshold.
+    static_assert(kStageCapacity % kReadBlockSamples == 0,
+                  "staging capacity must be a whole number of blocks");
+    auto* stage = static_cast<int16_t*>(
+        heap_caps_malloc(kStageCapacity * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     auto* samples = static_cast<int16_t*>(
         heap_caps_malloc(kFrameSamplesMax * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-    if (samples == nullptr || read_block == nullptr) {
+    if (samples == nullptr || stage == nullptr) {
         ESP_LOGE(kTag, "Audio buffer allocation failed");
         vTaskDelete(nullptr);
     }
@@ -270,6 +282,7 @@ void processing_task(void*) {
     int64_t next_capture_diag_us = 0;
 
     std::size_t filled = 0;  // samples currently in the analysis window
+    std::size_t staged = 0;  // samples waiting in the staging buffer
     while (true) {
         // esp_codec_dev_read returns a *status code*, not a byte count:
         //   ESP_CODEC_DEV_OK (0) on success, negative ESP_CODEC_DEV_* on failure.
@@ -283,21 +296,44 @@ void processing_task(void*) {
         // which is handled at the capture call site below.
         esp_err_t read_result = ESP_OK;
         std::size_t got = 0;
-        if (filled + kReadBlockSamples <= kFrameSamplesMax) {
+        while (staged < kStageCapacity) {
+            // Never ask for more than one block. The codec returns less than requested
+            // (measured: ~512 of 512, but a 1024 request came back short too), and a request
+            // for the whole staging buffer is exactly the shape that produced almost no data.
+            const std::size_t want = std::min(kReadBlockSamples, kStageCapacity - staged);
             const int64_t read_started_us = esp_timer_get_time();
-            read_result = esp_codec_dev_read(microphone, read_block,
-                                             kReadBlockSamples * sizeof(int16_t));
+            read_result = esp_codec_dev_read(microphone, stage + staged,
+                                             static_cast<int>(want * sizeof(int16_t)));
             if (g_record_seconds >= 0) {
                 capture_read_us += static_cast<uint32_t>(esp_timer_get_time() - read_started_us);
             }
-            if (read_result == ESP_OK) {
-                got = kReadBlockSamples;
-                for (std::size_t i = 0; i < got; ++i) {
-                    samples[filled + i] = read_block[i];
-                }
-                filled += got;
-            }
+            if (read_result != ESP_OK) break;  // nothing ready; the loop keeps turning
+            staged += want;
+            ++capture_reads;
+            // A block is what the analysis and the decimator were calibrated on, so process
+            // at that boundary rather than draining the DMA into a longer backlog.
+            if (staged >= kReadBlockSamples) break;
         }
+
+        // Move whole blocks from the staging buffer into the analysis window.
+        while (staged >= kReadBlockSamples && filled + kReadBlockSamples <= kFrameSamplesMax) {
+            for (std::size_t i = 0; i < kReadBlockSamples; ++i) {
+                samples[filled + i] = stage[i];
+            }
+            filled += kReadBlockSamples;
+            got = kReadBlockSamples;
+            const std::size_t remaining = staged - kReadBlockSamples;
+            for (std::size_t i = 0; i < remaining; ++i) {
+                stage[i] = stage[kReadBlockSamples + i];
+            }
+            staged = remaining;
+        }
+        // If the window cannot take another block, the staged remainder would be stale by the
+        // time the window drains: drop it rather than let it splice old audio into the next one.
+        // Only drop the remainder when the window is genuinely near full; at 2048+ of 2560
+        // there is still room for another block, and clearing there would throw away audio
+        // on every pass.
+        if (filled >= kStageHighWater) staged = 0;
         const int64_t now_us = esp_timer_get_time();
 
         if (poll_console_command()) {
@@ -324,13 +360,10 @@ void processing_task(void*) {
         // period is 300 ms while frames arrive every ~43 ms, so six frames in seven were
         // discarded and the recording came out with periodic holes.
         // The capture path runs on every pass, deliberately outside the analysis cadence gate.
-        // Only a failed read skips it: a failed read delivers no fresh samples, and decimating
-        // the stale block is what made recordings contain leftovers.
+        // `got` is non-zero only when a whole block moved into the window this pass, so a pass
+        // with no complete block is skipped instead of re-decimating stale samples.
         if (g_record_seconds >= 0 && got > 0) {
-            // Feed only the samples that were actually read: passing the whole block here is
-            // what made the recording contain stale audio.
-            ++capture_reads;
-            const std::size_t produced = decimator.process(read_block, got, decimated,
+            const std::size_t produced = decimator.process(samples + filled - got, got, decimated,
                                                            kDecimatedCapacity);
             capture_decimated_samples += static_cast<uint32_t>(produced);
             capture_last_produced = static_cast<uint32_t>(produced);
