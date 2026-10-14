@@ -325,13 +325,15 @@ void processing_task(void*) {
         // than being mistaken for "costs nothing".
         profiler.record(latency::Stage::embed, 0.0f);
         profiler.record(latency::Stage::decide, decide_ms);
-        // Scope of this figure, stated because the first version of it was wrong and read
-        // like something it was not: it measures the two esp_timer_get_time calls on either
-        // side of `probe_us`, which is the instrumentation's own cost. It is microseconds.
-        // It says nothing about the cost of the analysis, and it must not be quoted as if
-        // it did. The previous version read the clock before the analysis and again after
-        // the whole frame, so it reported 57 ms -- which was the analysis itself.
-        overhead.record(static_cast<float>(esp_timer_get_time() - probe_us));
+        // Instrumentation cost: two esp_timer_get_time calls back to back. The previous
+        // two revisions of this line both reported the analysis instead of the probes --
+        // first 57 ms, then 7.1 ms -- because the closing read sat after the work rather
+        // than beside the opening read. Both times the figure looked plausible enough to
+        // quote. Keeping the two reads adjacent is the whole point of the measurement, so
+        // do not move them apart to "also time something else".
+        const int64_t probe_start_us = esp_timer_get_time();
+        const int64_t probe_end_us = esp_timer_get_time();
+        overhead.record(static_cast<float>(probe_end_us - probe_start_us));
         ++analysed_frames;
 
         emit_command_json(command);
