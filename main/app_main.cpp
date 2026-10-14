@@ -277,8 +277,10 @@ void processing_task(void*) {
     uint32_t capture_reads = 0;
     uint32_t capture_read_failures = 0;
     uint32_t capture_decimated_samples = 0;
-    uint32_t capture_read_us = 0;
+    uint32_t capture_no_data_us = 0;
     uint32_t capture_ok_reads = 0;
+    uint32_t capture_blocks_to_decimator = 0;
+    uint32_t capture_samples_to_decimator = 0;
     uint32_t capture_ok_read_us = 0;
     uint32_t capture_analyse_us = 0;
     uint32_t capture_last_produced = 0;
@@ -307,15 +309,19 @@ void processing_task(void*) {
             const int64_t read_started_us = esp_timer_get_time();
             read_result = esp_codec_dev_read(microphone, stage + staged,
                                              static_cast<int>(want * sizeof(int16_t)));
-            if (g_record_seconds >= 0) {
-                capture_read_us += static_cast<uint32_t>(esp_timer_get_time() - read_started_us);
+            const uint32_t read_us =
+                static_cast<uint32_t>(esp_timer_get_time() - read_started_us);
+            if (read_result != ESP_OK) {
+                // Empty read: count its own bucket. Keeping one total and one success total
+                // invited a uint32 subtraction that underflowed to 4294966 ms.
+                if (g_record_seconds >= 0) capture_no_data_us += read_us;
+                break;
             }
-            if (read_result != ESP_OK) break;  // nothing ready; the loop keeps turning
             staged += want;
             ++capture_reads;
             if (g_record_seconds >= 0) {
                 ++capture_ok_reads;
-                capture_ok_read_us += static_cast<uint32_t>(esp_timer_get_time() - read_started_us);
+                capture_ok_read_us += read_us;
             }
             // A block is what the analysis and the decimator were calibrated on, so process
             // at that boundary rather than draining the DMA into a longer backlog.
@@ -355,8 +361,10 @@ void processing_task(void*) {
                 capture_reads = 0;
                 capture_read_failures = 0;
                 capture_decimated_samples = 0;
-                capture_read_us = 0;
+                capture_no_data_us = 0;
                 capture_ok_reads = 0;
+                capture_blocks_to_decimator = 0;
+                capture_samples_to_decimator = 0;
                 capture_ok_read_us = 0;
                 capture_analyse_us = 0;
                 capture_last_produced = 0;
@@ -375,6 +383,8 @@ void processing_task(void*) {
         if (g_record_seconds >= 0 && got > 0) {
             const std::size_t produced = decimator.process(samples + filled - got, got, decimated,
                                                            kDecimatedCapacity);
+            ++capture_blocks_to_decimator;
+            capture_samples_to_decimator += static_cast<uint32_t>(got);
             capture_decimated_samples += static_cast<uint32_t>(produced);
             capture_last_produced = static_cast<uint32_t>(produced);
             for (std::size_t i = 0; i < produced; ++i) {
@@ -394,16 +404,17 @@ void processing_task(void*) {
                 std::printf("{\"type\":\"capture\",\"state\":\"progress\","
                             "\"reads\":%lu,\"no_data\":%lu,"
                             "\"ok_reads\":%lu,\"ok_read_ms\":%lu,\"no_data_ms\":%lu,"
-                            "\"analyse_ms\":%lu,"
+                            "\"analyse_ms\":%lu,\"to_decimator\":%lu,\"to_decimator_samples\":%lu,"
                             "\"decimated\":%lu,\"last_produced\":%lu,"
                             "\"pending\":%lu,\"chunks\":%lu}\n",
                             static_cast<unsigned long>(capture_reads),
                             static_cast<unsigned long>(capture_read_failures),
                             static_cast<unsigned long>(capture_ok_reads),
                             static_cast<unsigned long>(capture_ok_read_us / 1000),
-                            static_cast<unsigned long>(
-                                (capture_read_us - capture_ok_read_us) / 1000),
+                            static_cast<unsigned long>(capture_no_data_us / 1000),
                             static_cast<unsigned long>(capture_analyse_us / 1000),
+                            static_cast<unsigned long>(capture_blocks_to_decimator),
+                            static_cast<unsigned long>(capture_samples_to_decimator),
                             static_cast<unsigned long>(capture_decimated_samples),
                             static_cast<unsigned long>(capture_last_produced),
                             static_cast<unsigned long>(pending_samples),
