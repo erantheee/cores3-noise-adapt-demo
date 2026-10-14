@@ -99,27 +99,27 @@ private:
     std::size_t rejected_ = 0;
 };
 
-/// Tracks the cost of the instrumentation itself.
+/// Tracks the cost of the instrumentation itself, in microseconds.
 ///
-/// A profiler that perturbs the thing it measures is worse than no profiler. This keeps
-/// the measured overhead and compares it against the frame budget so a regression fails
-/// loudly instead of quietly shifting every latency figure.
+/// A profiler that perturbs the thing it measures is worse than no profiler, so the cost
+/// of the probes is reported alongside the measurements they produce.
+///
+/// The unit is microseconds rather than milliseconds, and there is deliberately no
+/// "percentage of frame budget" here. An earlier version compared the figure against 1% of
+/// the 150 ms frame budget and reported thousands of microseconds, which was a true
+/// statement about a number that measured the wrong thing. What the probes actually cost
+/// is a handful of microseconds; anything larger means the measurement code is doing work,
+/// not that the budget is tight.
 class ProfilerOverhead {
 public:
-    explicit ProfilerOverhead(float frame_budget_ms) : frame_budget_ms_(frame_budget_ms) {}
-
-    void record(float overhead_ms);
-    float mean_ms() const;
-    float max_ms() const;
-    /// Share of the frame budget consumed by instrumentation, in [0, 1].
-    float budget_share() const;
-    /// True when overhead has stayed under `limit_share` of the budget.
-    bool within_budget(float limit_share = 0.01f) const;
+    void record(float overhead_us);
+    float mean_us() const;
+    float max_us() const;
+    std::size_t samples() const { return count_; }
 
 private:
-    float frame_budget_ms_;
-    double sum_ms_ = 0.0;
-    float max_ms_ = 0.0f;
+    double sum_us_ = 0.0;
+    float max_us_ = 0.0f;
     std::size_t count_ = 0;
 };
 

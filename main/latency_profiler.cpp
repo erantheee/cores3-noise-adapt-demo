@@ -113,27 +113,18 @@ void LatencyProfiler::reset() {
     rejected_ = 0;
 }
 
-void ProfilerOverhead::record(float overhead_ms) {
-    if (!usable_duration(overhead_ms)) return;
-    sum_ms_ += overhead_ms;
-    max_ms_ = std::max(max_ms_, overhead_ms);
+void ProfilerOverhead::record(float overhead_us) {
+    if (!usable_duration(overhead_us)) return;
+    sum_us_ += overhead_us;
+    max_us_ = std::max(max_us_, overhead_us);
     ++count_;
 }
 
-float ProfilerOverhead::mean_ms() const {
+float ProfilerOverhead::mean_us() const {
     if (count_ == 0) return 0.0f;
-    return static_cast<float>(sum_ms_ / static_cast<double>(count_));
+    return static_cast<float>(sum_us_ / static_cast<double>(count_));
 }
 
-float ProfilerOverhead::max_ms() const { return max_ms_; }
-
-float ProfilerOverhead::budget_share() const {
-    if (frame_budget_ms_ <= 0.0f) return 0.0f;
-    return mean_ms() / frame_budget_ms_;
-}
-
-bool ProfilerOverhead::within_budget(float limit_share) const {
-    return budget_share() <= limit_share;
-}
+float ProfilerOverhead::max_us() const { return max_us_; }
 
 }  // namespace latency

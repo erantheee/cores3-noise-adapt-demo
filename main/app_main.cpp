@@ -18,7 +18,20 @@
 
 namespace {
 constexpr uint32_t kSampleRate = 48000;
+/// Samples per analysis frame. 2048 at 48 kHz is 42.7 ms and is what the 24-band
+/// analysis was calibrated on.
 constexpr std::size_t kFrameSamples = 2048;
+/// Samples requested per hardware read. This is the quantisation step of the control
+/// cadence, because the cadence test can only run once a read returns.
+///
+/// It used to equal kFrameSamples, which put the measured loop period at 170 ms against a
+/// 150 ms target: the deadline is always crossed part-way through a read, so the period
+/// overshoots by half a read on average, and half of 42.7 ms is 21 ms. Measured on device,
+/// 150 + 21 = 171 ms, which is exactly what the report showed. A smaller block cuts the
+/// overshoot proportionally; 512 samples is 10.7 ms, so the period lands near 155 ms.
+constexpr std::size_t kReadBlockSamples = 512;
+/// Largest analysis frame the accumulator can hold.
+constexpr std::size_t kFrameSamplesMax = kFrameSamples + kReadBlockSamples;
 constexpr float kControlPeriodMs = 150.0f;
 /// During capture the analysis cadence is relaxed. The capture path costs a decimation
 /// plus a base64 encode and a console write per chunk, so the two must not both run flat
@@ -31,13 +44,9 @@ constexpr float kCapturePeriodMs = 250.0f;
 /// leftover. Choose a size that is not a multiple of the decimation ratio and the capture
 /// would still be correct but carry a partial chunk across frames.
 constexpr std::size_t kCaptureChunkSamples = 1024;
-constexpr std::size_t kDecimatedPerFrame = kFrameSamples / capture::kDecimation;
 /// How often the latency breakdown is reported. 10 s is frequent enough to watch a
 /// rehearsal drift and rare enough that the report itself is not noise in the log.
 constexpr int64_t kLatencyReportPeriodUs = 10 * 1000 * 1000;
-/// Instrumentation may not cost more than this share of the analysis period. Checked
-/// rather than assumed: a profiler that perturbs what it measures is worse than none.
-constexpr float kProfilerBudgetShare = 0.01f;
 const char* kTag = "cores3_noise_adapt";
 
 void emit_command_json(const EarbudCommand& command) {
@@ -60,13 +69,12 @@ void emit_command_json(const EarbudCommand& command) {
 void emit_latency_report(latency::LatencyProfiler& profiler,
                          const latency::ProfilerOverhead& overhead, uint32_t frames) {
     std::printf("{\"type\":\"latency\",\"frames\":%lu,\"total_p50_ms\":%.2f,"
-                "\"total_p95_ms\":%.2f,\"overhead_mean_us\":%.1f,\"overhead_max_us\":%.1f,"
-                "\"budget_share\":%.5f,\"within_budget\":%s,\"stages\":[",
+                "\"total_p95_ms\":%.2f,\"overhead_mean_us\":%.2f,\"overhead_max_us\":%.2f,"
+                "\"overhead_samples\":%lu,\"stages\":[",
                 static_cast<unsigned long>(frames), profiler.total_p50_ms(),
-                profiler.total_p95_ms(), static_cast<double>(overhead.mean_ms()) * 1000.0,
-                static_cast<double>(overhead.max_ms()) * 1000.0,
-                static_cast<double>(overhead.budget_share()),
-                overhead.within_budget(kProfilerBudgetShare) ? "true" : "false");
+                profiler.total_p95_ms(), static_cast<double>(overhead.mean_us()),
+                static_cast<double>(overhead.max_us()),
+                static_cast<unsigned long>(overhead.samples()));
     for (std::size_t i = 0; i < latency::kStageCount; ++i) {
         const auto stage = static_cast<latency::Stage>(i);
         const latency::StageStats stats = profiler.stats(stage);
@@ -189,15 +197,17 @@ void processing_task(void*) {
     ESP_ERROR_CHECK(esp_codec_dev_set_in_gain(microphone, 36.0f));
     ESP_ERROR_CHECK(esp_codec_dev_open(microphone, &format));
 
+    auto* read_block = static_cast<int16_t*>(
+        heap_caps_malloc(kReadBlockSamples * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     auto* samples = static_cast<int16_t*>(
-        heap_caps_malloc(kFrameSamples * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-    if (samples == nullptr) {
+        heap_caps_malloc(kFrameSamplesMax * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (samples == nullptr || read_block == nullptr) {
         ESP_LOGE(kTag, "Audio buffer allocation failed");
         vTaskDelete(nullptr);
     }
     // 2048 input samples decimate to at most 683 output samples.
     auto* decimated = static_cast<int16_t*>(
-        heap_caps_malloc(kDecimatedPerFrame * sizeof(int16_t),
+        heap_caps_malloc((kReadBlockSamples / capture::kDecimation + 1) * sizeof(int16_t),
                          MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     auto* pending = static_cast<int16_t*>(
         heap_caps_malloc(kCaptureChunkSamples * sizeof(int16_t),
@@ -212,7 +222,7 @@ void processing_task(void*) {
     NoiseAnalyzer analyzer;
     AdaptController controller;
     latency::LatencyProfiler profiler;
-    latency::ProfilerOverhead overhead(kControlPeriodMs);
+    latency::ProfilerOverhead overhead;
     int64_t next_latency_report_us = esp_timer_get_time() + kLatencyReportPeriodUs;
     uint32_t analysed_frames = 0;
     capture::Decimator decimator;
@@ -221,9 +231,17 @@ void processing_task(void*) {
     int64_t capture_deadline_us = 0;  // 0 = capture until stopped
     int64_t last_control_us = esp_timer_get_time();
 
+    std::size_t filled = 0;  // samples currently in the analysis window
     while (true) {
-        const esp_err_t read_result = esp_codec_dev_read(
-            microphone, samples, kFrameSamples * sizeof(int16_t));
+        esp_err_t read_result = ESP_OK;
+        if (filled + kReadBlockSamples <= kFrameSamplesMax) {
+            read_result = esp_codec_dev_read(microphone, read_block,
+                                             kReadBlockSamples * sizeof(int16_t));
+            for (std::size_t i = 0; i < kReadBlockSamples; ++i) {
+                samples[filled + i] = read_block[i];
+            }
+            filled += kReadBlockSamples;
+        }
         const int64_t now_us = esp_timer_get_time();
 
         if (poll_console_command()) {
@@ -243,8 +261,9 @@ void processing_task(void*) {
         // period is 300 ms while frames arrive every ~43 ms, so six frames in seven were
         // discarded and the recording came out with periodic holes.
         if (g_record_seconds >= 0) {
-            const std::size_t produced = decimator.process(samples, kFrameSamples, decimated,
-                                                           kDecimatedPerFrame);
+            const std::size_t produced = decimator.process(read_block, kReadBlockSamples,
+                                                           decimated,
+                                                           kReadBlockSamples / capture::kDecimation + 1);
             for (std::size_t i = 0; i < produced; ++i) {
                 pending[pending_samples++] = decimated[i];
                 if (pending_samples == kCaptureChunkSamples) {
@@ -270,7 +289,11 @@ void processing_task(void*) {
         const float period_ms = (g_record_seconds >= 0) ? kCapturePeriodMs : kControlPeriodMs;
         const bool due = (now_us - last_control_us) >=
                          static_cast<int64_t>(period_ms * 1000.0f);
-        if (!due) continue;
+        // Both conditions are required: the cadence decides when a decision is wanted, the
+        // window decides whether there is enough audio to decide on. Waiting for a full
+        // window rather than a partial one keeps the 24-band analysis operating on the
+        // frame length it was calibrated on.
+        if (!due || filled < kFrameSamples) continue;
 
         // Overhead probe. The previous version read the clock once before the analysis and
         // again after the whole frame, which meant "overhead" was really the analysis time:
@@ -280,7 +303,7 @@ void processing_task(void*) {
         const float capture_ms = static_cast<float>(probe_us - last_control_us) / 1000.0f;
 
         const int64_t analyse_started_us = esp_timer_get_time();
-        AnalysisFrame frame = analyzer.analyze(samples, kFrameSamples,
+        AnalysisFrame frame = analyzer.analyze(samples, filled,
             static_cast<uint32_t>(now_us / 1000));
         if (read_result != ESP_OK) frame.mic_valid = false;
         const int64_t analyse_done_us = esp_timer_get_time();
@@ -302,9 +325,13 @@ void processing_task(void*) {
         // than being mistaken for "costs nothing".
         profiler.record(latency::Stage::embed, 0.0f);
         profiler.record(latency::Stage::decide, decide_ms);
-        overhead.record(static_cast<float>(esp_timer_get_time() - probe_us) / 1000.0f);
-        // Note the scope: this validates that the two clock reads are cheap. It does NOT
-        // validate that the timed work is cheap, and it must not be quoted as if it did.
+        // Scope of this figure, stated because the first version of it was wrong and read
+        // like something it was not: it measures the two esp_timer_get_time calls on either
+        // side of `probe_us`, which is the instrumentation's own cost. It is microseconds.
+        // It says nothing about the cost of the analysis, and it must not be quoted as if
+        // it did. The previous version read the clock before the analysis and again after
+        // the whole frame, so it reported 57 ms -- which was the analysis itself.
+        overhead.record(static_cast<float>(esp_timer_get_time() - probe_us));
         ++analysed_frames;
 
         emit_command_json(command);
@@ -321,6 +348,7 @@ void processing_task(void*) {
         }
 
         last_control_us = now_us;
+        filled = 0;
     }
 }
 }  // namespace

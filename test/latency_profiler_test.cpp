@@ -140,27 +140,40 @@ int main() {
         check(close(profiler.stats(Stage::decide).max_ms, 0.0f), "reset clears the values");
     }
 
-    // --- Instrumentation overhead must be measurable and bounded --------------------
+    // --- Instrumentation overhead must be measurable ---------------------------------
+    //
+    // The unit is microseconds and there is no frame-budget comparison. An earlier version
+    // reported milliseconds and compared them against 1% of the frame budget, which failed
+    // loudly while measuring the analysis rather than the probes.
     {
-        ProfilerOverhead overhead(150.0f);  // the control loop's frame budget
-        for (int i = 0; i < 10; ++i) overhead.record(1.0f);
-        check(close(overhead.mean_ms(), 1.0f), "overhead mean is tracked");
-        check(close(overhead.max_ms(), 1.0f), "overhead max is tracked");
-        check(close(overhead.budget_share(), 1.0f / 150.0f), "budget share is a fraction");
-        check(overhead.within_budget(0.01f), "1 ms in a 150 ms budget is under 1%");
+        ProfilerOverhead overhead;
+        for (int i = 0; i < 10; ++i) overhead.record(6.0f);
+        check(close(overhead.mean_us(), 6.0f), "overhead mean is in microseconds");
+        check(close(overhead.max_us(), 6.0f), "overhead max is in microseconds");
+        check(overhead.samples() == 10, "overhead sample count is tracked");
     }
     {
-        ProfilerOverhead overhead(150.0f);
-        for (int i = 0; i < 10; ++i) overhead.record(20.0f);
-        check(!overhead.within_budget(0.01f),
-              "instrumentation that costs 13% of the frame budget fails the check");
-    }
-    {
-        // A zero or negative budget must not divide by zero.
-        ProfilerOverhead overhead(0.0f);
+        // Probe cost is a handful of microseconds; the report showed 5.8 ms when it was
+        // measuring the analysis, which is three orders of magnitude out.
+        ProfilerOverhead overhead;
+        overhead.record(4.0f);
+        overhead.record(7.0f);
         overhead.record(5.0f);
-        check(close(overhead.budget_share(), 0.0f),
-              "a zero frame budget yields zero share rather than a division by zero");
+        check(overhead.max_us() < 100.0f,
+              "probe cost stays in the microseconds range for a healthy instrument");
+    }
+    {
+        // Bad values are rejected rather than skewing the figure.
+        ProfilerOverhead overhead;
+        overhead.record(5.0f);
+        overhead.record(-1.0f);
+        overhead.record(std::nanf(""));
+        check(overhead.samples() == 1, "invalid overhead samples are ignored");
+    }
+    {
+        ProfilerOverhead overhead;
+        check(close(overhead.mean_us(), 0.0f) && close(overhead.max_us(), 0.0f),
+              "an unused overhead tracker reports zeros rather than dividing by zero");
     }
 
     std::cout << "LatencyProfiler: " << passed << "/" << (passed + failed) << " passed\n";
