@@ -162,7 +162,9 @@ bool poll_console_command() {
                     handled = true;
                 } else if (std::strncmp(g_console_line, "route active ", 13) == 0) {
                     std::snprintf(g_mac_route.device_name, sizeof(g_mac_route.device_name),
-                                  "%s", g_console_line + 13);
+                                  "%.*s",
+                                  static_cast<int>(sizeof(g_mac_route.device_name) - 1),
+                                  g_console_line + 13);
                     g_mac_route.mac_connected = true;
                     g_mac_route.audio_output_active = true;
                     std::printf("{\"type\":\"route\",\"state\":\"active\","
@@ -170,7 +172,9 @@ bool poll_console_command() {
                     handled = true;
                 } else if (std::strncmp(g_console_line, "route inactive ", 15) == 0) {
                     std::snprintf(g_mac_route.device_name, sizeof(g_mac_route.device_name),
-                                  "%s", g_console_line + 15);
+                                  "%.*s",
+                                  static_cast<int>(sizeof(g_mac_route.device_name) - 1),
+                                  g_console_line + 15);
                     g_mac_route.mac_connected = true;
                     g_mac_route.audio_output_active = false;
                     std::printf("{\"type\":\"route\",\"state\":\"inactive\","
