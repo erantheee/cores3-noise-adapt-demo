@@ -14,6 +14,83 @@ constexpr std::array<float, kBandCount> kBandCenter = {
 
 float clamp01(float value) { return std::clamp(value, 0.0f, 1.0f); }
 
+bool in_speech_band(float hz) { return hz >= 300.0f && hz <= 4000.0f; }
+
+/// Voice-decision thresholds. Grouped and named so they can be re-calibrated against
+/// real recordings without touching the DSP code.
+namespace voice_thresholds {
+/// Absolute speech-presence floor. Below this a frame is treated as silence rather than
+/// voice. An earlier revision used -58 dBFS and rejected usable voice at -45 dBFS, which
+/// is roughly 10 dB above a real room floor; a target speaker at that level is perfectly
+/// audible, so gating there was simply wrong.
+constexpr float kGateFloorDbfs = -72.0f;
+/// Level gate reaches full scale at this level.
+constexpr float kGateFullDbfs = -50.0f;
+/// White noise has a near-flat band spectrum: measured flatness 0.693 on the calibration
+/// corpus. Speech is far peakier around its formants: measured 0.010-0.012. A ceiling well
+/// above the speech range and well below the noise range separates them with a large
+/// margin, and this gate is what rejects white noise.
+///
+/// Why flatness rather than spectral tilt: an earlier revision gated on the least-squares
+/// slope of band level against band index. That quantity is an artifact of harmonic
+/// spacing. For a 120 Hz voice the low bands hold dozens of harmonics while the high bands
+/// hold one, so the measured slope is dominated by how many harmonics land in each band
+/// rather than by the spectral envelope. The gate ended up rejecting speech and passing
+/// noise, which is exactly backwards. Flatness has no such failure mode.
+constexpr float kNoiseFlatnessCeiling = 0.45f;
+/// A steady tone concentrates its vocal-band power in one or two bands; speech spreads it
+/// across formants. Requiring a low peak share rejects steady tones.
+constexpr float kMaxVocalPeakiness = 0.72f;
+/// Below this share of power in the speech band there is simply not enough to judge.
+constexpr float kMinVocalRatio = 0.34f;
+/// Width of the band-ratio ramp above kMinVocalRatio.
+constexpr float kVocalRatioSpan = 0.36f;
+/// A band at or below this level is treated as unmeasurable and does not count as excited.
+constexpr float kFloorDbfs = -95.0f;
+/// Speech excites several formant regions at once; a tone excites one. A steady tone that
+/// falls between two band centres leaks into both and can score a modest peakiness, so the
+/// excited-band count is what actually rejects it.
+constexpr std::size_t kMinExcitedVocalBands = 5;
+/// Width of the occupancy ramp below kMinExcitedVocalBands.
+constexpr float kExcitedBandSoftness = 2.0f;
+/// Softness of the flatness and peakiness gates. Smaller is a harder edge.
+constexpr float kFlatnessSoftness = 0.10f;
+constexpr float kPeakSoftness = 0.08f;
+}  // namespace voice_thresholds
+
+/// Ramps 0 -> 1 as value rises from `edge` to `edge + softness`.
+float soft_above(float value, float edge, float softness) {
+    return clamp01((value - edge) / std::max(softness, 1.0e-6f));
+}
+
+/// Ramps 1 -> 0 as value rises from `edge` to `edge + softness`.
+float soft_below(float value, float edge, float softness) {
+    return clamp01((edge - value) / std::max(softness, 1.0e-6f));
+}
+
+/// Clipping detection.
+///
+/// Counting isolated full-scale samples is not enough: at -1 dBFS even clean noise
+/// reaches full scale on roughly 26% of samples. What distinguishes a clipped frame is a
+/// *plateau* — consecutive samples pinned at full scale. On the calibration corpus, clean
+/// content tops out at a 6-sample run, a 1.2x overload reaches 9, and a 3x overload
+/// reaches 19, so the longest run is the discriminating signal. The pinned-share test
+/// additionally catches square-ish waveforms.
+namespace clip_thresholds {
+constexpr float kPinnedValue = 32760.0f;
+constexpr std::size_t kMaxPinnedRun = 12;
+constexpr float kMaxPinnedShare = 0.20f;
+}  // namespace clip_thresholds
+
+/// True when the frame looks clipped rather than merely loud.
+bool frame_is_clipped(std::size_t pinned_samples, std::size_t longest_pinned_run,
+                      std::size_t count) {
+    if (count == 0) return false;
+    const float pinned_share = static_cast<float>(pinned_samples) / static_cast<float>(count);
+    return longest_pinned_run > clip_thresholds::kMaxPinnedRun ||
+           pinned_share > clip_thresholds::kMaxPinnedShare;
+}
+
 float slew(float current, float target, float dt_ms, float attack_ms, float release_ms) {
     const float tau = target > current ? attack_ms : release_ms;
     const float alpha = 1.0f - std::exp(-std::max(dt_ms, 0.0f) / std::max(tau, 1.0f));
@@ -48,28 +125,114 @@ AnalysisFrame NoiseAnalyzer::analyze(const int16_t* mono, std::size_t count,
     if (mono == nullptr || count < 256) return frame;
 
     double sum = 0.0;
-    std::size_t clipped = 0;
+    std::size_t pinned = 0;
+    std::size_t longest_run = 0;
+    std::size_t current_run = 0;
     for (std::size_t i = 0; i < count; ++i) {
         const float x = static_cast<float>(mono[i]) / 32768.0f;
         sum += x * x;
-        if (std::abs(mono[i]) >= 32760) ++clipped;
+        if (std::abs(mono[i]) >= clip_thresholds::kPinnedValue) {
+            ++pinned;
+            ++current_run;
+            longest_run = std::max(longest_run, current_run);
+        } else {
+            current_run = 0;
+        }
     }
     const float rms = std::sqrt(static_cast<float>(sum / count));
     frame.broadband_dbfs = 20.0f * std::log10(std::max(rms, 1.0e-6f));
-    frame.mic_valid = std::isfinite(frame.broadband_dbfs) && clipped < count / 100;
+    frame.mic_valid = std::isfinite(frame.broadband_dbfs) &&
+                      !frame_is_clipped(pinned, longest_run, count);
 
-    float vocal_power = 0.0f;
-    float total_power = 0.0f;
     for (std::size_t band = 0; band < kBandCount; ++band) {
+        frame.band_center_hz[band] = kBandCenter[band];
         frame.band_dbfs[band] = goertzel_dbfs(mono, count, kBandCenter[band]);
-        const float power = std::pow(10.0f, frame.band_dbfs[band] / 10.0f);
-        total_power += power;
-        if (kBandCenter[band] >= 300.0f && kBandCenter[band] <= 4000.0f) vocal_power += power;
     }
-    const float vocal_ratio = vocal_power / std::max(total_power, 1.0e-12f);
-    const float level_gate = clamp01((frame.broadband_dbfs + 58.0f) / 18.0f);
-    frame.voice_likelihood = clamp01((vocal_ratio - 0.34f) / 0.36f) * level_gate;
+    frame.voice_likelihood = voice_likelihood_from_features(extract_voice_features(frame));
     return frame;
+}
+
+VoiceFeatures extract_voice_features(const AnalysisFrame& frame) {
+    VoiceFeatures features;
+
+    std::array<float, kBandCount> power{};
+    float total_power = 0.0f;
+    float vocal_power = 0.0f;
+    float vocal_peak = 0.0f;
+    std::size_t excited_vocal_bands = 0;
+    for (std::size_t band = 0; band < kBandCount; ++band) {
+        power[band] = std::pow(10.0f, frame.band_dbfs[band] / 10.0f);
+        total_power += power[band];
+        if (in_speech_band(frame.band_center_hz[band])) {
+            vocal_power += power[band];
+            vocal_peak = std::max(vocal_peak, power[band]);
+            if (frame.band_dbfs[band] > voice_thresholds::kFloorDbfs) ++excited_vocal_bands;
+        }
+    }
+
+    features.vocal_ratio = vocal_power / std::max(total_power, 1.0e-12f);
+    features.vocal_peakiness = vocal_peak / std::max(vocal_power, 1.0e-12f);
+    features.excited_vocal_bands = excited_vocal_bands;
+
+    // Least-squares slope of band level against band index, fitted over measurable bands
+    // only. Natural speech rolls off towards high frequencies; a flat spectrum gives a
+    // slope near zero. Floor-limited bands must be excluded or a narrowband signal
+    // manufactures a steep slope out of its own silence.
+    float mean_index = 0.0f;
+    float mean_level = 0.0f;
+    std::size_t fitted = 0;
+    for (std::size_t band = 0; band < kBandCount; ++band) {
+        if (frame.band_dbfs[band] <= voice_thresholds::kFloorDbfs) continue;
+        mean_index += static_cast<float>(band);
+        mean_level += frame.band_dbfs[band];
+        ++fitted;
+    }
+    if (fitted >= 2) {
+        mean_index /= static_cast<float>(fitted);
+        mean_level /= static_cast<float>(fitted);
+        float covariance = 0.0f;
+        float variance = 0.0f;
+        for (std::size_t band = 0; band < kBandCount; ++band) {
+            if (frame.band_dbfs[band] <= voice_thresholds::kFloorDbfs) continue;
+            const float dx = static_cast<float>(band) - mean_index;
+            covariance += dx * (frame.band_dbfs[band] - mean_level);
+            variance += dx * dx;
+        }
+        features.spectral_tilt_db_per_band = covariance / std::max(variance, 1.0e-6f);
+    }
+
+    double log_sum = 0.0;
+    for (std::size_t band = 0; band < kBandCount; ++band) {
+        log_sum += std::log(std::max(power[band], 1.0e-20f));
+    }
+    const float geometric_mean = std::exp(static_cast<float>(log_sum / kBandCount));
+    const float arithmetic_mean = std::max(total_power / kBandCount, 1.0e-20f);
+    features.spectral_flatness = clamp01(geometric_mean / arithmetic_mean);
+
+    features.level_gate = clamp01((frame.broadband_dbfs - voice_thresholds::kGateFloorDbfs) /
+                                  (voice_thresholds::kGateFullDbfs -
+                                   voice_thresholds::kGateFloorDbfs));
+    return features;
+}
+
+float voice_likelihood_from_features(const VoiceFeatures& features) {
+    using namespace voice_thresholds;
+
+    // Energy must actually be in the speech band.
+    const float band_term = clamp01((features.vocal_ratio - kMinVocalRatio) / kVocalRatioSpan);
+    // ... a single dominant band is a tone, not voice.
+    const float peak_term = soft_below(features.vocal_peakiness, kMaxVocalPeakiness,
+                                      kPeakSoftness);
+    // ... a flat spectrum is noise, not voice.
+    const float noise_term = soft_below(features.spectral_flatness, kNoiseFlatnessCeiling,
+                                       kFlatnessSoftness);
+    // ... and voice excites several formant regions, not one.
+    const float spread_term =
+        soft_above(static_cast<float>(features.excited_vocal_bands),
+                   static_cast<float>(kMinExcitedVocalBands) - kExcitedBandSoftness,
+                   kExcitedBandSoftness);
+
+    return band_term * peak_term * noise_term * spread_term * features.level_gate;
 }
 
 EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
