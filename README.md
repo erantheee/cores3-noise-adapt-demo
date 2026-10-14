@@ -273,10 +273,19 @@ python3 tools/voice_separability.py --enroll 甲A.wav 甲B.wav 甲C.wav \
 
 ```bash
 sh tools/host_up.sh                    # 真机（自动找 /dev/cu.usbmodem*）
+sh tools/host_up.sh --relay-audio      # S3 麦克风实时中继到 Mac 默认输出 / AirPods
 sh tools/host_up.sh --mock             # 没有设备也能先把界面跑起来
 sh tools/host_up.sh --replay 记录/x.log --speed 4    # 回放历史日志
 # 然后打开 http://127.0.0.1:8787/
 ```
+
+`--relay-audio` 会自动让设备进入无限时长采集，把 16 kHz 单声道 PCM 送给 Mac，再由 Mac
+当前默认音频输出播放。使用前先在 macOS 把输出切到 AirPods Pro。固件以 20 ms 小包发送；主机
+播放队列积压时丢弃旧包而不是继续增加延迟。中继期间同一份麦克风流仍进入环境分析，所以
+VAD、歌曲 EQ 和现实人声意图不会因为开始中继而冻结。
+
+这一版是**未经增强的现实声音中继**：它用于先测通路和总延迟，还没有完成声纹排除、目标人声
+提取、方向选择或歌曲避让 EQ。不要把听到现实声音写成“已经完成目标人声增强”。
 
 面板会显示：环境 / 当前动作 / **语音段增益** / **调音（24 频段 EQ 形状）** /
 **决策模式**（设备上报的 `mode`：`FLAT` / `SONG_EQ` / `EXTERNAL_VOICE_INTENT` / `SAFETY_HOLD`）/

@@ -18,6 +18,7 @@ import threading
 import time
 import webbrowser
 
+from .audio_relay import AudioRelay, RelayError
 from .mac_audio import default_output, route_command
 from .player import DEFAULT_VOLUME_PERCENT, PlayerService
 from .server import Broadcaster, make_server, pick_port
@@ -112,13 +113,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_VOLUME_PERCENT,
         help=f"播放器音量百分比，默认 {DEFAULT_VOLUME_PERCENT:.0f}（刻意调低：第一次出声不该吓人）",
     )
+    parser.add_argument(
+        "--relay-audio",
+        action="store_true",
+        help="把 CoreS3 麦克风实时中继到 Mac 当前默认输出（AirPods）",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     source = build_source(args)
-    state = HostState(source=source.name, detail=source.detail)
+    relay = AudioRelay() if args.relay_audio else None
+    if relay is not None:
+        try:
+            relay.start()
+        except RelayError as exc:
+            print(f"无法启动音频中继：{exc}", file=sys.stderr)
+            return 3
+    state = HostState(
+        source=source.name,
+        detail=source.detail,
+        on_mic_chunk=(lambda chunk: relay.feed(chunk.pcm, chunk.rate)) if relay else None,
+    )
     broadcaster = Broadcaster(state)
     writer = DeviceWriter()
 
@@ -179,6 +196,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  面板      {url}")
         print("  帧率      设备每 100 ms 一帧；录音时放宽到 250 ms（预期行为）")
         print("  回控      可发 rec start [秒数] / rec stop" if can_control else "  回控      不可用（当前数据源没有设备可写）")
+        print("  中继      S3 麦克风 → Mac 默认输出" if relay else "  中继      未开启（加 --relay-audio）")
         if isinstance(source, ReplaySource):
             print("  注意      回放只是把历史日志搬到界面上，不代表设备现在的状态")
         if isinstance(source, MockSource):
@@ -221,6 +239,26 @@ def main(argv: list[str] | None = None) -> int:
     if can_control:
         threading.Thread(target=monitor_mac_route, name="mac-route", daemon=True).start()
 
+    def start_live_capture() -> None:
+        """Start indefinite device capture after the serial console has finished booting."""
+        if relay is None:
+            return
+        deadline = time.monotonic() + 10.0
+        while not stop.is_set() and time.monotonic() < deadline:
+            if writer.available:
+                time.sleep(0.8)
+                try:
+                    writer(b"rec start\r\n")
+                    state.note_control_sent("rec start（音频中继）")
+                    return
+                except (OSError, RuntimeError):
+                    pass
+            time.sleep(0.1)
+        state.note("音频中继未能启动：10 秒内没有可写的设备连接")
+
+    if can_control and relay is not None:
+        threading.Thread(target=start_live_capture, name="relay-start", daemon=True).start()
+
     serving = threading.Thread(target=httpd.serve_forever, name="http", daemon=True)
     serving.start()
 
@@ -246,6 +284,13 @@ def main(argv: list[str] | None = None) -> int:
     source_thread.join(timeout=3.0)
     if player_service is not None:
         player_service.stop()
+    if relay is not None:
+        relay.stop()
+        stats = relay.stats()
+        if relay.failure:
+            thread_error.append(RelayError(relay.failure))
+        elif not args.quiet:
+            print(f"音频中继：播放 {stats.chunks_written} 包，因积压丢弃 {stats.chunks_dropped} 包。")
 
     if thread_error:
         error = thread_error[0]

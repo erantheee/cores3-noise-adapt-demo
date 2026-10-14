@@ -27,7 +27,7 @@ import time
 import threading
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from .protocol import (
     CAPTURE_RATE_HZ,
@@ -195,11 +195,13 @@ class HostState:
     界面线程不会读到一半被改掉的数据。
     """
 
-    def __init__(self, source: str = "serial", detail: str = "", capacity: int = SAMPLE_CAPACITY):
+    def __init__(self, source: str = "serial", detail: str = "", capacity: int = SAMPLE_CAPACITY,
+                 on_mic_chunk: Callable[[MicChunk], None] | None = None):
         self.started_at = time.monotonic()
         self.source = source
         self.source_detail = detail
         self.capacity = capacity
+        self.on_mic_chunk = on_mic_chunk
 
         self.connected = False
         self.connected_detail = ""
@@ -473,6 +475,8 @@ class HostState:
                     self.note(f"录音块缺失 {lost} 块：这一段录音有断裂，不能用于声纹或信噪比结论")
             self._expected_chunk = chunk.sequence + 1
         self.audio_samples += chunk.sample_count
+        if self.on_mic_chunk is not None:
+            self.on_mic_chunk(chunk)
 
     # ------------------------------------------------------------------ 记录
 

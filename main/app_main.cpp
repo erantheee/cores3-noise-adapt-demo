@@ -47,11 +47,10 @@ constexpr float kControlPeriodMs = 100.0f;
 /// 10-20 ms, which is under 10% of 250 ms. On device the analysis itself measures 7.03 ms p50
 /// (see README), so 10-20 ms is the pessimistic end of that estimate, not the observed one.
 constexpr float kCapturePeriodMs = 250.0f;
-/// Samples accumulated before a chunk is sent: 1024 at 16 kHz is 64 ms, which is exactly
-/// three 2048-sample input frames at the 3:1 decimation, so blocks line up with no
-/// leftover. Choose a size that is not a multiple of the decimation ratio and the capture
-/// would still be correct but carry a partial chunk across frames.
-constexpr std::size_t kCaptureChunkSamples = 1024;
+/// Samples accumulated before a chunk is sent. 320 at 16 kHz is 20 ms: short enough for
+/// live monitoring while still keeping serial/base64 overhead modest. The previous 1024
+/// sample packet imposed 64 ms of packetisation delay before USB and Bluetooth did any work.
+constexpr std::size_t kCaptureChunkSamples = 320;
 /// How often the latency breakdown is reported. 10 s is frequent enough to watch a
 /// rehearsal drift and rare enough that the report itself is not noise in the log.
 constexpr int64_t kLatencyReportPeriodUs = 10 * 1000 * 1000;
@@ -456,6 +455,17 @@ void processing_task(void*) {
         // and no window state, so it consumes staging directly and staging keeps its remainder.
         if (capturing) {
             while (staged >= kReadBlockSamples) {
+                // Relay and environment control consume the same microphone stream. Capture
+                // used to starve analysis, so enabling relay silently froze VAD/EQ decisions.
+                if (filled + kReadBlockSamples <= kFrameSamplesMax) {
+                    for (std::size_t i = 0; i < kReadBlockSamples; ++i) {
+                        samples[filled + i] = stage[i];
+                    }
+                    filled += kReadBlockSamples;
+                    if (filled > capture_max_filled) {
+                        capture_max_filled = static_cast<uint32_t>(filled);
+                    }
+                }
                 const std::size_t produced =
                     decimator.process(stage, kReadBlockSamples, decimated, kDecimatedCapacity);
                 ++capture_blocks_to_decimator;

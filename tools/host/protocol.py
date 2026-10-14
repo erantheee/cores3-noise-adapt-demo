@@ -44,7 +44,7 @@ MAX_NOISE_REDUCTION_DB = 8.0
 
 #: 固件侧录音输出参数，与 capture::kOutputRate / kCaptureChunkSamples 一致。
 CAPTURE_RATE_HZ = 16000
-CAPTURE_CHUNK_SAMPLES = 1024
+CAPTURE_CHUNK_SAMPLES = 320
 
 #: 已知的固件状态与环境的字符串（main/controller.cpp 的 adapt_state_name /
 #: environment_name）。未知值要如实显示为"未知(原文)"，不要猜。

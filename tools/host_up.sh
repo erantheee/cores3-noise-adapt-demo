@@ -5,6 +5,7 @@
 #   sh tools/host_up.sh --detach        # 脱离会话在后台运行（推荐：会话被回收也不会带走它）
 #   sh tools/host_up.sh --status        # 只看它是否在运行
 #   sh tools/host_up.sh --mock          # 没有设备时先把界面跑起来
+#   sh tools/host_up.sh --relay-audio   # S3 麦克风实时送到 Mac 默认输出/AirPods
 #   sh tools/host_up.sh --replay 记录/x.log --speed 4
 #
 # 覆盖项：
