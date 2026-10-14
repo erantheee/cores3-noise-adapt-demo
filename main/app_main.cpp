@@ -246,16 +246,44 @@ void processing_task(void*) {
     int64_t capture_deadline_us = 0;  // 0 = capture until stopped
     int64_t last_control_us = esp_timer_get_time();
 
+    bool logged_first_capture_frame = false;
     std::size_t filled = 0;  // samples currently in the analysis window
     while (true) {
+        // Read what the codec actually has, and advance by *that* count.
+        //
+        // The previous revision called esp_codec_dev_read(.., kReadBlockSamples * 2) and then
+        // unconditionally did `filled += kReadBlockSamples`. A codec read is a partial read:
+        // it returns the number of bytes it delivered, which is routinely less than asked.
+        // Two things followed from ignoring it:
+        //
+        //   * the analysis window filled at the wrong rate, and
+        //   * the decimator was handed a full 512-sample block on every call regardless of
+        //     how many samples were new, so a recording mixed fresh audio with leftovers
+        //     from the previous read.
+        //
+        // Measured on device after flashing the USB-console fix: a 15-second `rec start 15`
+        // produced exactly one chunk of 170 samples -- one 512-sample block's worth of
+        // decimation -- while the control loop kept its 250 ms cadence throughout.
         esp_err_t read_result = ESP_OK;
+        std::size_t got = 0;
         if (filled + kReadBlockSamples <= kFrameSamplesMax) {
-            read_result = esp_codec_dev_read(microphone, read_block,
-                                             kReadBlockSamples * sizeof(int16_t));
-            for (std::size_t i = 0; i < kReadBlockSamples; ++i) {
-                samples[filled + i] = read_block[i];
+            const int bytes = esp_codec_dev_read(microphone, read_block,
+                                                 kReadBlockSamples * sizeof(int16_t));
+            if (bytes <= 0) {
+                // Nothing available this pass. This is not a microphone fault: the codec can
+                // legitimately have nothing ready between DMA blocks. Feed nothing to the
+                // analysis or the decimator and wait for the next pass -- marking the frame
+                // invalid here would raise MIC FAULT on a healthy microphone, and the
+                // control loop would then zero the gain for no reason.
+                continue;
+            } else {
+                got = static_cast<std::size_t>(bytes) / sizeof(int16_t);
+                if (got > kReadBlockSamples) got = kReadBlockSamples;
+                for (std::size_t i = 0; i < got; ++i) {
+                    samples[filled + i] = read_block[i];
+                }
+                filled += got;
             }
-            filled += kReadBlockSamples;
         }
         const int64_t now_us = esp_timer_get_time();
 
@@ -268,6 +296,7 @@ void processing_task(void*) {
                 pending_samples = 0;
                 capture_deadline_us =
                     requested > 0 ? now_us + static_cast<int64_t>(requested) * 1000000 : 0;
+                logged_first_capture_frame = false;
             }
         }
 
@@ -275,9 +304,10 @@ void processing_task(void*) {
         // below. Sitting behind that gate was a real bug: during capture the analysis
         // period is 300 ms while frames arrive every ~43 ms, so six frames in seven were
         // discarded and the recording came out with periodic holes.
-        if (g_record_seconds >= 0) {
-            const std::size_t produced = decimator.process(read_block, kReadBlockSamples,
-                                                           decimated,
+        if (g_record_seconds >= 0 && got > 0) {
+            // Feed only the samples that were actually read: passing the whole block here is
+            // what made the recording contain stale audio.
+            const std::size_t produced = decimator.process(read_block, got, decimated,
                                                            kReadBlockSamples / capture::kDecimation + 1);
             for (std::size_t i = 0; i < produced; ++i) {
                 pending[pending_samples++] = decimated[i];
@@ -286,6 +316,16 @@ void processing_task(void*) {
                                        encode_buffer);
                     pending_samples = 0;
                 }
+            }
+            if (!logged_first_capture_frame && produced > 0) {
+                // One line per recording, so a future capture problem is diagnosable from the
+                // log instead of from a 15-second file that turns out to be empty.
+                logged_first_capture_frame = true;
+                std::printf("{\"type\":\"capture\",\"state\":\"first_frame\","
+                            "\"read_samples\":%lu,\"decimated\":%lu,\"pending\":%lu}\n",
+                            static_cast<unsigned long>(got),
+                            static_cast<unsigned long>(produced),
+                            static_cast<unsigned long>(pending_samples));
             }
             if (capture_deadline_us != 0 && now_us >= capture_deadline_us) {
                 if (pending_samples > 0) {
