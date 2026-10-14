@@ -333,11 +333,17 @@ void processing_task(void*) {
         }
 
         // Top up the analysis window from staging. At most two blocks per pass: 2048 samples
-        // every 150 ms is all the 24-band analysis needs, and leaving the rest staged keeps the
-        // decimator fed. Staging keeps its remainder -- clearing it here is what made four blocks
-        // in every five disappear, because the window reaches its high-water mark during a
-        // recording while audio keeps arriving at 48 kHz.
-        for (int block = 0; block < 2; ++block) {
+        // every 150 ms is all the 24-band analysis needs. Staging keeps its remainder --
+        // clearing it here is what made four blocks in every five disappear, because the window
+        // reaches its high-water mark during a recording while audio keeps arriving at 48 kHz.
+        //
+        // During a recording this is skipped entirely. Measured: 471 blocks read against 379
+        // reaching the decimator, with the staging high-water mark at 512 of 4096 -- so staging
+        // was never full, and the missing blocks were the ones the analysis window took. A
+        // recording is the scarce consumer here; the analysis can run on whatever it already has,
+        // because the capture cadence has already been relaxed to 250 ms for exactly this reason.
+        const bool capturing = g_record_seconds >= 0;
+        for (int block = 0; block < 2 && !capturing; ++block) {
             if (staged < kReadBlockSamples) break;
             if (filled + kReadBlockSamples > kFrameSamplesMax) break;
             for (std::size_t i = 0; i < kReadBlockSamples; ++i) {
@@ -401,7 +407,7 @@ void processing_task(void*) {
         // high-water mark: measured on device, 953 blocks read in 10 s (487936 samples, the full
         // 48 kHz) against only 196 blocks reaching the decimator. Decimation needs whole blocks
         // and no window state, so it consumes staging directly and staging keeps its remainder.
-        if (g_record_seconds >= 0) {
+        if (capturing) {
             while (staged >= kReadBlockSamples) {
                 const std::size_t produced =
                     decimator.process(stage, kReadBlockSamples, decimated, kDecimatedCapacity);
