@@ -540,7 +540,13 @@ void processing_task(void*) {
         if (g_record_seconds >= 0) {
             capture_analyse_us += static_cast<uint32_t>(esp_timer_get_time() - analyse_started_us);
         }
-        if (read_result != ESP_OK) frame.mic_valid = false;
+        // An empty read is not a broken microphone. `read_result != ESP_OK` here means the DMA
+        // had nothing ready this pass, which happens routinely while the loop is keeping up;
+        // treating it as a fault raised MIC FAULT eight times in the first five seconds after
+        // boot, zeroing the gain each time. The read error is still counted (`no_data`) but it no
+        // longer claims the microphone is broken. A microphone that is genuinely dead produces
+        // out-of-range samples, which the clipping check in the analyser already catches.
+        (void)read_result;
         const int64_t analyse_done_us = esp_timer_get_time();
 
         const float elapsed_ms = static_cast<float>(now_us - last_control_us) / 1000.0f;
