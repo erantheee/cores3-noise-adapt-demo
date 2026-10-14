@@ -218,10 +218,12 @@ void processing_task(void*) {
     // read capped the recording at about a fifth of real time. Reads are decoupled from the
     // block size: take whatever arrives and hand a block on once one has accumulated.
     // Staging has two independent consumers: the analysis window, and -- during a recording --
-    // the decimator. Four blocks of slack keeps a busy analysis pass from forcing audio to be
-    // dropped. Capacity must be a whole number of blocks, or the top-up loop leaves a remainder
-    // that never reaches the block threshold.
-    constexpr std::size_t kStageCapacity = 4 * kReadBlockSamples;
+    // the decimator. The read is the fast producer (one block per ~10 ms) while the decimator
+    // drains what it can per pass, so staging needs real slack: at four blocks the buffer filled,
+    // the top-up loop stopped reading, and the recording ran at 12766 of 16000 samples/s.
+    // Eight blocks is 8 KB and takes that to the full rate. Capacity must be a whole number of
+    // blocks, or the top-up loop leaves a remainder that never reaches the block threshold.
+    constexpr std::size_t kStageCapacity = 8 * kReadBlockSamples;
     static_assert(kStageCapacity % kReadBlockSamples == 0,
                   "staging capacity must be a whole number of blocks");
     auto* stage = static_cast<int16_t*>(
@@ -281,8 +283,8 @@ void processing_task(void*) {
     uint32_t capture_ok_reads = 0;
     uint32_t capture_blocks_to_decimator = 0;
     uint32_t capture_samples_to_decimator = 0;
-    uint32_t capture_dropped_window_full = 0;
     uint32_t capture_max_filled = 0;
+    uint32_t capture_max_staged = 0;
     uint32_t capture_ok_read_us = 0;
     uint32_t capture_analyse_us = 0;
     uint32_t capture_last_produced = 0;
@@ -355,6 +357,11 @@ void processing_task(void*) {
         // there is still room for another block, and clearing there would throw away audio
         // on every pass.
         if (filled > capture_max_filled) capture_max_filled = static_cast<uint32_t>(filled);
+        if (g_record_seconds >= 0 && staged > capture_max_staged) {
+            // If this ever reaches kStageCapacity, the reader is stalled behind a full staging
+            // buffer again -- that is the shape of the 20% shortfall, so keep it visible.
+            capture_max_staged = static_cast<uint32_t>(staged);
+        }
         const int64_t now_us = esp_timer_get_time();
 
         if (poll_console_command()) {
@@ -373,8 +380,8 @@ void processing_task(void*) {
                 capture_ok_reads = 0;
                 capture_blocks_to_decimator = 0;
                 capture_samples_to_decimator = 0;
-                capture_dropped_window_full = 0;
                 capture_max_filled = 0;
+                capture_max_staged = 0;
                 capture_ok_read_us = 0;
                 capture_analyse_us = 0;
                 capture_last_produced = 0;
@@ -432,7 +439,7 @@ void processing_task(void*) {
                             "\"reads\":%lu,\"no_data\":%lu,"
                             "\"ok_reads\":%lu,\"ok_read_ms\":%lu,\"no_data_ms\":%lu,"
                             "\"analyse_ms\":%lu,\"to_decimator\":%lu,\"to_decimator_samples\":%lu,"
-                            "\"drop_window_full\":%lu,\"max_filled\":%lu,"
+                            "\"max_filled\":%lu,\"max_staged\":%lu,\"stage_cap\":%lu,"
                             "\"decimated\":%lu,\"last_produced\":%lu,"
                             "\"pending\":%lu,\"chunks\":%lu}\n",
                             static_cast<unsigned long>(capture_reads),
@@ -443,8 +450,9 @@ void processing_task(void*) {
                             static_cast<unsigned long>(capture_analyse_us / 1000),
                             static_cast<unsigned long>(capture_blocks_to_decimator),
                             static_cast<unsigned long>(capture_samples_to_decimator),
-                            static_cast<unsigned long>(capture_dropped_window_full),
                             static_cast<unsigned long>(capture_max_filled),
+                            static_cast<unsigned long>(capture_max_staged),
+                            static_cast<unsigned long>(kStageCapacity),
                             static_cast<unsigned long>(capture_decimated_samples),
                             static_cast<unsigned long>(capture_last_produced),
                             static_cast<unsigned long>(pending_samples),
