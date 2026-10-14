@@ -37,6 +37,7 @@ from host.protocol import (  # noqa: E402
     iter_json_objects,
     parse_line,
 )
+from host.mac_audio import parse_default_output, route_command  # noqa: E402
 from host.server import (  # noqa: E402
     Broadcaster,
     CommandError,
@@ -88,6 +89,13 @@ def test_d2_matches_c_printf() -> None:
     eq(d2(3.2), 3.2, "d2 保持两位以内")
     eq(d2(4.109), 4.11, "d2 常规进位")
     eq(d2(0.0), 0.0, "d2 零")
+
+
+def test_mac_default_output_route() -> None:
+    report = """Audio:\n\n    Devices:\n\n        MacBook Air扬声器:\n\n          Output Channels: 2\n\n        AirPods Pro:\n\n          Default Output Device: Yes\n          Output Channels: 2\n"""
+    eq(parse_default_output(report), "AirPods Pro", "识别 Mac 默认音频输出")
+    eq(route_command("AirPods Pro"), b"route active AirPods Pro\r\n", "生成路由回传命令")
+    eq(route_command(None), b"route offline\r\n", "没有默认输出时明确离线")
 
 
 def test_command_frame_full() -> None:
@@ -1104,6 +1112,7 @@ def test_server_refuses_control_without_device() -> None:
 def main() -> int:
     tests = [
         test_d2_matches_c_printf,
+        test_mac_default_output_route,
         test_command_frame_full,
         test_new_firmware_frame_carries_tuning,
         test_old_firmware_frame_still_reads,

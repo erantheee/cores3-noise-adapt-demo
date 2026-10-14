@@ -18,6 +18,7 @@ import threading
 import time
 import webbrowser
 
+from .mac_audio import default_output, route_command
 from .server import Broadcaster, make_server, pick_port
 from .sources import (
     MissingDependency,
@@ -179,6 +180,24 @@ def main(argv: list[str] | None = None) -> int:
 
     source_thread = threading.Thread(target=run_source, name="source", daemon=True)
     source_thread.start()
+
+    # CoreS3 cannot inspect macOS Bluetooth routing itself. Report the Mac's
+    # real default output to its second page whenever that route changes.
+    def monitor_mac_route() -> None:
+        last_device: str | None | object = object()
+        while not stop.wait(2.0):
+            device = default_output()
+            if device == last_device or not writer.available:
+                continue
+            try:
+                writer(route_command(device))
+                last_device = device
+                state.log("route", "Mac 音频输出已同步", device or "没有默认输出")
+            except (OSError, RuntimeError):
+                continue
+
+    if can_control:
+        threading.Thread(target=monitor_mac_route, name="mac-route", daemon=True).start()
 
     serving = threading.Thread(target=httpd.serve_forever, name="http", daemon=True)
     serving.start()
