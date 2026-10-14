@@ -9,6 +9,19 @@ constexpr std::size_t kBandCount = 24;
 constexpr std::size_t kMaxAnalysisFrame = 4096;
 constexpr float kMaxSpeechGainDb = 6.5f;
 
+enum class TuningMode : uint8_t {
+    flat,
+    song_eq,
+    external_voice_intent,
+    safety_hold,
+};
+
+enum class ConversationState : uint8_t {
+    none,
+    speech_nearby,
+    likely,
+};
+
 enum class AdaptState : uint8_t {
     observing,
     adjusting,
@@ -71,16 +84,20 @@ VoiceFeatures extract_voice_features(const AnalysisFrame& frame);
 float voice_likelihood_from_features(const VoiceFeatures& features);
 
 struct EarbudCommand {
-    uint32_t schema_version = 1;
+    uint32_t schema_version = 2;
     uint32_t sequence = 0;
     uint32_t timestamp_ms = 0;
     float speech_gain_db = 0.0f;
+    float external_voice_gain_db = 0.0f;
     uint8_t media_percent = 100;
     std::array<float, kBandCount> eq_gain_db{};
+    std::array<float, kBandCount> ambient_band_dbfs{};
     AdaptState state = AdaptState::observing;
     EnvironmentKind environment = EnvironmentKind::quiet;
     float confidence = 0.0f;
     bool earbud_link_connected = false;
+    TuningMode tuning_mode = TuningMode::flat;
+    ConversationState conversation = ConversationState::none;
 };
 
 class NoiseAnalyzer {
@@ -100,7 +117,14 @@ private:
     float media_percent_ = 100.0f;
     float valid_ms_ = 0.0f;
     float invalid_ms_ = 0.0f;
+    float speech_run_ms_ = 0.0f;
+    float silence_run_ms_ = 1000.0f;
+    float conversation_hold_ms_ = 0.0f;
+    uint8_t speech_turns_ = 0;
+    bool previous_speech_active_ = false;
 };
 
 const char* adapt_state_name(AdaptState state);
 const char* environment_name(EnvironmentKind environment);
+const char* tuning_mode_name(TuningMode mode);
+const char* conversation_state_name(ConversationState state);

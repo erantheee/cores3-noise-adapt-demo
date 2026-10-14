@@ -1,11 +1,12 @@
-# CoreS3 端侧可行性验证机
+# AI OWS 耳机仓综合体验 Demo
 
-M5Stack CoreS3 上运行的**耳机盒形态端侧 AI 可行性验证机**。它不是耳机，也不代表智能耳机盒
-已具备商业价值。
+本项目用 **CoreS3 = AI OWS 耳机仓、Mac = 播放器与原型执行器、AirPods Pro = 本次耳机**，
+验证端侧 AI 根据环境、时间、个人历史和用户纠正做出的综合听音决策是否真的有用。
 
-**它要回答的不是"算法好不好"**——那件事已经由
-[`ows-earbud-demo`](https://github.com/erantheee/ows-earbud-demo) 在 Mac 上完成并留下实测数据。
-它回答的是另外三笔账：**端侧的分段延迟、端侧的近场拾音信噪比、声纹选人在端侧是否可行。**
+唯一产品口径见 [`docs/product-alignment.md`](docs/product-alignment.md)。功能、UI 和对外表述都必须与它一致。
+
+它要回答的是综合体验：**环境判断是否可靠、歌曲 EQ 是否有益、现实人声增益意图能否执行、端到端
+延迟是否可接受，以及策略是否知道何时退出或不动作。**
 
 完整论证见 [`docs/edge-feasibility.md`](docs/edge-feasibility.md)；每条决定的原因见
 [`docs/decisions.md`](docs/decisions.md)；**计划本身与每项状态见
@@ -16,16 +17,16 @@ M5Stack CoreS3 上运行的**耳机盒形态端侧 AI 可行性验证机**。它
 ## 当前闭环
 
 ```text
-CoreS3 双麦克风 → 24 频段环境分析 → 人声/噪声判据 → 连续策略控制器
-                                                        ↓
-                                                 EarbudCommand v1
-                                                        ↓
-                                            屏幕状态 + USB 串口 JSON
+CoreS3 双麦克风 → 24频段环境分析 → 人声/噪声/对话形态 → 端侧策略
+                                                           ↓
+                                                  EarbudCommand v2
+                                                           ↓ USB
+                                        Mac三首本地歌曲处理 → AirPods Pro
 ```
 
-CoreS3 承担感知、判断与决策。**音频链路不由它负责**——真实产品里耳机盒也不参与音频链路，
-音频由播放端经蓝牙送达耳机。当前没有已接入的可控耳机协议，因此界面如实显示
-`控制链路：模拟`。
+CoreS3 承担耳机仓侧的感知、判断与决策；Mac 承担本次 Demo 的音频执行；AirPods Pro 只播放 Mac
+最终输出。AirPods 不开放双耳原始麦克风与通透 DSP，所以当前不能声称使用 AirPods 麦克风完成了
+目标人声增强。真实执行链路尚未接通时，协议固定上报 `execution: decision_only`。
 
 ## 三笔账的当前状态
 
@@ -71,30 +72,31 @@ CoreS3 承担感知、判断与决策。**音频链路不由它负责**——真
 
 ## 屏幕（中文界面）
 
-- 标题 `端侧算法验证机`，底部 `非最终耳机声学与产品形态`
+- 第一页是 S3 环境与决策；左滑进入第二页查看 Mac→AirPods Pro 路由
 - `环境`：安静 / 噪声 / 人声嘈杂 / 高噪声
-- `当前动作`：正在感知 / 正在调节 / 保持当前设置 / 正在恢复 / 麦克风异常
-- `人声增益`：建议的人声增益，硬上限 +6.5 dB
-- `调音`：语音段（8–16 号频段）抬升，其余频段保持 0 dB。卡片显示"9段 +4.2"这种口径
-- `媒体音量`：建议媒体音量比例
-- `控制链路`：当前为 `模拟`；真实链路接通并取得回执后才显示 `已发送`
+- `当前动作`：保持 / 歌曲调音 / 现实人声增益意图 / 安全保持
+- `人声状态`：`NONE / SPEECH / LIKELY`；只是 S3 麦克风启发式，不是身份识别
+- `调音`：`SONG_EQ` 的 24 段建议；现实人声模式下保持歌曲 EQ 平直
+- `人声增益`：现实中对方说话的增益意图，硬上限 +6.5 dB
+- `控制链路`：Mac 串口是否真实连接
+- 第二页显示 `AirPods Pro`、Mac 控制通道和 Mac 回报的蓝牙输出状态
 - 底部信息行：麦克风正常/异常、处理耗时与剩余内存
 
 开机不播放任何歌曲，内置扬声器保持静音。
 
-## EarbudCommand v1
+## EarbudCommand v2
 
 每约 150 ms 从 USB 串口输出一帧 JSON：
 
 ```json
-{"type":"earbud_command","schema":1,"sequence":42,"timestamp_ms":6300,"speech_gain_db":3.20,"media_percent":84,"state":"ADJUSTING","environment":"VOICE","confidence":0.92,"link":"simulated","eq_gain_db":[0.0,...,3.2,...,0.0]}
+{"type":"earbud_command","schema":2,"sequence":42,"timestamp_ms":6300,"external_voice_gain_db":3.20,"media_percent":100,"state":"ADJUSTING","environment":"VOICE","mode":"EXTERNAL_VOICE_INTENT","conversation":"LIKELY","confidence":0.92,"execution":"decision_only","link":"simulated","eq_gain_db":[0.0,...,0.0],"ambient_band_dbfs":[-52.1,...,-61.0]}
 ```
 
-没有确认回执前，不得把 `simulated` 改成已连接或已发送。
+没有 Mac 执行回执前，`execution` 必须保持 `decision_only`。现实人声模式下 `eq_gain_db` 必须平直；
+否则就是把现实人声增强错误替换成歌曲中频增强。
 
-**`eq_gain_db` 是 24 个频段的调音值**（设备实际要施加的每频段增益），2026-10-14 起才发。
-在此之前它只是内部数组：面板除了标量增益之外看不到调音，只能**推导**出一个形状。
-一帧约 301 字节，约 2 kB/s，只占串口可用带宽的 2%。
+`eq_gain_db` 是 S3 给 Mac 的歌曲 EQ 建议，`ambient_band_dbfs` 是 S3 实测环境谱；Mac 还要结合
+EQ 前的歌曲内容生成最终处方。`external_voice_gain_db` 是现实人声增益意图，不代表 AirPods 已执行。
 
 `noise_reduction_db` 是**降噪量的大小**，取值 0…+8，不是负值偏移（固件的钳位是
 `std::clamp(noise_reduction_db_, 0.0f, kMaxNoiseReductionDb)`，`main/controller.cpp`）。

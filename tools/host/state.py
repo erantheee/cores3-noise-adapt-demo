@@ -327,11 +327,14 @@ class HostState:
                 "t": round(now - self.started_at, 3),
                 "ts": frame.timestamp_ms,
                 "g": frame.speech_gain_db,
+                "vg": frame.external_voice_gain_db,
                 "n": frame.noise_reduction_db,
                 "m": frame.media_percent,
                 "c": frame.confidence,
                 "env": frame.environment,
                 "state": frame.state,
+                "mode": frame.mode,
+                "conversation": frame.conversation,
             }
         )
 
@@ -520,16 +523,17 @@ class HostState:
                 "sequence": frame.sequence,
                 "timestamp_ms": frame.timestamp_ms,
                 "speech_gain_db": frame.speech_gain_db,
-                # 这里**故意不暴露 noise_reduction_db**：本产品的动作只有增益与调音，
-                # 没有降噪（2026-10-14 用户明确口径）。固件仍在算它、仍在屏幕上显示
-                # 「降噪」，那是固件侧待收拾的残留；上位机不再把它端到决策者面前。
-                # 解析层仍然校验这个字段，因为"设备报了一个越界的值"依然要能被发现。
+                "external_voice_gain_db": frame.external_voice_gain_db,
                 "media_percent": frame.media_percent,
                 "confidence": frame.confidence,
                 "state": frame.state,
                 "state_text": state_text(frame.state),
                 "environment": frame.environment,
                 "environment_text": environment_text(frame.environment),
+                "mode": frame.mode,
+                "conversation": frame.conversation,
+                "execution": frame.execution,
+                "ambient_band_dbfs": list(frame.ambient_band_dbfs),
                 "link": frame.link,
                 "link_text": link_text(frame.link),
                 "link_reported_connected": frame.link_reported_connected,

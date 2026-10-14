@@ -33,16 +33,21 @@ int main() {
     check(quiet.speech_gain_db == 0, "quiet stays flat");
     check(quiet.media_percent == 100, "quiet preserves media");
 
-    EarbudCommand noisy;
-    for (int i = 0; i < 12; ++i) noisy = controller.update(frame(-28, 0.8f), 150);
-    check(noisy.speech_gain_db > 3, "noisy voice raises speech target");
-    check(noisy.media_percent < 100, "voice in noise yields media");
-    check(noisy.speech_gain_db <= kMaxSpeechGainDb, "speech gain is bounded");
+    EarbudCommand steady;
+    for (int i = 0; i < 12; ++i) steady = controller.update(frame(-38, 0.0f), 150);
+    check(steady.tuning_mode == TuningMode::song_eq, "steady noise selects song EQ");
+    check(steady.media_percent == 100, "song EQ does not silently duck media");
 
-    // Tuning is the product's second action, and it is what gets sent to the earbud.
-    // The speech band must be lifted by exactly the scalar gain, and every other band must
-    // stay at 0 dB -- if a neighbour band drifts up, the tuning is no longer what the
-    // device screen and the host panel both claim it is.
+    EarbudCommand voice;
+    for (int i = 0; i < 12; ++i) voice = controller.update(frame(-28, 0.8f), 150);
+    check(voice.tuning_mode == TuningMode::external_voice_intent,
+          "nearby speech selects external voice intent");
+    check(voice.external_voice_gain_db > 3, "external voice intent carries bounded gain");
+    check(voice.external_voice_gain_db <= kMaxSpeechGainDb, "voice gain is bounded");
+    check(voice.media_percent == 100, "external voice intent does not pretend media ducking is voice gain");
+
+    // Real-world voice gain is not a song EQ. AirPods Pro exposes no public DSP control,
+    // so this mode must leave the song prescription flat until the Mac relay path exists.
     std::size_t lifted = 0;
     bool all_match = true;
     bool outside_is_flat = true;
@@ -50,15 +55,18 @@ int main() {
         const bool in_band = band >= kSpeechBandFirst && band <= kSpeechBandLast;
         if (in_band) {
             ++lifted;
-            if (std::fabs(noisy.eq_gain_db[band] - noisy.speech_gain_db) > 1e-4f) all_match = false;
-        } else if (noisy.eq_gain_db[band] != 0.0f) {
+            if (voice.eq_gain_db[band] != 0.0f) all_match = false;
+        } else if (voice.eq_gain_db[band] != 0.0f) {
             outside_is_flat = false;
         }
     }
-    check(lifted == kSpeechBandLast - kSpeechBandFirst + 1, "tuning lifts exactly the speech band");
-    check(all_match, "every lifted band equals the reported speech gain");
-    check(outside_is_flat, "bands outside the speech band stay at 0 dB");
-    check(noisy.eq_gain_db[kSpeechBandFirst] > 0, "the speech band is actually lifted");
+    check(lifted == kSpeechBandLast - kSpeechBandFirst + 1, "test inspects the full speech band");
+    check(all_match, "external voice intent leaves speech-band song EQ flat");
+    check(outside_is_flat, "external voice intent leaves all song bands flat");
+
+    bool song_eq_has_gain = false;
+    for (float gain : steady.eq_gain_db) song_eq_has_gain = song_eq_has_gain || gain > 0.05f;
+    check(song_eq_has_gain, "steady environmental masking produces a song EQ suggestion");
 
     // No noise reduction anywhere: the product only has gain and tuning. This is a
     // compile-time guarantee now (the field is gone from EarbudCommand); the check that
@@ -68,11 +76,19 @@ int main() {
     EarbudCommand failed_frame;
     for (int i = 0; i < 3; ++i) failed_frame = controller.update(frame(-20, 0, false), 100);
     check(failed_frame.state == AdaptState::mic_fault, "persistent invalid mic enters fault");
-    check(failed_frame.speech_gain_db < noisy.speech_gain_db, "fault fails toward zero gain");
-    check(failed_frame.media_percent > noisy.media_percent, "fault restores media");
+    check(failed_frame.speech_gain_db < voice.speech_gain_db, "fault fails toward zero gain");
+    check(failed_frame.media_percent == 100, "fault preserves media");
     check(failed_frame.eq_gain_db[kSpeechBandFirst] <
-              noisy.eq_gain_db[kSpeechBandFirst],
+              steady.eq_gain_db[kSpeechBandFirst],
           "fault flattens the tuning");
+
+    AdaptController safety_controller;
+    EarbudCommand loud;
+    for (int i = 0; i < 8; ++i) loud = safety_controller.update(frame(-20, 0.0f), 150);
+    check(loud.tuning_mode == TuningMode::safety_hold, "very loud non-speech selects safety hold");
+    bool safety_flat = true;
+    for (float gain : loud.eq_gain_db) safety_flat = safety_flat && gain == 0.0f;
+    check(safety_flat, "safety hold forbids positive EQ gain");
 
     check(std::string(adapt_state_name(AdaptState::adjusting)) == "ADJUSTING",
           "state names are stable protocol values");

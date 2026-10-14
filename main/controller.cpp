@@ -266,31 +266,83 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
     command.sequence = ++sequence_;
     command.timestamp_ms = frame.timestamp_ms;
     command.eq_gain_db.fill(0.0f);
+    command.ambient_band_dbfs = frame.band_dbfs;
 
     if (!frame.mic_valid || !std::isfinite(frame.broadband_dbfs)) {
         invalid_ms_ += dt_ms;
         valid_ms_ = 0.0f;
         speech_gain_db_ = slew(speech_gain_db_, 0.0f, dt_ms, 100.0f, 250.0f);
         media_percent_ = slew(media_percent_, 100.0f, dt_ms, 100.0f, 250.0f);
+        speech_run_ms_ = 0.0f;
+        silence_run_ms_ += dt_ms;
+        conversation_hold_ms_ = std::max(0.0f, conversation_hold_ms_ - dt_ms);
+        previous_speech_active_ = false;
         command.state = invalid_ms_ >= 250.0f ? AdaptState::mic_fault : AdaptState::recovering;
     } else {
         invalid_ms_ = 0.0f;
         valid_ms_ += dt_ms;
         const float noise = clamp01((frame.broadband_dbfs + 58.0f) / 30.0f);
         const float voice = clamp01(frame.voice_likelihood);
-        // The only two actions this product has: lift the speech band, and make room for it
-        // by pulling the media level back. There is no noise reduction -- an earlier revision
-        // also computed one and reported it as `noise_reduction_db`, but nothing in the chain
-        // ever consumed it, and it made the device claim a capability it does not have.
-        const float speech_target = std::min(kMaxSpeechGainDb, noise * (2.5f + 4.0f * voice));
-        const float media_target = 100.0f - 28.0f * noise * voice;
+        const bool speech_active = voice > 0.55f && frame.broadband_dbfs > -58.0f;
+
+        // A single voice-like frame means only "speech nearby".  It is not evidence that the
+        // wearer is in a conversation: a podcast, television or one passing sentence has the
+        // same spectrum.  Conversation becomes likely only after turn-shaped activity (speech,
+        // a 300-2500 ms pause, then speech again), or after sustained nearby speech.  It is held
+        // briefly so a natural pause does not make the UI and tuning flap.
+        if (speech_active) {
+            if (!previous_speech_active_ && silence_run_ms_ >= 300.0f &&
+                silence_run_ms_ <= 2500.0f) {
+                speech_turns_ = static_cast<uint8_t>(std::min<int>(speech_turns_ + 1, 3));
+            }
+            speech_run_ms_ += dt_ms;
+            silence_run_ms_ = 0.0f;
+            if (speech_turns_ >= 2 || speech_run_ms_ >= 2400.0f) {
+                conversation_hold_ms_ = 3500.0f;
+            }
+        } else {
+            silence_run_ms_ += dt_ms;
+            speech_run_ms_ = 0.0f;
+            conversation_hold_ms_ = std::max(0.0f, conversation_hold_ms_ - dt_ms);
+            if (silence_run_ms_ > 5000.0f) speech_turns_ = 0;
+        }
+        previous_speech_active_ = speech_active;
+
+        if (conversation_hold_ms_ > 0.0f) {
+            command.conversation = ConversationState::likely;
+        } else if (speech_active) {
+            command.conversation = ConversationState::speech_nearby;
+        }
+
+        // The actions are deliberately distinct:
+        //   * SONG_EQ asks the Mac renderer to adapt one of the three local songs.
+        //   * EXTERNAL_VOICE_INTENT asks for real-world speech gain. AirPods Pro cannot execute
+        //     that command through a public API, so the Mac bridge must report it as simulated
+        //     until the S3-mic relay path is measured or an open earbud DSP replaces AirPods.
+        //   * SAFETY_HOLD forbids positive gain in a very loud non-speech environment. It is a
+        //     conservative proxy, not a car-sound classifier; crossing-road recognition remains
+        //     a later model/calibration task.
+        if (frame.broadband_dbfs < -56.0f) {
+            command.environment = EnvironmentKind::quiet;
+            command.tuning_mode = TuningMode::flat;
+        } else if (speech_active || command.conversation == ConversationState::likely) {
+            command.environment = EnvironmentKind::voice_likely;
+            command.tuning_mode = TuningMode::external_voice_intent;
+        } else if (frame.broadband_dbfs > -30.0f) {
+            command.environment = EnvironmentKind::loud;
+            command.tuning_mode = TuningMode::safety_hold;
+        } else {
+            command.environment = EnvironmentKind::steady_noise;
+            command.tuning_mode = TuningMode::song_eq;
+        }
+
+        const float voice_target = command.tuning_mode == TuningMode::external_voice_intent
+            ? std::min(kMaxSpeechGainDb, noise * (2.5f + 4.0f * voice))
+            : 0.0f;
+        const float media_target = 100.0f;
+        const float speech_target = voice_target;
         speech_gain_db_ = slew(speech_gain_db_, speech_target, dt_ms, 350.0f, 1200.0f);
         media_percent_ = slew(media_percent_, media_target, dt_ms, 250.0f, 800.0f);
-
-        if (frame.broadband_dbfs < -56.0f) command.environment = EnvironmentKind::quiet;
-        else if (voice > 0.55f) command.environment = EnvironmentKind::voice_likely;
-        else if (frame.broadband_dbfs > -30.0f) command.environment = EnvironmentKind::loud;
-        else command.environment = EnvironmentKind::steady_noise;
 
         const bool moving = std::abs(speech_target - speech_gain_db_) > 0.25f ||
                             std::abs(media_target - media_percent_) > 2.0f;
@@ -300,11 +352,19 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
 
         for (std::size_t band = 0; band < kBandCount; ++band) {
             const bool speech_band = band >= 8 && band <= 16;
-            command.eq_gain_db[band] = speech_band ? speech_gain_db_ : 0.0f;
+            if (command.tuning_mode == TuningMode::song_eq) {
+                // A bounded environment-only suggestion.  The Mac combines the ambient
+                // spectrum sent below with the clean pre-EQ spectrum of one of the three local
+                // songs before applying its final content-aware prescription.
+                const float band_noise = clamp01((frame.band_dbfs[band] + 62.0f) / 32.0f);
+                const float importance = speech_band ? 1.0f : (band < 5 ? 0.45f : 0.70f);
+                command.eq_gain_db[band] = std::min(4.0f, 4.0f * band_noise * importance);
+            }
         }
     }
 
     command.speech_gain_db = std::clamp(speech_gain_db_, 0.0f, kMaxSpeechGainDb);
+    command.external_voice_gain_db = command.speech_gain_db;
     command.media_percent = static_cast<uint8_t>(std::lround(std::clamp(media_percent_, 65.0f, 100.0f)));
     return command;
 }
@@ -315,6 +375,11 @@ void AdaptController::reset() {
     media_percent_ = 100.0f;
     valid_ms_ = 0.0f;
     invalid_ms_ = 0.0f;
+    speech_run_ms_ = 0.0f;
+    silence_run_ms_ = 1000.0f;
+    conversation_hold_ms_ = 0.0f;
+    speech_turns_ = 0;
+    previous_speech_active_ = false;
 }
 
 const char* adapt_state_name(AdaptState state) {
@@ -334,6 +399,25 @@ const char* environment_name(EnvironmentKind environment) {
         case EnvironmentKind::steady_noise: return "NOISY";
         case EnvironmentKind::voice_likely: return "VOICE";
         case EnvironmentKind::loud: return "LOUD";
+    }
+    return "UNKNOWN";
+}
+
+const char* tuning_mode_name(TuningMode mode) {
+    switch (mode) {
+        case TuningMode::flat: return "FLAT";
+        case TuningMode::song_eq: return "SONG_EQ";
+        case TuningMode::external_voice_intent: return "EXTERNAL_VOICE_INTENT";
+        case TuningMode::safety_hold: return "SAFETY_HOLD";
+    }
+    return "UNKNOWN";
+}
+
+const char* conversation_state_name(ConversationState state) {
+    switch (state) {
+        case ConversationState::none: return "NONE";
+        case ConversationState::speech_nearby: return "SPEECH_NEARBY";
+        case ConversationState::likely: return "LIKELY";
     }
     return "UNKNOWN";
 }

@@ -107,7 +107,7 @@ def test_command_frame_full() -> None:
     eq(frame.media_percent, 84, "媒体音量")
     eq(frame.state, "ADJUSTING", "状态")
     eq(frame.environment, "VOICE", "环境")
-    eq(frame.schema_version, SCHEMA_VERSION, "schema")
+    eq(frame.schema_version, 1, "历史帧保留 v1 schema")
     eq(frame.tuning, None, "旧固件的帧没有 eq_gain_db，tuning 应为 None")
     check(not frame.link_reported_connected, "simulated 不得被当作已连接")
     check(not parsed.problems, f"完整帧不应有异常（实得 {parsed.problems}）")

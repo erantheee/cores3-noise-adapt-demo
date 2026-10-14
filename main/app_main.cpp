@@ -49,8 +49,9 @@ constexpr std::size_t kCaptureChunkSamples = 1024;
 /// rehearsal drift and rare enough that the report itself is not noise in the log.
 constexpr int64_t kLatencyReportPeriodUs = 10 * 1000 * 1000;
 const char* kTag = "cores3_noise_adapt";
+MacAudioRoute g_mac_route;
 
-/// Emit one frame of EarbudCommand v1.
+/// Emit one frame of EarbudCommand v2.
 ///
 /// Two deliberate changes from the previous revision:
 ///   * `noise_reduction_db` is gone. This product's actions are gain and tuning; the field
@@ -64,16 +65,27 @@ const char* kTag = "cores3_noise_adapt";
 void emit_command_json(const EarbudCommand& command) {
     std::printf("{\"type\":\"earbud_command\",\"schema\":%lu,\"sequence\":%lu,"
                 "\"timestamp_ms\":%lu,\"speech_gain_db\":%.2f,"
-                "\"media_percent\":%u,\"state\":\"%s\",\"environment\":\"%s\","
-                "\"confidence\":%.2f,\"link\":\"simulated\",\"eq_gain_db\":[",
+                "\"external_voice_gain_db\":%.2f,\"media_percent\":%u,"
+                "\"state\":\"%s\",\"environment\":\"%s\",\"mode\":\"%s\","
+                "\"conversation\":\"%s\",\"confidence\":%.2f,"
+                "\"execution\":\"decision_only\",\"link\":\"simulated\","
+                "\"eq_gain_db\":[",
                 static_cast<unsigned long>(command.schema_version),
                 static_cast<unsigned long>(command.sequence),
                 static_cast<unsigned long>(command.timestamp_ms),
-                command.speech_gain_db, command.media_percent,
+                command.speech_gain_db, command.external_voice_gain_db,
+                command.media_percent,
                 adapt_state_name(command.state), environment_name(command.environment),
+                tuning_mode_name(command.tuning_mode),
+                conversation_state_name(command.conversation),
                 command.confidence);
     for (std::size_t band = 0; band < kBandCount; ++band) {
         std::printf("%s%.1f", band == 0 ? "" : ",", static_cast<double>(command.eq_gain_db[band]));
+    }
+    std::printf("],\"ambient_band_dbfs\":[");
+    for (std::size_t band = 0; band < kBandCount; ++band) {
+        std::printf("%s%.1f", band == 0 ? "" : ",",
+                    static_cast<double>(command.ambient_band_dbfs[band]));
     }
     std::printf("]}\n");
 }
@@ -121,7 +133,7 @@ void emit_latency_report(latency::LatencyProfiler& profiler,
 /// Written by the console poll and read by the audio task.
 volatile int32_t g_record_seconds = -1;
 
-constexpr std::size_t kConsoleLineMax = 64;
+constexpr std::size_t kConsoleLineMax = 96;
 char g_console_line[kConsoleLineMax];
 std::size_t g_console_fill = 0;
 
@@ -147,6 +159,27 @@ bool poll_console_command() {
                 } else if (std::strncmp(g_console_line, "rec stop", 8) == 0) {
                     g_record_seconds = -1;
                     std::printf("{\"type\":\"capture\",\"state\":\"stopped\"}\n");
+                    handled = true;
+                } else if (std::strncmp(g_console_line, "route active ", 13) == 0) {
+                    std::snprintf(g_mac_route.device_name, sizeof(g_mac_route.device_name),
+                                  "%s", g_console_line + 13);
+                    g_mac_route.mac_connected = true;
+                    g_mac_route.audio_output_active = true;
+                    std::printf("{\"type\":\"route\",\"state\":\"active\","
+                                "\"device\":\"%s\"}\n", g_mac_route.device_name);
+                    handled = true;
+                } else if (std::strncmp(g_console_line, "route inactive ", 15) == 0) {
+                    std::snprintf(g_mac_route.device_name, sizeof(g_mac_route.device_name),
+                                  "%s", g_console_line + 15);
+                    g_mac_route.mac_connected = true;
+                    g_mac_route.audio_output_active = false;
+                    std::printf("{\"type\":\"route\",\"state\":\"inactive\","
+                                "\"device\":\"%s\"}\n", g_mac_route.device_name);
+                    handled = true;
+                } else if (std::strcmp(g_console_line, "route offline") == 0) {
+                    g_mac_route.mac_connected = false;
+                    g_mac_route.audio_output_active = false;
+                    std::printf("{\"type\":\"route\",\"state\":\"offline\"}\n");
                     handled = true;
                 }
             }
@@ -534,7 +567,8 @@ void processing_task(void*) {
         emit_command_json(command);
 
         if (bsp_display_lock(100)) {
-            demo_ui_update(frame, command, processing_ms, esp_get_free_heap_size());
+            demo_ui_update(frame, command, g_mac_route, processing_ms,
+                           esp_get_free_heap_size());
             bsp_display_unlock();
         }
 

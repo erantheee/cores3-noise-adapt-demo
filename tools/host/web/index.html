@@ -126,7 +126,7 @@
       <div class="sub" id="state-raw">—</div>
     </div>
     <div class="card">
-      <h2>人声增益</h2>
+      <h2>现实人声增益意图</h2>
       <div class="value" id="gain">—</div>
       <div class="meter"><span id="gain-bar"></span></div>
       <div class="sub" id="gain-cap">硬上限 +6.5 dB</div>
@@ -134,13 +134,13 @@
     <div class="card">
       <h2>调音（24 频段 EQ）</h2>
       <canvas id="eq" height="52" style="height:52px"></canvas>
-      <div class="sub" id="eq-note">固件只抬语音段（8–16 号频段），其余频段保持 0 dB</div>
+      <div class="sub" id="eq-note">仅用于 Mac 本地歌曲；不等于现实人声增强</div>
     </div>
     <div class="card">
-      <h2>建议媒体音量</h2>
+      <h2>决策模式</h2>
       <div class="value" id="media">—</div>
       <div class="meter"><span id="media-bar"></span></div>
-      <div class="sub">增益的配套让位</div>
+      <div class="sub">歌曲 EQ / 现实人声 / 安全保持</div>
     </div>
     <div class="card">
       <h2>控制链路</h2>
@@ -160,8 +160,8 @@
       <h2>趋势（最近 90 秒）</h2>
       <canvas id="chart" width="900" height="150"></canvas>
       <div class="legend">
-        <span><i style="background:#4cc2ff"></i>语音段增益 dB（调音幅度）</span>
-        <span><i style="background:#3ddc84"></i>建议媒体音量 %</span>
+        <span><i style="background:#4cc2ff"></i>现实人声增益意图 dB</span>
+        <span><i style="background:#3ddc84"></i>媒体音量 %（当前固定100）</span>
       </div>
     </div>
     <div class="card">
@@ -217,7 +217,7 @@
 </main>
 
 <footer>
-  控制链路显示 <code>模拟</code>：设备自称还没有接通可控耳机协议。
+  <code>decision_only</code> 表示 S3 已产生决策，但 Mac 尚未回报实际施加；AirPods Pro 只播放 Mac 输出。
 </footer>
 
 <script>
@@ -287,13 +287,13 @@ function render(s) {
     $("env").className = "value env-" + f.environment;
     $("env-raw").textContent = f.environment;
     $("state").textContent = f.state_text;
-    $("state-raw").textContent = f.state;
-    $("gain").textContent = fmt(f.speech_gain_db, 2, " dB");
-    $("gain-bar").style.width = Math.max(0, Math.min(100, (f.speech_gain_db / s.caps.speech_gain_db) * 100)) + "%";
-    $("media").textContent = f.media_percent + " %";
-    $("media-bar").style.width = f.media_percent + "%";
+    $("state-raw").textContent = `${f.state} · ${f.conversation || "NONE"}`;
+    $("gain").textContent = fmt(f.external_voice_gain_db, 2, " dB");
+    $("gain-bar").style.width = Math.max(0, Math.min(100, (f.external_voice_gain_db / s.caps.speech_gain_db) * 100)) + "%";
+    $("media").textContent = f.mode || "LEGACY";
+    $("media-bar").style.width = f.mode === "SONG_EQ" ? "65%" : f.mode === "EXTERNAL_VOICE_INTENT" ? "100%" : "0%";
     $("link").textContent = f.link_text;
-    $("link-raw").textContent = "设备字段 link=" + f.link;
+    $("link-raw").textContent = `execution=${f.execution} · link=${f.link}`;
     $("conf").textContent = fmt(f.confidence, 2);
     $("conf-bar").style.width = Math.max(0, Math.min(100, f.confidence * 100)) + "%";
     $("seq").textContent = "帧序号 " + f.sequence + " · 设备时间 " + (f.timestamp_ms / 1000).toFixed(1) + " s";
@@ -301,11 +301,11 @@ function render(s) {
 
   renderAlerts(s);
   renderLatency(s);
-  drawEq(f ? f.tuning : null, f ? f.speech_gain_db : 0);
+  drawEq(f ? f.tuning : null, 0);
   $("eq-note").textContent = !f
     ? "等待设备数据"
     : f.tuning
-      ? `设备实测调音：抬起 ${f.tuning.lifted_bands} 个频段，最高 +${f.tuning.peak_gain_db.toFixed(1)} dB`
+      ? `S3歌曲EQ建议：抬起 ${f.tuning.lifted_bands} 个频段，最高 +${f.tuning.peak_gain_db.toFixed(1)} dB；Mac尚需结合歌曲内容执行`
       : "这一帧没有调音数据（旧固件不发 eq_gain_db）；图形是由语音段增益推导的";
   $("control-warn").style.display = s.control && s.control.unresponsive ? "block" : "none";
   renderCapture(s);
@@ -345,10 +345,7 @@ function renderLatency(s) {
     "「无样本」＝该阶段要由对端上报，而当前没有接通的对端。";
 }
 
-// 24 频段调音：固件把语音段（8–16 号）抬 speech_gain_db，其余频段保持 0 dB
-// （main/controller.cpp: command.eq_gain_db[band] = speech_band ? speech_gain_db_ : 0.0f）。
-// 注意 eq_gain_db 是 24 个数的数组，而串口 JSON 只发标量 speech_gain_db —— 所以这里画的是
-// 由已知规则推出来的形状，不是设备逐频段报回来的值。设备没报的，界面不能装作收到了。
+// 24 频段数组是歌曲 EQ 建议。现实人声增益是另一条意图，绝不能在这里画成歌曲中频提升。
 function drawEq(tuning, fallbackGainDb) {
   const canvas = $("eq");
   if (!canvas || !canvas.getContext) return;
@@ -489,11 +486,9 @@ function drawChart(samples) {
     ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(width, y); ctx.stroke();
   }
 
-  // 只画产品真正有的两个量：调音幅度（语音段增益）与配套的媒体让位。
-  // 固件还在算一个 noise_reduction_db，但它不属于这个产品，也不该出现在图上——
-  // 画一条没人负责的曲线，比不画更容易被误读成"这个产品会降噪"。
+  // 现实人声增益意图与媒体音量分开；意图不等于 AirPods 已执行。
   const series = [
-    { key: "g", color: "#4cc2ff", max: 8 },
+    { key: "vg", color: "#4cc2ff", max: 8 },
     { key: "m", color: "#3ddc84", max: 100 },
   ];
   const visible = samples.filter((s) => s.t >= startT);

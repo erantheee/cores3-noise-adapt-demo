@@ -30,7 +30,8 @@ from typing import Any, Iterable
 
 #: 本上位机实现的协议版本。设备侧 schema_version 不是这个值时必须显式报告不兼容，
 #: 而不是按 v1 去解读——字段含义变了却继续显示，比显示不出来更糟。
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSIONS = (1, 2)
 
 #: 固件侧的硬上限，与 main/controller.hpp 保持一致。
 MAX_SPEECH_GAIN_DB = 6.5
@@ -86,7 +87,7 @@ class Tuning:
 
 @dataclass(frozen=True)
 class CommandFrame:
-    """一帧 EarbudCommand v1。"""
+    """一帧 EarbudCommand；v1 历史日志与当前 v2 都可读取。"""
 
     sequence: int
     timestamp_ms: int
@@ -96,6 +97,11 @@ class CommandFrame:
     environment: str
     confidence: float
     link: str
+    external_voice_gain_db: float = 0.0
+    mode: str = "LEGACY"
+    conversation: str = "NONE"
+    execution: str = "decision_only"
+    ambient_band_dbfs: tuple[float, ...] = ()
     #: 旧固件的字段（已从固件删除）。保留只为读得懂历史日志；上位机不显示它。
     noise_reduction_db: float | None = None
     #: 设备实际要施加的调音。None 表示这一帧没有报（旧固件不发 eq_gain_db）。
@@ -221,6 +227,7 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
     sequence = _as_int(payload, "sequence")
     timestamp_ms = _as_int(payload, "timestamp_ms")
     speech_gain = _as_float(payload, "speech_gain_db")
+    external_voice_gain = _as_float(payload, "external_voice_gain_db")
     # noise_reduction_db 已从固件里删除（本产品只有增益与调音）。这里接受它存在，
     # 只为读得懂旧固件的帧与历史日志；不会把它放进快照端给界面。
     noise_reduction = _as_float(payload, "noise_reduction_db")
@@ -229,6 +236,9 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
     state = _as_str(payload, "state")
     environment = _as_str(payload, "environment")
     link = _as_str(payload, "link")
+    mode = _as_str(payload, "mode") or "LEGACY"
+    conversation = _as_str(payload, "conversation") or "NONE"
+    execution = _as_str(payload, "execution") or "decision_only"
 
     missing = [
         name
@@ -254,9 +264,10 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
     if schema is None:
         # 固件当前总会发 schema。一旦它不发了，说明协议在演进，此时按 v1 解读要留痕迹。
         schema = SCHEMA_VERSION
+        schema = 1
         problems.append("帧里没有 schema 字段，按 v1 解读")
-    elif schema != SCHEMA_VERSION:
-        problems.append(f"schema={schema} 与本机上位机的 v{SCHEMA_VERSION} 不一致")
+    elif schema not in SUPPORTED_SCHEMA_VERSIONS:
+        problems.append(f"schema={schema} 不在支持范围 {SUPPORTED_SCHEMA_VERSIONS}")
 
     if speech_gain > MAX_SPEECH_GAIN_DB + 1e-6:
         problems.append(f"人声增益 {speech_gain:+.2f} dB 超过硬上限 +{MAX_SPEECH_GAIN_DB} dB")
@@ -280,6 +291,11 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
             )
 
     tuning = _parse_tuning(payload)
+    ambient = _parse_float_array(payload, "ambient_band_dbfs")
+    if schema >= 2 and external_voice_gain is None:
+        problems.append("v2 帧缺 external_voice_gain_db")
+    if external_voice_gain is not None and not 0.0 <= external_voice_gain <= MAX_SPEECH_GAIN_DB:
+        problems.append(f"现实人声增益 {external_voice_gain:+.2f} dB 越界")
     if not 0 <= media_percent <= 100:
         problems.append(f"媒体音量 {media_percent}% 超出 0–100")
     if not 0.0 <= confidence <= 1.0:
@@ -300,6 +316,11 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
             environment=environment,
             confidence=d2(confidence),
             link=link,
+            external_voice_gain_db=d2(external_voice_gain or 0.0),
+            mode=mode,
+            conversation=conversation,
+            execution=execution,
+            ambient_band_dbfs=ambient,
             tuning=tuning,
             schema_version=schema,
         ),
@@ -326,6 +347,18 @@ def _parse_tuning(payload: dict[str, Any]) -> Tuning | None:
         lifted_bands=len(lifted),
         peak_gain_db=d2(max(gains)),
     )
+
+
+def _parse_float_array(payload: dict[str, Any], key: str) -> tuple[float, ...]:
+    raw = payload.get(key)
+    if not isinstance(raw, list):
+        return ()
+    values: list[float] = []
+    for item in raw:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            return ()
+        values.append(d2(float(item)))
+    return tuple(values)
 
 
 def _parse_latency(payload: dict[str, Any]) -> ParsedLine:
