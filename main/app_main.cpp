@@ -278,6 +278,9 @@ void processing_task(void*) {
     uint32_t capture_read_failures = 0;
     uint32_t capture_decimated_samples = 0;
     uint32_t capture_read_us = 0;
+    uint32_t capture_ok_reads = 0;
+    uint32_t capture_ok_read_us = 0;
+    uint32_t capture_analyse_us = 0;
     uint32_t capture_last_produced = 0;
     int64_t next_capture_diag_us = 0;
 
@@ -310,6 +313,10 @@ void processing_task(void*) {
             if (read_result != ESP_OK) break;  // nothing ready; the loop keeps turning
             staged += want;
             ++capture_reads;
+            if (g_record_seconds >= 0) {
+                ++capture_ok_reads;
+                capture_ok_read_us += static_cast<uint32_t>(esp_timer_get_time() - read_started_us);
+            }
             // A block is what the analysis and the decimator were calibrated on, so process
             // at that boundary rather than draining the DMA into a longer backlog.
             if (staged >= kReadBlockSamples) break;
@@ -349,6 +356,9 @@ void processing_task(void*) {
                 capture_read_failures = 0;
                 capture_decimated_samples = 0;
                 capture_read_us = 0;
+                capture_ok_reads = 0;
+                capture_ok_read_us = 0;
+                capture_analyse_us = 0;
                 capture_last_produced = 0;
                 next_capture_diag_us = now_us + 5 * 1000 * 1000;
             }
@@ -382,12 +392,18 @@ void processing_task(void*) {
                 // blocking read, which is what tells a data-rate problem apart from a
                 // loop-iteration problem.
                 std::printf("{\"type\":\"capture\",\"state\":\"progress\","
-                            "\"reads\":%lu,\"no_data\":%lu,\"read_ms\":%lu,"
+                            "\"reads\":%lu,\"no_data\":%lu,"
+                            "\"ok_reads\":%lu,\"ok_read_ms\":%lu,\"no_data_ms\":%lu,"
+                            "\"analyse_ms\":%lu,"
                             "\"decimated\":%lu,\"last_produced\":%lu,"
                             "\"pending\":%lu,\"chunks\":%lu}\n",
                             static_cast<unsigned long>(capture_reads),
                             static_cast<unsigned long>(capture_read_failures),
-                            static_cast<unsigned long>(capture_read_us / 1000),
+                            static_cast<unsigned long>(capture_ok_reads),
+                            static_cast<unsigned long>(capture_ok_read_us / 1000),
+                            static_cast<unsigned long>(
+                                (capture_read_us - capture_ok_read_us) / 1000),
+                            static_cast<unsigned long>(capture_analyse_us / 1000),
                             static_cast<unsigned long>(capture_decimated_samples),
                             static_cast<unsigned long>(capture_last_produced),
                             static_cast<unsigned long>(pending_samples),
@@ -426,6 +442,9 @@ void processing_task(void*) {
         const int64_t analyse_started_us = esp_timer_get_time();
         AnalysisFrame frame = analyzer.analyze(samples, filled,
             static_cast<uint32_t>(now_us / 1000));
+        if (g_record_seconds >= 0) {
+            capture_analyse_us += static_cast<uint32_t>(esp_timer_get_time() - analyse_started_us);
+        }
         if (read_result != ESP_OK) frame.mic_valid = false;
         const int64_t analyse_done_us = esp_timer_get_time();
 
