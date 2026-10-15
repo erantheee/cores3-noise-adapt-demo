@@ -46,16 +46,12 @@ constexpr float kControlPeriodMs = 100.0f;
 /// modest: the probe plus the analysis of one 2048-sample frame costs on the order of
 /// 10-20 ms, which is under 10% of 250 ms. On device the analysis itself measures 7.03 ms p50
 /// (see README), so 10-20 ms is the pessimistic end of that estimate, not the observed one.
-constexpr float kCapturePeriodMs = 1000.0f;
-/// The USB console measured on the real CoreS3 tops out near 11 kB/s despite accepting a
-/// higher host baud setting. 16-bit/16-kHz PCM becomes ~43 kB/s after base64, so it can only
-/// deliver one quarter of real time. Average each four 16-kHz samples for a 4-kHz proof-of-
-/// concept speech relay; this is intentionally telephone-like, but continuous and honest.
-constexpr uint32_t kRelayRate = capture::kOutputRate / 4;
-constexpr std::size_t kRelayDownsample = capture::kOutputRate / kRelayRate;
-static_assert(kRelayRate == 4000 && kRelayDownsample == 4);
-/// 320 samples at 4 kHz is an 80 ms packet. The larger packet keeps JSON/base64 framing below
-/// the remaining console budget while still staying usable for the relay experiment.
+constexpr float kCapturePeriodMs = 250.0f;
+/// Relay at the analyser's 16-kHz speech rate. Once hardware capture was decoupled from the
+/// full analysis window, the apparent 4:1 "serial bottleneck" disappeared: it had actually
+/// been four reads per analysis period. 320 samples is a 20-ms packet, reducing packetisation
+/// delay by 60 ms versus the temporary 4-kHz proof path while restoring speech clarity.
+constexpr uint32_t kRelayRate = capture::kOutputRate;
 constexpr std::size_t kCaptureChunkSamples = 320;
 /// How often the latency breakdown is reported. 10 s is frequent enough to watch a
 /// rehearsal drift and rare enough that the report itself is not noise in the log.
@@ -321,8 +317,6 @@ void processing_task(void*) {
     capture::Decimator decimator;
     uint32_t capture_sequence = 0;
     std::size_t pending_samples = 0;
-    int32_t relay_sum = 0;
-    std::size_t relay_sum_samples = 0;
     int64_t capture_deadline_us = 0;  // 0 = capture until stopped
     int64_t last_control_us = esp_timer_get_time();
     // Capture-path counters for the periodic diagnostic below. The first recording attempt
@@ -438,8 +432,6 @@ void processing_task(void*) {
                 decimator.reset();
                 capture_sequence = 0;
                 pending_samples = 0;
-                relay_sum = 0;
-                relay_sum_samples = 0;
                 capture_deadline_us =
                     requested > 0 ? now_us + static_cast<int64_t>(requested) * 1000000 : 0;
                 capture_reads = 0;
@@ -495,13 +487,7 @@ void processing_task(void*) {
                 }
                 staged = remaining;
                 for (std::size_t i = 0; i < produced; ++i) {
-                    relay_sum += decimated[i];
-                    ++relay_sum_samples;
-                    if (relay_sum_samples < kRelayDownsample) continue;
-                    pending[pending_samples++] =
-                        static_cast<int16_t>(relay_sum / static_cast<int32_t>(relay_sum_samples));
-                    relay_sum = 0;
-                    relay_sum_samples = 0;
+                    pending[pending_samples++] = decimated[i];
                     if (pending_samples == kCaptureChunkSamples) {
                         emit_capture_chunk(pending, pending_samples, ++capture_sequence,
                                            encode_buffer);

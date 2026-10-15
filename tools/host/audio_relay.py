@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import queue
 import shutil
 import subprocess
@@ -27,7 +28,7 @@ class AudioRelay:
     sound is discarded instead of allowing audible latency to grow without bound.
     """
 
-    def __init__(self, rate: int = 4000, queue_chunks: int = 6) -> None:
+    def __init__(self, rate: int = 16000, queue_chunks: int = 2) -> None:
         self.rate = rate
         self._queue: queue.Queue[bytes | None] = queue.Queue(maxsize=queue_chunks)
         self._process: subprocess.Popen | None = None
@@ -44,6 +45,8 @@ class AudioRelay:
             raise RelayError("找不到 ffplay；请先安装 ffmpeg（brew install ffmpeg）")
         command = [
             ffplay, "-nodisp", "-loglevel", "error",
+            "-fflags", "nobuffer", "-flags", "low_delay", "-avioflags", "direct",
+            "-probesize", "32", "-analyzeduration", "0",
             "-f", "s16le", "-ar", str(self.rate), "-ch_layout", "mono",
             # CoreS3's microphone stream is intentionally conservative and measured
             # around -40 dB RMS on the real board. Bring speech to an audible level,
@@ -51,7 +54,11 @@ class AudioRelay:
             "-af", "volume=18dB,alimiter=limit=0.95",
             "-i", "pipe:0",
         ]
-        self._process = subprocess.Popen(command, stdin=subprocess.PIPE)
+        env = os.environ.copy()
+        # ffplay uses SDL for output. Request a small callback buffer; stale speech is worse
+        # than an occasional drop in a live hear-through path.
+        env["SDL_AUDIO_MIN_BUFFER_SIZE"] = "128"
+        self._process = subprocess.Popen(command, stdin=subprocess.PIPE, env=env)
         self._thread = threading.Thread(target=self._run, name="audio-relay", daemon=True)
         self._thread.start()
 
