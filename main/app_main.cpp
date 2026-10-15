@@ -167,7 +167,7 @@ bool poll_console_command() {
                     std::printf("{\"type\":\"capture\",\"state\":\"started\","
                                 "\"seconds\":%ld,\"rate\":%lu}\n",
                                 static_cast<long>(g_record_seconds),
-                                static_cast<unsigned long>(capture::kOutputRate));
+                                static_cast<unsigned long>(kRelayRate));
                     handled = true;
                 } else if (std::strncmp(g_console_line, "rec stop", 8) == 0) {
                     g_record_seconds = -1;
@@ -366,7 +366,13 @@ void processing_task(void*) {
         //     data (the codec hands back what the DMA has ready), so ask for at most one block.
         esp_err_t read_result = ESP_OK;
         std::size_t got = 0;
-        if (staged < kStageCapacity && filled + kReadBlockSamples <= kFrameSamplesMax) {
+        // During relay, capture must keep reading even when the slower AI analysis window is
+        // full. The capture path below drains `stage` every pass and only copies into `filled`
+        // when there is room. Coupling the hardware read to `filled` limited recording to four
+        // blocks per analysis period: a 10-second command contained under two seconds of audio.
+        const bool capture_needs_audio = g_record_seconds >= 0;
+        if (staged < kStageCapacity &&
+            (capture_needs_audio || filled + kReadBlockSamples <= kFrameSamplesMax)) {
             const std::size_t want = std::min(kReadBlockSamples, kStageCapacity - staged);
             const int64_t read_started_us = esp_timer_get_time();
             read_result = esp_codec_dev_read(microphone, stage + staged,
