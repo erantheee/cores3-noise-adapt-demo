@@ -29,7 +29,7 @@
 
 - `listening-model/`：训练与 C 头文件导出工具。
 - `model-bench/`：独立 ESP-IDF 工程，只做 27 条数值自检和推理计时。
-- `ear-context/`：声音模型、BMI270 六轴采集、屏幕状态与 USB 会话采集整合；已编译，尚未刷入验证。活动模型尚未训练。
+- `ear-context/`：声音模型、BMI270 六轴采集、两页屏幕状态与 USB 会话采集整合；已刷入真机，60 秒连续采集零丢帧。活动模型尚未训练。
 - 原 Demo 的源码、分区表和 `outputs/current/` 均未修改。
 - 原设备完整备份仍在 `outputs/cores3-pre-demo-backup-20261013.bin`。
 

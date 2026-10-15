@@ -9,12 +9,13 @@
 #include "freertos/queue.h"
 #include "lvgl.h"
 #include "imu.hpp"
+#include "ui.hpp"
 #include "window.hpp"
 #include "listening_model.h"
 
-LV_FONT_DECLARE(lv_font_ui_16);
+
 static QueueHandle_t imu_queue;
-static lv_obj_t* display;
+static float gyro_speed=0;
 static portMUX_TYPE state_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t imu_drops=0;
 static int64_t imu_last_us=0;
@@ -62,6 +63,7 @@ static void imu_task(void*) {
             bool dropped=xQueueSend(imu_queue,&s,0)!=pdTRUE;
             taskENTER_CRITICAL(&state_lock);
             imu_last_us=s.t_us; imu_drops+=dropped;
+            gyro_speed=std::sqrt(s.gyro[0]*s.gyro[0]+s.gyro[1]*s.gyro[1]+s.gyro[2]*s.gyro[2]);
             taskEXIT_CRITICAL(&state_lock);
         }
         vTaskDelayUntil(&tick,pdMS_TO_TICKS(5));
@@ -91,7 +93,7 @@ static void audio_task(void*) {
     while(true) {
         if(esp_codec_dev_read(mic,block,sizeof(block))!=ESP_OK) {
             ++audio_errors; filled=frames=blocks=0;
-            if(bsp_display_lock(20)) { lv_label_set_text(display,"麦克风异常\n环境 未知\n耳机 未连接"); bsp_display_unlock(); }
+            if(bsp_display_lock(20)) { ui_update(-1,0,-120,false,false,0,0,0); bsp_display_unlock(); }
             vTaskDelay(pdMS_TO_TICKS(10)); continue;
         }
         int drop=std::max(0,filled+480-2560);
@@ -115,12 +117,11 @@ static void audio_task(void*) {
             double sum=0; for(float x:logits) sum+=std::exp(x-logits[cls]); score=1/sum;
         }
         if(!f.mic_valid) frames=0;
-        bool ok; uint32_t drops; int64_t imu_time;
+        bool ok; uint32_t drops; int64_t imu_time; float gyro;
         taskENTER_CRITICAL(&state_lock);
-        ok=imu_ok; drops=imu_drops; imu_time=imu_last_us;
+        ok=imu_ok; drops=imu_drops; imu_time=imu_last_us; gyro=gyro_speed;
         taskEXIT_CRITICAL(&state_lock);
         ok=ok && imu_time>0 && now-imu_time<500000;
-        const char* name=cls>=0?listening_model::kClassNames[cls]:"unknown";
         Telemetry packet{};
         packet.f=f; memcpy(packet.features,features,sizeof(features));
         packet.cls=cls; packet.score=score; packet.now=now; packet.inference_us=inference_us;
@@ -128,9 +129,8 @@ static void audio_task(void*) {
         packet.context_drops=context_drops; packet.ok=ok;
         if(xQueueSend(context_queue,&packet,0)!=pdTRUE) ++context_drops;
         if(seq%5==0 && bsp_display_lock(20)) {
-            char text[384];
-            snprintf(text,sizeof(text),"环境 %s\nAI %.0f%%  (score)\nIMU %s | activity: untrained\n麦克风 %.1f dBFS\n处理 %lld us | clock: unset\n耳机 未连接\nSynthetic model / demo",name,score*100,ok?"正常":"异常",f.broadband_dbfs,(long long)inference_us);
-            lv_label_set_text(display,text); bsp_display_unlock();
+            ui_update(cls,score,f.broadband_dbfs,f.mic_valid,ok,gyro,inference_us,drops+context_drops);
+            bsp_display_unlock();
         }
         // Yield even if DMA has accumulated a backlog.
         vTaskDelay(1);
@@ -139,10 +139,7 @@ static void audio_task(void*) {
 extern "C" void app_main() {
     bsp_display_start();
     bsp_display_lock(0);
-    display=lv_label_create(lv_screen_active());
-    lv_obj_set_style_text_font(display,&lv_font_ui_16,0);
-    lv_obj_set_width(display,308); lv_obj_align(display,LV_ALIGN_TOP_LEFT,6,8);
-    lv_label_set_text(display,"环境 正在感知\nIMU init\n耳机 未连接");
+    ui_create();
     bsp_display_unlock(); bsp_display_backlight_on();
     imu_queue=xQueueCreate(128,sizeof(ImuSample));
     context_queue=xQueueCreate(4,sizeof(Telemetry));
