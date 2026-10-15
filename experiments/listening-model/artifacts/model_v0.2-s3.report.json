@@ -1,0 +1,343 @@
+{
+  "version": "v0.2-s3",
+  "model": "ContextNet (MLP 92-32-16-9)",
+  "hidden": [
+    32,
+    16
+  ],
+  "parameters": 3657,
+  "macs_per_inference": 3600,
+  "weights_bytes_f32": 14628,
+  "classes": [
+    "babble",
+    "horn",
+    "music",
+    "near_voice",
+    "other",
+    "quiet",
+    "steady",
+    "street",
+    "wind"
+  ],
+  "epochs_run": 62,
+  "train_accuracy": 0.9954,
+  "val_accuracy": 0.953,
+  "val_confusion": [
+    [
+      153,
+      0,
+      0,
+      2,
+      1,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      156,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      149,
+      0,
+      5,
+      2,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      156,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      3,
+      0,
+      106,
+      0,
+      15,
+      32,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      156,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      1,
+      0,
+      155,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      5,
+      0,
+      0,
+      151,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      156
+    ]
+  ],
+  "per_class": {
+    "babble": {
+      "precision": 1.0,
+      "recall": 0.9808,
+      "f1": 0.9903,
+      "support": 156
+    },
+    "horn": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "support": 156
+    },
+    "music": {
+      "precision": 0.9803,
+      "recall": 0.9551,
+      "f1": 0.9675,
+      "support": 156
+    },
+    "near_voice": {
+      "precision": 0.9873,
+      "recall": 1.0,
+      "f1": 0.9936,
+      "support": 156
+    },
+    "other": {
+      "precision": 0.8983,
+      "recall": 0.6795,
+      "f1": 0.7737,
+      "support": 156
+    },
+    "quiet": {
+      "precision": 0.9873,
+      "recall": 1.0,
+      "f1": 0.9936,
+      "support": 156
+    },
+    "steady": {
+      "precision": 0.9118,
+      "recall": 0.9936,
+      "f1": 0.9509,
+      "support": 156
+    },
+    "street": {
+      "precision": 0.8251,
+      "recall": 0.9679,
+      "f1": 0.8909,
+      "support": 156
+    },
+    "wind": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "support": 156
+    }
+  },
+  "val_samples": 1404,
+  "train_samples": 5616,
+  "holdout_accuracy": 0.9444,
+  "holdout_confusion": [
+    [
+      152,
+      0,
+      0,
+      3,
+      0,
+      1,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      156,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      154,
+      0,
+      2,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      1,
+      0,
+      0,
+      154,
+      0,
+      1,
+      0,
+      0,
+      0
+    ],
+    [
+      10,
+      0,
+      30,
+      0,
+      90,
+      0,
+      12,
+      14,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      156,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      1,
+      0,
+      155,
+      0,
+      0
+    ],
+    [
+      0,
+      3,
+      0,
+      0,
+      0,
+      0,
+      0,
+      153,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      156
+    ]
+  ],
+  "holdout_per_class": {
+    "babble": {
+      "precision": 0.9325,
+      "recall": 0.9744,
+      "f1": 0.953,
+      "support": 156
+    },
+    "horn": {
+      "precision": 0.9811,
+      "recall": 1.0,
+      "f1": 0.9905,
+      "support": 156
+    },
+    "music": {
+      "precision": 0.837,
+      "recall": 0.9872,
+      "f1": 0.9059,
+      "support": 156
+    },
+    "near_voice": {
+      "precision": 0.9809,
+      "recall": 0.9872,
+      "f1": 0.984,
+      "support": 156
+    },
+    "other": {
+      "precision": 0.9677,
+      "recall": 0.5769,
+      "f1": 0.7229,
+      "support": 156
+    },
+    "quiet": {
+      "precision": 0.9873,
+      "recall": 1.0,
+      "f1": 0.9936,
+      "support": 156
+    },
+    "steady": {
+      "precision": 0.9281,
+      "recall": 0.9936,
+      "f1": 0.9598,
+      "support": 156
+    },
+    "street": {
+      "precision": 0.9162,
+      "recall": 0.9808,
+      "f1": 0.9474,
+      "support": 156
+    },
+    "wind": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "support": 156
+    }
+  },
+  "holdout_note": "留出音色/语料，训练从未见过"
+}

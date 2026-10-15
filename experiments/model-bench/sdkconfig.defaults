@@ -1,0 +1,6 @@
+# 与 cores3-noise-adapt-demo 相同的控制台配置：stdout/stderr 走内置 USB-Serial/JTAG。
+# 这是那台 Mac 上唯一能收到设备输出的路径（UART0 上没有可用串口）。
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y

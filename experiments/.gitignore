@@ -1,0 +1,8 @@
+**/.venv/
+**/.uv-cache/
+**/__pycache__/
+**/build/
+**/sdkconfig
+**/data/
+**/dataset_*.npz
+
