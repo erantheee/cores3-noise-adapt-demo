@@ -192,8 +192,8 @@ CI 里这一步跑在固件构建**之前**（[`.github/workflows/build.yml`](.g
 上位机（`tools/host/`）另有一套自己的自测，同样是纯 Python、秒级、不需要设备：
 
 ```bash
-python3 tools/host/tests/test_host.py            # 39 组、2711 条断言
-node tools/host/tests/render_check.js <快照.json> # 可选：用 DOM 桩真跑一遍界面渲染（54 条通过、0 条失败）
+python3 tools/host/tests/test_host.py            # 45 组、2735 条断言
+node tools/host/tests/render_check.js <快照.json> # 可选：用 DOM 桩真跑一遍界面渲染（60 条通过、0 条失败）
 ```
 
 `render_check.js` 存在的原因很具体：这台机器上无头浏览器拿不到显示器，系统也不允许截屏，
@@ -273,21 +273,48 @@ python3 tools/voice_separability.py --enroll 甲A.wav 甲B.wav 甲C.wav \
 
 ```bash
 sh tools/host_up.sh                    # 真机（自动找 /dev/cu.usbmodem*）
-sh tools/host_up.sh --relay-audio      # S3 麦克风实时中继到 Mac 默认输出 / AirPods
+sh tools/host_up.sh --relay-audio      # S3 麦克风实时中继到 AirPods（可 --relay-device 改目标）
 sh tools/host_up.sh --mock             # 没有设备也能先把界面跑起来
 sh tools/host_up.sh --replay 记录/x.log --speed 4    # 回放历史日志
 # 然后打开 http://127.0.0.1:8787/
 ```
 
 `--relay-audio` 会自动让设备进入无限时长采集，把 16 kHz 单声道 PCM 送给 Mac，再由 Mac
-当前默认音频输出播放。使用前先在 macOS 把输出切到 AirPods Pro。固件以 20 ms 小包发送；主机
-播放队列积压时丢弃旧包而不是继续增加延迟。中继期间同一份麦克风流仍进入环境分析，所以
-VAD、歌曲 EQ 和现实人声意图不会因为开始中继而冻结。
+播放到**指定设备**（默认 `AirPods Pro`，`--relay-device` 可改）。固件以 20 ms 小包发送。
+中继期间同一份麦克风流仍进入环境分析，所以 VAD、歌曲 EQ 和现实人声意图不会因为开始中继而
+冻结。
+
+**播放端是 `tools/relay/relaysink`，不是 ffplay。** 换掉它的唯一理由是**延迟必须可测**：
+
+| | ffplay（旧） | relaysink（现在） |
+|---|---|---|
+| 排队深度 | 测不到：不反压、不暴露播放位置 | **排队 = 已交付 − 播放器回报已播完** |
+| 实测（`tools/probe_player_buffer.py`） | 按实时速率喂 5 秒音频，**0.94 秒吞完（5.3×）** | 无节流时立刻按上限丢弃（`dropped_ms`） |
+| 播放到哪 | 跟随系统默认输出（跳到扬声器也不说） | 用 AUHAL 钉住名字匹配的设备，**不改系统默认输出** |
+| 延迟上限 | 靠上位机的虚拟时钟猜（100 ms，猜错就永久留着） | `--relay-target-ms`（默认 60 ms），超限丢**来不及播的那一块** |
+
+**实测（2026-10-15，固件 20 ms 分包，AirPods Pro，设备连续中继 50 秒）：**
+
+| 项 | 值 | 出处 |
+|---|---|---|
+| 播放端排队 | **40 ms** | 面板「中继延迟」卡（`queued_ms`） |
+| 驱动侧输出（蓝牙） | **170.7 ms** | 同一张卡（`driver_ms`：回调缓冲 512 帧 10.7 + 设备延迟 7680 帧 160.0） |
+| **合计：进播放端 → 耳机出声** | **约 211 ms** | `est_out_ms` |
+| 设备侧打包 + USB | 约 20 ms + 未单独测 | 固件 320 点一块（设备自报 `decimated/chunks = 320.1`） |
+| 丢弃 | **0 ms / 50 秒**；启动排空 0 ms | `dropped_ms` / `drained_ms` |
+
+**这个 211 ms 是这条拓扑的物理下限，不是调参调出来的**：其中 170.7 ms 是蓝牙输出，
+`relaysink` 只占 40 ms，设备侧 20 ms。要更小只能换拓扑（见 D2：混合必须发生在出声的那台
+设备上）。面板上这一格同时写着"不含设备侧打包与 USB"，不许把它当成整条链路的全部。
+
+**不许把「测不到」显示成「延迟为 0」**：`--relay-player ffplay` 那条路保留着只为 A/B 对比，
+面板对它会写明"测不到"。
 
 这一版是**未经增强的现实声音中继**：它用于先测通路和总延迟，还没有完成声纹排除、目标人声
 提取、方向选择或歌曲避让 EQ。不要把听到现实声音写成“已经完成目标人声增强”。
 
 面板会显示：环境 / 当前动作 / **语音段增益** / **调音（24 频段 EQ 形状）** /
+**中继延迟（实测排队 + 驱动侧输出）** /
 **决策模式**（设备上报的 `mode`：`FLAT` / `SONG_EQ` / `EXTERNAL_VOICE_INTENT` / `SAFETY_HOLD`）/
 控制链路 / 置信度、最近 90 秒的趋势、端侧分段延迟（每 10 秒一次汇总）、状态变化与异常列表、
 以及最近几行设备原始输出。
@@ -366,6 +393,7 @@ sdkconfig.defaults:
 
 ```bash
 sh tools/player/build.sh          # 用 swiftc 编出 tools/player/player（本机无 Xcode 全量，CLT 够）
+sh tools/relay/build.sh           # 用 swiftc 编出中继播放端 tools/relay/relaysink（--relay-audio 需要它）
 sh tools/host_up.sh               # 起上位机时会自动带起播放器（--no-player 可关）
 ```
 
@@ -412,8 +440,8 @@ Mac 的 `applied` / `idle` / `silent` / `bypass` / `unavailable`（有证据：
 ### 上位机自测
 
 ```bash
-python3 tools/host/tests/test_host.py      # 39 组、2711 条断言，不需要设备、不需要串口
-node tools/host/tests/render_check.js <快照.json>   # 用 DOM 桩真跑一遍 render()：54 条通过、0 条失败
+python3 tools/host/tests/test_host.py      # 45 组、2735 条断言，不需要设备、不需要串口
+node tools/host/tests/render_check.js <快照.json>   # 用 DOM 桩真跑一遍 render()：60 条通过、0 条失败
 ```
 
 它自带一份真机日志 `tools/host/tests/fixtures/device_real.log`（**2026-10-15 从当前固件重抓**：

@@ -75,11 +75,13 @@ class RelaySource:
     的延迟。
     """
 
-    def __init__(self, rate: int) -> None:
+    def __init__(self, rate: int, player: str = "sink") -> None:
         from host.audio_relay import AudioRelay  # noqa: PLC0415
 
         self.rate = rate
-        self.relay = AudioRelay(rate=rate)
+        # 播放端可换：sink（新，报真实排队深度）与 ffplay（旧，延迟不可观测）。
+        # 换它而不是换别的，是因为"延迟到底降了多少"必须能归因到具体那一处改动。
+        self.relay = AudioRelay(rate=rate, player=player)
         #: 脉冲真正进入中继队列的时刻，由 stream() 填写。
         self.click_at: float | None = None
 
@@ -267,6 +269,9 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--source", choices=("relay", "afplay"), default="relay",
                         help="relay=走真正的中继播放器（默认，蓝牙链路是热的）；"
                              "afplay=每次冷启动一个播放器，用来对比蓝牙唤醒代价")
+    parser.add_argument("--player", choices=("sink", "ffplay"), default="sink",
+                        help="中继播放端：sink=新的（报排队深度、按上限丢弃）；"
+                             "ffplay=旧的，用于 A/B 对比")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--listen", type=float, default=1.2, help="每轮听多久（秒）")
     parser.add_argument("--lead-in", type=float, default=0.7, help="每轮开始前的静默（秒）")
@@ -298,7 +303,7 @@ def main(argv: list[str]) -> int:
         print("设备已进入录音态，开始测量…")
 
         if args.source == "relay":
-            source = RelaySource(RELAY_RATE)
+            source = RelaySource(RELAY_RATE, player=args.player)
             source.start()
             try:
                 results = measure_via_relay(reader, source, args)
