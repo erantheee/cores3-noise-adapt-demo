@@ -559,7 +559,15 @@ class HostState:
                 # 发过命令但一次都没等到回应 → 界面要明确说这是降级，而不是让按钮
                 # 看起来"点过了"。判定标准是"设备是否进过录音态"，因为那是命令被消费
                 # 的唯一可观测证据。
-                "unresponsive": self.control_sent > 0 and self.control_acknowledged == 0,
+                # A capture event is itself device-side proof that rec start was
+                # consumed. The automatic relay command does not pass through the
+                # HTTP acknowledgement waiter, so requiring that counter alone
+                # produced a false "device never entered recording" alert.
+                "unresponsive": (
+                    self.control_sent > 0
+                    and self.control_acknowledged == 0
+                    and self.last_capture_at is None
+                ),
                 "last_capture_at": None
                 if self.last_capture_at is None
                 else round(self.last_capture_at - origin, 1),

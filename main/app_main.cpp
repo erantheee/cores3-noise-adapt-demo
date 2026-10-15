@@ -46,10 +46,16 @@ constexpr float kControlPeriodMs = 100.0f;
 /// modest: the probe plus the analysis of one 2048-sample frame costs on the order of
 /// 10-20 ms, which is under 10% of 250 ms. On device the analysis itself measures 7.03 ms p50
 /// (see README), so 10-20 ms is the pessimistic end of that estimate, not the observed one.
-constexpr float kCapturePeriodMs = 250.0f;
-/// Samples accumulated before a chunk is sent. 320 at 16 kHz is 20 ms: short enough for
-/// live monitoring while still keeping serial/base64 overhead modest. The previous 1024
-/// sample packet imposed 64 ms of packetisation delay before USB and Bluetooth did any work.
+constexpr float kCapturePeriodMs = 1000.0f;
+/// The USB console measured on the real CoreS3 tops out near 11 kB/s despite accepting a
+/// higher host baud setting. 16-bit/16-kHz PCM becomes ~43 kB/s after base64, so it can only
+/// deliver one quarter of real time. Average each four 16-kHz samples for a 4-kHz proof-of-
+/// concept speech relay; this is intentionally telephone-like, but continuous and honest.
+constexpr uint32_t kRelayRate = capture::kOutputRate / 4;
+constexpr std::size_t kRelayDownsample = capture::kOutputRate / kRelayRate;
+static_assert(kRelayRate == 4000 && kRelayDownsample == 4);
+/// 320 samples at 4 kHz is an 80 ms packet. The larger packet keeps JSON/base64 framing below
+/// the remaining console budget while still staying usable for the relay experiment.
 constexpr std::size_t kCaptureChunkSamples = 320;
 /// How often the latency breakdown is reported. 10 s is frequent enough to watch a
 /// rehearsal drift and rare enough that the report itself is not noise in the log.
@@ -124,13 +130,14 @@ void emit_latency_report(latency::LatencyProfiler& profiler,
 // ---------------------------------------------------------------------------------
 // Capture over the serial console
 //
-// `rec start [seconds]` / `rec stop` stream the microphone as 16 kHz base64 chunks, one
+// `rec start [seconds]` / `rec stop` stream the microphone as 4 kHz base64 chunks, one
 // JSON object per line. The three accounts this project has to settle -- speaker-embedding
 // separability, near-field signal-to-noise, and the judge thresholds -- all need audio as
 // this device hears it. A laptop recording measures the laptop's acoustics instead.
 //
-// The link budget is the reason for 16 kHz: 48 kHz mono base64 is about 128 kB/s against
-// roughly 92 kB/s of usable console throughput, while 16 kHz takes 46%.
+// The real USB console measured about 11 kB/s. A 16-kHz stream needs ~43 kB/s after base64
+// and therefore played only one quarter of real time. The relay stream is downsampled again;
+// analysis remains at 16 kHz and is unaffected.
 // ---------------------------------------------------------------------------------
 
 /// Capture request from the console: -1 means "not capturing", 0 means "capture until
@@ -225,7 +232,7 @@ void emit_capture_chunk(const int16_t* samples, std::size_t count, uint32_t sequ
                 static_cast<unsigned long>(sequence),
                 static_cast<unsigned long>(esp_timer_get_time() / 1000),
                 static_cast<unsigned long>(count),
-                static_cast<unsigned long>(capture::kOutputRate), encoded);
+                static_cast<unsigned long>(kRelayRate), encoded);
 }
 
 void processing_task(void*) {
@@ -314,6 +321,8 @@ void processing_task(void*) {
     capture::Decimator decimator;
     uint32_t capture_sequence = 0;
     std::size_t pending_samples = 0;
+    int32_t relay_sum = 0;
+    std::size_t relay_sum_samples = 0;
     int64_t capture_deadline_us = 0;  // 0 = capture until stopped
     int64_t last_control_us = esp_timer_get_time();
     // Capture-path counters for the periodic diagnostic below. The first recording attempt
@@ -423,6 +432,8 @@ void processing_task(void*) {
                 decimator.reset();
                 capture_sequence = 0;
                 pending_samples = 0;
+                relay_sum = 0;
+                relay_sum_samples = 0;
                 capture_deadline_us =
                     requested > 0 ? now_us + static_cast<int64_t>(requested) * 1000000 : 0;
                 capture_reads = 0;
@@ -478,7 +489,13 @@ void processing_task(void*) {
                 }
                 staged = remaining;
                 for (std::size_t i = 0; i < produced; ++i) {
-                    pending[pending_samples++] = decimated[i];
+                    relay_sum += decimated[i];
+                    ++relay_sum_samples;
+                    if (relay_sum_samples < kRelayDownsample) continue;
+                    pending[pending_samples++] =
+                        static_cast<int16_t>(relay_sum / static_cast<int32_t>(relay_sum_samples));
+                    relay_sum = 0;
+                    relay_sum_samples = 0;
                     if (pending_samples == kCaptureChunkSamples) {
                         emit_capture_chunk(pending, pending_samples, ++capture_sequence,
                                            encode_buffer);

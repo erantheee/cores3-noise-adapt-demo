@@ -7,7 +7,7 @@ earbud_command）。上位机是第三个，而且它必须同时处理**全部�
     earbud_command   每 ~100 ms 一帧的控制指令
     latency          每 10 s 一次的逐阶段延迟汇总（main/app_main.cpp: emit_latency_report）
     capture          录音状态变化（started / stopped / finished / encode_failed）
-    mic_chunk        录音数据块，16 kHz 单声道 base64（main/app_main.cpp: emit_capture_chunk）
+    mic_chunk        录音数据块，4 kHz 单声道 base64（main/app_main.cpp: emit_capture_chunk）
 
 本模块**不依赖 pyserial，也不做任何 IO**，因此可以在开发机上秒级自测。凡是解析规则
 都必须在这里落地，不要散落到串口读取或界面代码里——那正是"改了设备侧却没人发现上位机
@@ -42,8 +42,9 @@ MAX_SPEECH_GAIN_DB = 6.5
 DEMO_SPEECH_GAIN_DB = 8.0
 MAX_NOISE_REDUCTION_DB = 8.0
 
-#: 固件侧录音输出参数，与 capture::kOutputRate / kCaptureChunkSamples 一致。
-CAPTURE_RATE_HZ = 16000
+#: 固件侧中继输出参数，与 kRelayRate / kCaptureChunkSamples 一致。麦克风分析仍在
+#: 16 kHz 运行；只有受 USB 控制台带宽约束的试听流降到 4 kHz。
+CAPTURE_RATE_HZ = 4000
 CAPTURE_CHUNK_SAMPLES = 320
 
 #: 已知的固件状态与环境的字符串（main/controller.cpp 的 adapt_state_name /

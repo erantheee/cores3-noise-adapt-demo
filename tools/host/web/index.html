@@ -308,7 +308,7 @@ function renderAlerts(s) {
   }
   if (s.control && s.control.unresponsive) {
     items.push(["bad",
-      `已向设备发送 ${s.control.sent} 条命令，但<b>一次都没有得到回应</b>：设备从未进入录音态。` +
+      `已向设备发送 ${s.control.sent} 条命令，但<b>一次都没有得到回应</b>：尚未观察到设备进入录音态。` +
       `写成功不等于设备照做——本机实测 write() 成功而设备无反应，与控制台输入未接到 ` +
       `USB-Serial/JTAG 的症状一致。这不是按钮失效。`]);
   }

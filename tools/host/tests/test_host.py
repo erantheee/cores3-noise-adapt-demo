@@ -1015,6 +1015,15 @@ def test_control_acknowledgement_is_tracked() -> None:
     eq(state.snapshot()["control"]["acknowledged"], 1, "设备回应后计入应答")
     check(not state.snapshot()["control"]["unresponsive"], "有应答之后不再算降级")
 
+    # 自动音频中继不是 HTTP 请求，没有同步等待器；capture started 本身就是硬件回执。
+    relay_state = HostState(source="serial")
+    relay_state.note_control_sent("rec start（音频中继）")
+    relay_state.feed_capture(CaptureEvent(state="started", seconds=0, rate=16000))
+    check(
+        not relay_state.snapshot()["control"]["unresponsive"],
+        "设备已开始录音时不得误报从未进入录音态",
+    )
+
 
 def test_serial_source_survives_transient_read_errors() -> None:
     """读串口出一次错不该终结整个会话。

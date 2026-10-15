@@ -27,7 +27,7 @@ class AudioRelay:
     sound is discarded instead of allowing audible latency to grow without bound.
     """
 
-    def __init__(self, rate: int = 16000, queue_chunks: int = 6) -> None:
+    def __init__(self, rate: int = 4000, queue_chunks: int = 6) -> None:
         self.rate = rate
         self._queue: queue.Queue[bytes | None] = queue.Queue(maxsize=queue_chunks)
         self._process: subprocess.Popen | None = None
@@ -43,9 +43,13 @@ class AudioRelay:
         if ffplay is None:
             raise RelayError("找不到 ffplay；请先安装 ffmpeg（brew install ffmpeg）")
         command = [
-            ffplay, "-nodisp", "-loglevel", "error", "-fflags", "nobuffer",
-            "-flags", "low_delay", "-probesize", "32", "-analyzeduration", "0",
-            "-f", "s16le", "-ar", str(self.rate), "-ac", "1", "-i", "pipe:0",
+            ffplay, "-nodisp", "-loglevel", "error",
+            "-f", "s16le", "-ar", str(self.rate), "-ch_layout", "mono",
+            # CoreS3's microphone stream is intentionally conservative and measured
+            # around -40 dB RMS on the real board. Bring speech to an audible level,
+            # then limit peaks instead of asking the user to max out AirPods volume.
+            "-af", "volume=18dB,alimiter=limit=0.95",
+            "-i", "pipe:0",
         ]
         self._process = subprocess.Popen(command, stdin=subprocess.PIPE)
         self._thread = threading.Thread(target=self._run, name="audio-relay", daemon=True)
