@@ -290,7 +290,10 @@ def main(argv: list[str] | None = None) -> int:
         if relay.failure:
             thread_error.append(RelayError(relay.failure))
         elif not args.quiet:
-            print(f"音频中继：播放 {stats.chunks_written} 包，因积压丢弃 {stats.chunks_dropped} 包。")
+            print(
+                f"音频中继：播放 {stats.chunks_written} 包，队列积压丢弃 {stats.chunks_dropped} 包，"
+                f"超出延迟预算丢弃 {stats.chunks_stale} 包。"
+            )
 
     if thread_error:
         error = thread_error[0]

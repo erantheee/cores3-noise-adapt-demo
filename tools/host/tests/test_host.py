@@ -994,6 +994,41 @@ def test_interval_stats_and_percentile() -> None:
     eq(stats["max_gap"], 14, "最大连丢")
 
 
+def test_audio_relay_budget_caps_backlog() -> None:
+    """播放器不给反压时，必须由我们丢掉旧音频，否则延迟只增不减。
+
+    背景是一次真机实测：ffplay 在无节流写入下 1.08 秒吃下 5 秒音频（吸收比 4.6×），
+    也就是它不按实时速率反压。实时流的产生速率和播放速率相同，于是任何一次抖动造成的
+    积压都会被永久保留——用户听到的声音只会越拖越晚，而不是稳定在某个延迟上。
+
+    这里用 `cat` 当"照单全收"的播放器，就不需要声卡也能验证：灌进 5 秒音频后，真正写入
+    播放器的量必须受预算限制，其余作为过期音频被丢掉。
+    """
+    import time as _time
+
+    from host.audio_relay import AudioRelay
+
+    relay = AudioRelay(rate=16_000, queue_chunks=256, budget_seconds=0.1,
+                       player_command=["cat"])
+    relay.start()
+    try:
+        chunk = bytes(320 * 2)  # 20 ms @ 16 kHz
+        for _ in range(250):    # 5 秒音频，瞬间灌进去
+            relay.feed(chunk, 16_000)
+        _time.sleep(0.5)
+        stats = relay.stats()
+    finally:
+        relay.stop()
+
+    check(stats.chunks_stale > 0, "超出延迟预算的旧音频必须被丢掉")
+    # 预算 0.1 s = 5 块，加上 0.5 s 等待窗口最多再放 25 块。留足余量只测量级：
+    # 关键是不能出现"250 块全写进去"这种结果。
+    check(stats.chunks_written <= 60,
+          f"写入量必须受预算限制（实得 {stats.chunks_written} 块）")
+    check(stats.chunks_stale >= 150,
+          f"大部分过期音频应被丢弃（实得 {stats.chunks_stale} 块）")
+
+
 def test_control_acknowledgement_is_tracked() -> None:
     """写成功 != 设备照做。"""
     state = HostState(source="serial")
@@ -1269,6 +1304,7 @@ def main() -> int:
         test_server_endpoints,
         test_interval_stats_and_percentile,
         test_player_decision_path_is_not_silently_dropped,
+        test_audio_relay_budget_caps_backlog,
         test_control_acknowledgement_is_tracked,
         test_serial_source_survives_transient_read_errors,
         test_sse_endpoint_streams,
