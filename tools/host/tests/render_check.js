@@ -143,6 +143,39 @@ if (frame) {
   }
 }
 
+// 中继延迟：这条通路上原来最缺的一块，也是"改了参数延迟只动一点点"的答案。
+// 三种情形必须显示成三件不同的事：有实测数字 / 播放端不报告 / 没开中继。
+if (snapshot.relay === null || snapshot.relay === undefined) {
+  check(text("relay-total") === "未开启", "没开中继时显示未开启，而不是 0 ms");
+} else if (!snapshot.relay.measurable) {
+  check(text("relay-total") === "测不到", "播放端不报告时必须显示测不到，不许显示成 0");
+  check(text("relay-note").includes("不等于延迟为零"), "没有数字必须解释成没有数字");
+} else {
+  const relay = snapshot.relay;
+  check(text("relay-total").includes(String(Math.round(relay.est_out_ms))),
+        "中继卡片显示实测合计延迟");
+  check(text("relay-detail").includes(String(Math.round(relay.driver_ms))),
+        "明细里拆出驱动侧输出延迟（蓝牙那一段）");
+  check(text("relay-detail").includes(relay.device || ""),
+        "写明声音实际去了哪个设备");
+  check(text("relay-note").includes("不含设备侧打包"), "必须写明这个数不含哪一段");
+  if (relay.pinned === false) {
+    check(text("relay-note").includes("没有钉住"), "没钉住目标设备时必须报警");
+  }
+}
+
+// 另外两种情形只在合成快照上出现，而它们最容易说错：把"没开中继"或"播放端不报告"
+// 显示成 0 ms，等于用一个漂亮的数字掩盖"这条链路没有测量"。
+if (snapshot.relay) {
+  render(Object.assign({}, snapshot, { relay: null }));
+  check(text("relay-total") === "未开启", "未开启中继时显示未开启，不是 0 ms");
+  render(Object.assign({}, snapshot, {
+    relay: { measurable: false, note: "播放端不报告排队深度（ffplay 没有播放位置接口）" },
+  }));
+  check(text("relay-total") === "测不到", "播放端不报告时显示测不到，不是 0 ms");
+  render(snapshot); // 还原：后面的断言还在这份快照上
+}
+
 // Mac 播放与执行端：面板必须说清"决策已产生"与"Mac 已执行"是两件事，
 // 而且第三件（AirPods 是否已播放）本链路无法验证，不得写成已验证。
 if (snapshot.player) {

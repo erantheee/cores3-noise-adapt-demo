@@ -170,6 +170,12 @@
       <div class="value small" id="link">—</div>
       <div class="sub" id="link-raw">—</div>
     </div>
+    <div class="card">
+      <h2>中继延迟（实测）</h2>
+      <div class="value small" id="relay-total">—</div>
+      <div class="sub" id="relay-detail">—</div>
+      <div class="sub" id="relay-note">—</div>
+    </div>
     <div class="card wide">
       <h2>播放（Mac · 原版原曲）</h2>
       <div class="row">
@@ -370,6 +376,7 @@ function render(s) {
   }
 
   renderAlerts(s);
+  renderRelay(s);
   renderLatency(s);
   drawEq(f ? f.tuning : null, 0);
   // 「设备实测」四个字是有意的：设备报了 eq_gain_db 才算实测，没报只能是推导值。
@@ -388,6 +395,52 @@ function render(s) {
   renderLists(s);
   renderStats(s);
   drawChart(s.samples || []);
+}
+
+// 中继延迟：这条通路上原来最缺的一块。
+//
+// 口径（不许含糊）：
+//   * 这里显示的数字是**播放端自己报的**：排队深度（已交付 − 已播完）加上驱动侧输出延迟。
+//     不是"我们写进去多少字节"折算出来的推测值。
+//   * `测不到` 必须显示成"测不到"，不能显示成 0。旧播放端（ffplay）没有播放位置接口，
+//     它内部囤了多少从外面看不出来——这正是"改了参数延迟只动一点点"的原因。
+//   * 它**不含**设备侧打包与 USB 传输，所以面板写明那一段另算。
+function renderRelay(s) {
+  const relay = s.relay;
+  if (!relay) {
+    $("relay-total").textContent = "未开启";
+    $("relay-detail").textContent = "本次运行没有开中继（加 --relay-audio 才会把 S3 麦克风送到 Mac 输出）";
+    $("relay-note").textContent = "";
+    return;
+  }
+  if (!relay.measurable) {
+    $("relay-total").textContent = "测不到";
+    $("relay-detail").textContent = relay.note || "这个播放端不报告排队深度";
+    $("relay-note").textContent = "没有数字不等于延迟为零：ffplay 就是因此被换掉的。";
+    return;
+  }
+  const est = Number(relay.est_out_ms) || 0;
+  $("relay-total").textContent = est.toFixed(0) + " ms";
+  $("relay-detail").textContent =
+    `播放端排队 ${(Number(relay.queued_ms) || 0).toFixed(0)} ms + 驱动侧输出 ${(Number(relay.driver_ms) || 0).toFixed(0)} ms` +
+    ` · 输出设备「${relay.device || "?"}」`;
+  const notes = [];
+  if (relay.pinned === false) {
+    notes.push("没有钉住目标设备：声音可能没进耳机");
+  }
+  if ((Number(relay.dropped_ms) || 0) > 0) {
+    notes.push(`超出排队上限丢弃 ${Number(relay.dropped_ms).toFixed(0)} ms`);
+  }
+  if ((Number(relay.drained_ms) || 0) > 0) {
+    notes.push(`启动排空 ${Number(relay.drained_ms).toFixed(0)} ms 旧音频（不排空就等于把延迟永久留在开头）`);
+  }
+  if (relay.stale) {
+    notes.push("播放端状态已过期，这些数字不可信");
+  }
+  if (relay.failure) {
+    notes.push(relay.failure);
+  }
+  $("relay-note").textContent = notes.concat(["不含设备侧打包与 USB，那一段约 20 ms"]).join(" · ");
 }
 
 // 回执：设备报了"决策已产生"，Mac 这边必须能说出"执行到哪一步"。三件事分开写，

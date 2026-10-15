@@ -12,3 +12,5 @@ build-host-tests/
 recordings/
 # Mac 播放器的编译产物（源码是 tools/player/player.swift，用 sh tools/player/build.sh 生成）
 tools/player/player
+# 中继播放端的编译产物（源码是 tools/relay/relaysink.swift，用 sh tools/relay/build.sh 生成）
+tools/relay/relaysink

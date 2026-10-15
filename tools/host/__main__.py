@@ -18,7 +18,14 @@ import threading
 import time
 import webbrowser
 
-from .audio_relay import AudioRelay, RelayError
+from .audio_relay import (
+    DEFAULT_DEVICE,
+    DEFAULT_TARGET_MS,
+    PLAYER_FFPLAY,
+    PLAYER_SINK,
+    AudioRelay,
+    RelayError,
+)
 from .mac_audio import EXPECTED_TARGET, default_output, route_command
 from .player import DEFAULT_VOLUME_PERCENT, PlayerService
 from .server import Broadcaster, make_server, pick_port
@@ -118,13 +125,44 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="把 CoreS3 麦克风实时中继到 Mac 当前默认输出（AirPods）",
     )
+    parser.add_argument(
+        "--relay-player",
+        choices=(PLAYER_SINK, PLAYER_FFPLAY),
+        default=PLAYER_SINK,
+        help=(
+            "中继播放端：sink（默认，tools/relay/relaysink，报真实排队深度并按上限丢弃）"
+            "或 ffplay（旧路径，延迟不可观测，只为 A/B 对比保留）"
+        ),
+    )
+    parser.add_argument(
+        "--relay-device",
+        default=DEFAULT_DEVICE,
+        help=(
+            f"中继要钉住的输出设备名（子串匹配），默认 {DEFAULT_DEVICE}。"
+            "只钉这条流的输出，不改系统默认输出；设备不在时会如实报警"
+        ),
+    )
+    parser.add_argument(
+        "--relay-target-ms",
+        type=float,
+        default=DEFAULT_TARGET_MS,
+        help=f"播放端允许的最大排队深度（毫秒），默认 {DEFAULT_TARGET_MS:g}",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     source = build_source(args)
-    relay = AudioRelay() if args.relay_audio else None
+    relay = (
+        AudioRelay(
+            player=args.relay_player,
+            device=args.relay_device,
+            target_ms=args.relay_target_ms,
+        )
+        if args.relay_audio
+        else None
+    )
     if relay is not None:
         try:
             relay.start()
@@ -136,6 +174,11 @@ def main(argv: list[str] | None = None) -> int:
         detail=source.detail,
         on_mic_chunk=(lambda chunk: relay.feed(chunk.pcm, chunk.rate)) if relay else None,
     )
+    if relay is not None:
+        # 中继的数字要进快照：这条通路上原来最缺的就是"现在到底晚了多少"。
+        # 顺序要紧：attach 必须发生在 HostState 建好之后（这里曾经写成之前，结果是
+        # 启动就 UnboundLocalError —— 而所有单测都测不到 main()，是启动横幅救的场）。
+        state.attach_relay(relay)
     broadcaster = Broadcaster(state)
     writer = DeviceWriter()
 
@@ -196,7 +239,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  面板      {url}")
         print("  帧率      设备每 100 ms 一帧；录音时放宽到 250 ms（预期行为）")
         print("  回控      可发 rec start [秒数] / rec stop" if can_control else "  回控      不可用（当前数据源没有设备可写）")
-        print("  中继      S3 麦克风 → Mac 默认输出" if relay else "  中继      未开启（加 --relay-audio）")
+        if relay:
+            print(f"  中继      S3 麦克风 → {args.relay_device}（播放端 {relay.mode}，"
+                  f"排队上限 {args.relay_target_ms:g} ms）")
+            if relay.mode == PLAYER_FFPLAY:
+                print("  注意      ffplay 不报告排队深度：这条路的延迟只能靠声学测量，"
+                      "面板会显示为「测不到」")
+        else:
+            print("  中继      未开启（加 --relay-audio）")
         if isinstance(source, ReplaySource):
             print("  注意      回放只是把历史日志搬到界面上，不代表设备现在的状态")
         if isinstance(source, MockSource):
@@ -295,6 +345,7 @@ def main(argv: list[str] | None = None) -> int:
     if player_service is not None:
         player_service.stop()
     if relay is not None:
+        live = relay.live() or {}
         relay.stop()
         stats = relay.stats()
         if relay.failure:
@@ -304,6 +355,14 @@ def main(argv: list[str] | None = None) -> int:
                 f"音频中继：播放 {stats.chunks_written} 包，队列积压丢弃 {stats.chunks_dropped} 包，"
                 f"超出延迟预算丢弃 {stats.chunks_stale} 包。"
             )
+            if live.get("measurable"):
+                print(
+                    f"          设备「{live.get('device')}」排队 {live.get('queued_ms', 0):.0f} ms，"
+                    f"驱动侧 {live.get('driver_ms', 0):.0f} ms，"
+                    f"合计约 {live.get('est_out_ms', 0):.0f} ms；"
+                    f"播放端丢弃 {live.get('dropped_ms', 0):.0f} ms，"
+                    f"启动排空 {live.get('drained_ms', 0):.0f} ms。"
+                )
 
     if thread_error:
         error = thread_error[0]

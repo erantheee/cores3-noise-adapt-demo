@@ -1029,6 +1029,187 @@ def test_audio_relay_budget_caps_backlog() -> None:
           f"大部分过期音频应被丢弃（实得 {stats.chunks_stale} 块）")
 
 
+def test_relay_measures_real_queue_depth_not_our_writes() -> None:
+    """中继的延迟必须来自**播放端的回执**，不是"我们写进去多少"。
+
+    这是这轮修复的核心。旧实现用 ffplay：它不给反压也不暴露播放位置，上位机只能假设
+    "写进去就在按实时播"，于是任何一次卡顿造成的积压都永久留在里面且看不见。
+    新的播放端（tools/relay/relaysink）把"已交付"与"已播完"两个计数都报出来。
+
+    这里用一个**假播放端**（照抄真实 sink 的输出格式）验证上位机确实把那些数字接住了，
+    并且没有把它们和"我们写了多少包"混成一个数。
+    """
+    import stat
+    import tempfile
+    import time as _time
+
+    from host.audio_relay import AudioRelay
+
+    with tempfile.TemporaryDirectory() as folder:
+        fake = Path(folder) / "fakesink"
+        fake.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' "
+            "'{\"type\":\"relay\",\"state\":\"running\",\"device\":\"AirPods Pro\","
+            "\"pinned\":true,\"queued_ms\":21.5,\"queued_frames\":344,"
+            "\"dropped_ms\":180.0,\"drained_ms\":640.0,\"driver_ms\":170.7,"
+            "\"est_out_ms\":192.2,\"received_s\":12.0,\"starved_ticks\":0,"
+            "\"clipped_samples\":3,\"buffer_frames\":512,\"sample_rate\":16000}'\n"
+            "cat > /dev/null\n",
+            encoding="utf-8",
+        )
+        fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+        relay = AudioRelay(rate=16_000, sink_binary=str(fake))
+        eq(relay.mode, "sink", "默认播放端是 sink")
+        relay.start()
+        try:
+            deadline = _time.monotonic() + 2.0
+            live = relay.live()
+            while _time.monotonic() < deadline and not (live or {}).get("measurable"):
+                _time.sleep(0.05)
+                live = relay.live()
+        finally:
+            relay.stop()
+
+    check(live is not None and live.get("measurable") is True,
+          "播放端报出状态后 measurable 必须为真")
+    eq(live.get("queued_ms"), 21.5, "排队深度取自播放端回执")
+    eq(live.get("driver_ms"), 170.7, "驱动侧输出延迟原样带出")
+    eq(live.get("est_out_ms"), 192.2, "合计延迟 = 排队 + 驱动侧")
+    eq(live.get("dropped_ms"), 180.0, "播放端丢弃量单独一条，不和队列丢弃混报")
+    eq(live.get("drained_ms"), 640.0, "启动排空与运行期丢弃分开报")
+    eq(live.get("pinned"), True, "是否钉住设备要能看出来")
+    check(live.get("stale") is False, "刚收到状态时不能标成过期")
+    # 上位机自己那份计数是另一回事：它只有"我们写了多少包"，不是延迟。
+    check(not hasattr(relay.stats(), "queued_ms"), "排队深度不来自上位机自己的写入计数")
+
+
+def test_relay_reports_unmeasurable_instead_of_guessing() -> None:
+    """ffplay 那条路测不到延迟，就必须说测不到——不许显示成 0。"""
+    from host.audio_relay import PLAYER_FFPLAY, AudioRelay
+
+    relay = AudioRelay(rate=16_000, player=PLAYER_FFPLAY)
+    live = relay.live()
+    eq(live["measurable"], False, "ffplay 不报告播放位置")
+    check("ffplay" in live["note"], f"理由里必须点名播放端（实得 {live['note']}）")
+    check("note" in live and live["note"], "不能只给一个空状态")
+
+
+def test_relay_sink_missing_binary_says_how_to_build() -> None:
+    """播放端没构建时要给出**下一步命令**，而不是一个 No such file。"""
+    from host.audio_relay import AudioRelay, RelayError
+
+    relay = AudioRelay(rate=16_000, sink_binary="/nonexistent/relaysink")
+    try:
+        relay.build_command()
+    except RelayError as exc:
+        check("tools/relay/build.sh" in str(exc),
+              f"错误信息里要有构建命令（实得 {exc}）")
+    else:
+        check(False, "缺播放端时必须报 RelayError")
+
+
+def test_relay_snapshot_reaches_the_panel() -> None:
+    """中继读数必须进快照——不进快照的数字等于不存在。"""
+
+    class FakeRelay:
+        def live(self):
+            return {"mode": "sink", "measurable": True, "queued_ms": 20.0}
+
+    state = HostState(source="serial")
+    check(state.snapshot()["relay"] is None, "没开中继时这一格是 None，不是 0")
+    state.attach_relay(FakeRelay())
+    relay_block = state.snapshot()["relay"]
+    eq(relay_block["measurable"], True, "中继读数进了快照")
+    eq(relay_block["queued_ms"], 20.0, "排队深度原样带出")
+
+
+def test_main_starts_with_relay_attached() -> None:
+    """main() 真的能起来，并且中继读数进了快照。
+
+    这一组是被一次真事故补上的：`state.attach_relay(relay)` 一开始写在了 HostState 构造
+    **之前**，结果是启动即 UnboundLocalError——而当时所有单测都是绿的，因为它们没有一个
+    跑 main()。真机上表现为"面板起不来"，看了日志才发现。凡是 main() 里的装配顺序，
+    都得有一次真的把它跑起来的测试。
+    """
+    import json as _json
+    import stat
+    import tempfile
+    import threading
+    import urllib.request
+
+    from host.__main__ import main
+    from host.server import pick_port
+
+    with tempfile.TemporaryDirectory() as folder:
+        fake = Path(folder) / "fakesink"
+        fake.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' "
+            "'{\"type\":\"relay\",\"state\":\"running\",\"device\":\"AirPods Pro\","
+            "\"pinned\":true,\"queued_ms\":21.5,\"driver_ms\":170.7,"
+            "\"est_out_ms\":192.2,\"dropped_ms\":0.0,\"drained_ms\":600.0}'\n"
+            "cat > /dev/null\n",
+            encoding="utf-8",
+        )
+        fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+
+        from host import audio_relay as relay_module
+
+        original_init = relay_module.AudioRelay.__init__
+
+        def patched(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+            kwargs.setdefault("sink_binary", str(fake))
+            original_init(self, *args, **kwargs)
+
+        relay_module.AudioRelay.__init__ = patched
+        # main() 会装 SIGINT/SIGTERM 处理器，而 signal.signal 只能在主线程调用。
+        # 这里测的是装配顺序，不是信号处理，所以临时把它换成空实现。
+        import host.__main__ as main_module
+
+        original_signal = main_module.signal.signal
+        main_module.signal.signal = lambda *args, **kwargs: None  # noqa: ARG005
+        port = pick_port(18940)
+        thread = threading.Thread(
+            target=main,
+            args=(["--mock", "--quiet", "--no-browser", "--relay-audio",
+                   "--no-player", "--web-port", str(port)],),
+            daemon=True,
+        )
+        thread.start()
+        try:
+            base = f"http://127.0.0.1:{port}"
+            health = None
+            for _ in range(60):
+                try:
+                    with urllib.request.urlopen(f"{base}/api/health", timeout=2) as response:
+                        health = _json.loads(response.read())
+                    break
+                except Exception:  # noqa: BLE001 - 起来之前连接失败是正常的
+                    time.sleep(0.2)
+            check(health is not None and health.get("ok"), "main() 起来后 /api/health 是通的")
+            # 播放端的第一行状态不是立刻可见的（实测约 0.7 s：进程起来 + 管道首读），
+            # 所以这里等它，而不是抓一次快照就下结论。
+            relay_block = None
+            deadline = time.monotonic() + 6.0
+            while time.monotonic() < deadline:
+                with urllib.request.urlopen(f"{base}/api/snapshot", timeout=5) as response:
+                    snapshot = _json.loads(response.read())
+                relay_block = snapshot.get("relay")
+                if relay_block and relay_block.get("measurable"):
+                    break
+                time.sleep(0.2)
+            check(relay_block is not None, "快照里有 relay 块")
+            check(bool(relay_block) and relay_block.get("measurable") is True,
+                  f"中继读数可用（实得 {relay_block}）")
+        finally:
+            relay_module.AudioRelay.__init__ = original_init
+            main_module.signal.signal = original_signal
+            # main() 跑在自己的守护线程里，进程退出时它随之结束；这里只等它把端口放开，
+            # 免得下一组测试挑到同一个端口。
+            time.sleep(0.5)
+
+
 def test_control_acknowledgement_is_tracked() -> None:
     """写成功 != 设备照做。"""
     state = HostState(source="serial")
@@ -1305,6 +1486,11 @@ def main() -> int:
         test_interval_stats_and_percentile,
         test_player_decision_path_is_not_silently_dropped,
         test_audio_relay_budget_caps_backlog,
+        test_relay_measures_real_queue_depth_not_our_writes,
+        test_relay_reports_unmeasurable_instead_of_guessing,
+        test_relay_sink_missing_binary_says_how_to_build,
+        test_relay_snapshot_reaches_the_panel,
+        test_main_starts_with_relay_attached,
         test_control_acknowledgement_is_tracked,
         test_serial_source_survives_transient_read_errors,
         test_sse_endpoint_streams,

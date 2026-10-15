@@ -211,6 +211,8 @@ class HostState:
         self.last_frame_at: float | None = None
         #: Mac 播放与执行端（tools/player）。为 None 表示本次运行没有启用它。
         self.player = None
+        #: 音频中继（S3 麦克风 → Mac 输出）。为 None = 本次运行没开中继。
+        self.relay = None
 
         self.latest: CommandFrame | None = None
         self.latency: LatencyReport | None = None
@@ -275,6 +277,16 @@ class HostState:
             # 连接的起点要记下来：设备插着但一帧都没来时，"等了多久"只能从这一刻算。
             self.connected_at = time.monotonic() if connected else None
             self.log("link", "上位机已连接设备" if connected else "上位机与设备断开", detail)
+
+    def attach_relay(self, relay: object | None) -> None:
+        """挂上音频中继（tools/host/audio_relay.py）。
+
+        与 attach_player 同样的鸭子类型理由：状态层要能在没有音频设备的环境里单独跑。
+        中继的数字是**播放端自己报出来的实测值**（排队深度、丢弃量、驱动侧输出延迟），
+        面板显示它们而不是显示我们猜的值——这正是这条通路上原来最缺的东西。
+        """
+        with self.lock:
+            self.relay = relay
 
     def attach_player(self, player: object | None) -> None:
         """挂上 Mac 播放与执行端（tools/host/player.py）。
@@ -557,6 +569,9 @@ class HostState:
             "recording": self.recording,
             #: Mac 播放与执行端的自报状态。为 None = 本次运行没启用播放器。
             "player": self.player.snapshot() if self.player is not None else None,
+            #: 中继的实时读数。measurable=False 表示这个播放端不报告排队深度——
+            #: 界面必须把"测不到"和"延迟为零"分开显示。
+            "relay": self.relay.live() if self.relay is not None else None,
             "control": {
                 "sent": self.control_sent,
                 "acknowledged": self.control_acknowledged,
