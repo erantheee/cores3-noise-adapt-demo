@@ -1,0 +1,43 @@
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_FREERTOS_HZ=1000
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_QUAD=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_CODEC_I2C_BACKWARD_COMPATIBLE=n
+CONFIG_LV_CONF_SKIP=y
+CONFIG_LV_BUILD_EXAMPLES=n
+CONFIG_LV_USE_CLIB_MALLOC=y
+CONFIG_LV_USE_CLIB_SPRINTF=y
+CONFIG_LV_USE_CLIB_STRING=y
+CONFIG_LV_FONT_MONTSERRAT_10=y
+CONFIG_LV_FONT_MONTSERRAT_12=y
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# Console I/O must be the built-in USB Serial/JTAG, not UART0.
+#
+# Why this matters: `poll_console_command()` reads with std::getchar(), and on this board the
+# only connected link is the built-in USB Serial/JTAG (the ROM banner and every JSON frame
+# come out of it). With the default UART0 console, stdout was routed to USB as a secondary
+# console but **stdin was not**: measured on 2026-10-14, `rec start` written from the host
+# arrived as 13 bytes on the wire (write() succeeded, out_waiting stayed 0) and the device
+# never reacted -- no capture event, no mic_chunk. Routing the console to USB Serial/JTAG
+# puts stdin on the same link as stdout, which is what makes console commands reachable.
+#
+# Consequence: when the device is powered from a charger instead of a host, there is no
+# console output at all. That is acceptable for this bench instrument; the alternative is
+# having no way to command it.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+# Secondary console: NONE, not "UART0".
+#
+# There is no `ESP_CONSOLE_SECONDARY_UART0` option in v5.4.1 -- the choice only offers
+# NONE or USB_SERIAL_JTAG, and an unknown key in sdkconfig.defaults is silently ignored
+# (the build still succeeds and nothing warns). It was written that way first, and only a
+# check against the actual Kconfig caught it.
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
