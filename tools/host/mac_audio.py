@@ -34,7 +34,14 @@ def default_output() -> str | None:
     return parse_default_output(result.stdout)
 
 
-def route_command(device: str | None, target: str = "AirPods Pro") -> bytes:
+#: 中继期望声音最终到达的设备。
+#:
+#: 只用来判断"声音有没有送到该去的地方"，**不用来切换输出**：默认输出是用户的系统设置，
+#: 由蓝牙连接的实际情况决定，工具擅自改它会让"没声音"变成更难查的问题。
+EXPECTED_TARGET = "AirPods Pro"
+
+
+def route_command(device: str | None, target: str = EXPECTED_TARGET) -> bytes:
     safe_target = " ".join(target.replace("\r", " ").replace("\n", " ").split())[:47]
     state = "active" if device == target else "inactive"
     return f"route {state} {safe_target}\r\n".encode("utf-8")

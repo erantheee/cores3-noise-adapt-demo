@@ -19,7 +19,7 @@ import time
 import webbrowser
 
 from .audio_relay import AudioRelay, RelayError
-from .mac_audio import default_output, route_command
+from .mac_audio import EXPECTED_TARGET, default_output, route_command
 from .player import DEFAULT_VOLUME_PERCENT, PlayerService
 from .server import Broadcaster, make_server, pick_port
 from .sources import (
@@ -233,6 +233,16 @@ def main(argv: list[str] | None = None) -> int:
                 writer(route_command(device))
                 last_device = device
                 state.log("route", "Mac 音频输出已同步", device or "没有默认输出")
+                # 真机踩过：AirPods 掉线后默认输出自动落到 MacBook Air 扬声器，中继照常播放，
+                # 面板只记了一行路由变更。用户戴着耳机听不到声音时，会以为是自己这边的问题，
+                # 于是往延迟、增益、缓冲的方向查——真正的原因（耳机压根没连）反而没人说。
+                # 所以这里必须报警，而不是只记录。
+                if relay is not None and device != EXPECTED_TARGET:
+                    state.note(
+                        f"中继正在播放到「{device or '没有默认输出'}」，不是 {EXPECTED_TARGET}。"
+                        "声音不会进到你戴的耳机里。先确认耳机已连上这台 Mac，并在"
+                        "「系统设置 → 声音 → 输出」里选中它。"
+                    )
             except (OSError, RuntimeError):
                 continue
 
