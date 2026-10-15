@@ -472,7 +472,15 @@ class HostState:
                 lost = chunk.sequence - self._expected_chunk
                 if lost > 0:
                     self.stats.chunks_lost += lost
-                    self.note(f"录音块缺失 {lost} 块：这一段录音有断裂，不能用于声纹或信噪比结论")
+                    # 把最可能的成因一起说出来。真机踩过两次：这个现象的根因是**另一个进程
+                    # 也在读同一个串口**，两边互相偷走对方的字节——一次是忘了停旧的上位机，
+                    # 一次是诊断脚本自己开了端口。只报"有断裂"会让人去查 USB 带宽、固件丢块、
+                    # 蓝牙干扰，而真正的处置只是关掉那个抢占者。
+                    self.note(
+                        f"录音块缺失 {lost} 块：这一段录音有断裂，不能用于声纹或信噪比结论。"
+                        "最常见的原因是另一个进程也在读同一个串口（旧的上位机没停，"
+                        "或诊断脚本自己开了这个端口）；先确认只有一个读者，再怀疑带宽或固件。"
+                    )
             self._expected_chunk = chunk.sequence + 1
         self.audio_samples += chunk.sample_count
         if self.on_mic_chunk is not None:
