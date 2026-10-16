@@ -383,15 +383,20 @@ function renderOwnVoice(f) {
   const confidence = f.own_voice_confidence || 0;
   bar.style.width = Math.max(0, Math.min(100, confidence * 100)) + "%";
   const bone = f.own_voice_source === "bone";
+  const none = f.own_voice_source === "none" || f.own_voice_source === null;
   $("ov").textContent = (confidence * 100).toFixed(0) + "%";
-  if (bone) {
+  if (none) {
+    // 没有证据：这是 fail-closed 的正常状态，不是"代理在跑"。IMU 没起来时会一直是这个。
+    $("ov-raw").textContent = f.imu_ok === false ? "IMU 未就绪 → 无证据，不动作" : "无自身语音证据";
+    $("ov-note").textContent = "fail-closed：没有证据就不下压（代理只在回放实验里用）";
+  } else if (bone) {
     const correlation = f.own_voice_correlation;
     $("ov-raw").textContent =
       "骨传导 · 相关 " + (correlation === null || correlation === undefined ? "—" : correlation.toFixed(2));
     $("ov-note").textContent = f.imu_motion ? "骨传导 · 检测到整体运动（已否决）" : "骨传导优先 · 无 IMU 时退回近场代理";
   } else {
-    $("ov-raw").textContent = "近场代理（无 IMU）：只有电平，分不开自己与旁人";
-    $("ov-note").textContent = f.imu_ok === false ? "IMU 未就绪" : "近场代理";
+    $("ov-raw").textContent = "近场代理（显式开启）：只有电平，分不开自己与旁人";
+    $("ov-note").textContent = "回放实验路径，不是产品默认";
   }
 }
 

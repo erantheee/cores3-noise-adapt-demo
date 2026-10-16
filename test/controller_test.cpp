@@ -29,6 +29,17 @@ constexpr std::size_t kSpeechBandLast = 16;
 
 int main() {
     AdaptController controller;
+    // 下压现在需要证据。这个套件测的是"有证据时状态机与调压怎么走"，所以显式给骨传导证据；
+    // "没有证据就不下压"（fail-closed）由本文件末尾那条独立断言覆盖。
+    const auto give_bone_evidence = [&controller](float confidence) {
+        OwnVoiceEvidence evidence;
+        evidence.bone = true;
+        evidence.imu_ok = true;
+        evidence.gravity = 9.81f;
+        evidence.confidence = confidence;
+        evidence.correlation = 0.9f;
+        controller.set_own_voice_evidence(evidence);
+    };
     auto quiet = controller.update(frame(-65, 0), 150);
     check(quiet.speech_gain_db == 0, "quiet stays flat");
     check(quiet.media_percent == 100, "quiet preserves media");
@@ -38,6 +49,7 @@ int main() {
     check(steady.tuning_mode == TuningMode::song_eq, "steady noise selects song EQ");
     check(steady.media_percent == 100, "song EQ does not silently duck media");
 
+    give_bone_evidence(0.9f);
     EarbudCommand voice;
     for (int i = 0; i < 12; ++i) voice = controller.update(frame(-28, 0.8f), 150);
     check(voice.tuning_mode == TuningMode::external_voice_intent,
@@ -125,6 +137,25 @@ int main() {
         for (std::size_t band = 0; band < kBandCount; ++band) {
             check(worst.eq_gain_db[band] <= 10.0f, "no EQ band may exceed the 10 dB ceiling");
         }
+    }
+
+    // 没有证据就不下压（fail-closed）。这条断言是 2026-10-16 的近场代理实测逼出来的：
+    // 代理在设备自己录的静音素材上 35/75 拍误判并压到 25%，所以"证据没来"时宁可什么都不做。
+    // 没有它，IMU 挂掉会静默退化成"音乐时不时无故被压"，而那是最难查的一类故障。
+    {
+        AdaptController no_evidence;
+        EarbudCommand without_evidence;
+        for (int i = 0; i < 20; ++i) without_evidence = no_evidence.update(frame(-28, 0.8f), 150);
+        check(without_evidence.media_percent == 100,
+              "clear speech with no own-voice evidence does not duck (fail-closed)");
+        check(without_evidence.conversation != ConversationState::likely,
+              "no evidence never reaches the engaged conversation state");
+
+        no_evidence.set_allow_near_field_fallback(true);
+        EarbudCommand with_fallback;
+        for (int i = 0; i < 20; ++i) with_fallback = no_evidence.update(frame(-28, 0.8f), 150);
+        check(with_fallback.media_percent < 60,
+              "the proxy fallback still exists when a caller opts in");
     }
 
     check(std::string(adapt_state_name(AdaptState::adjusting)) == "ADJUSTING",

@@ -376,12 +376,19 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
         evidence.speech_active = speech_active;
         evidence.voice_likelihood = voice;
         evidence.level_dbfs = frame.broadband_dbfs;
-        // 证据优先级：骨传导（装了 IMU 且这一拍有数）> 近场代理（占位）。
-        // 近场代理在真机静音素材上会把 35/75 拍判成语音（见 docs/apple-conversation-awareness.md
-        // 第 10.4 节），所以有骨传导时它必须退出主路径，而不是两条相加。
+        // 证据来源：骨传导（装了 IMU 且这一拍有数）是主路径；没有它时默认 **不动作**。
+        //
+        // 为什么 fail-closed，而不是退回近场代理兜底：代理的判据是"语音判据 × 电平"，
+        // 它在设备自己录的静音素材上把 35/75 拍判成语音并压到 25%（docs/apple-conversation-awareness.md
+        // 第 10.4 节），而且它分不出"自己说"和"旁边人说"。让它在 IMU 挂掉时兜底，
+        // 等于把"特征暂时不工作"变成"音乐时不时无故被压"——那比不动作难查得多。
+        // 代理本身保留：回放工具与实验还在用它检验判据形状，只是不进产品路径。
         OwnVoiceEvidence effective = own_voice_evidence_;
         if (!effective.bone) {
-            effective.confidence = conversation::near_field_own_voice(frame.broadband_dbfs, voice);
+            effective.proxy = allow_near_field_fallback_;
+            effective.confidence = effective.proxy
+                                       ? conversation::near_field_own_voice(frame.broadband_dbfs, voice)
+                                       : 0.0f;
             effective.correlation = 0.0f;
             effective.vibration_rms = 0.0f;
             effective.motion = false;

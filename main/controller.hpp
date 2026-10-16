@@ -135,8 +135,12 @@ struct OwnVoiceEvidence {
     float vibration_rms = 0.0f;
     /// 整体运动否决是否生效。
     bool motion = false;
-    /// true=骨传导证据，false=近场代理。
+    /// true=骨传导证据。
     bool bone = false;
+    /// 这一拍真的用了近场代理兜底（只在调用方显式打开开关时可能为真）。
+    /// `bone=false && proxy=false` = 没有证据、fail-closed 不动作。遥测要能把这三种情况分开：
+    /// 把"没证据"报成"用了代理"，就是在设备上撒一个我们查不到的谎。
+    bool proxy = false;
     /// 这一拍 IMU 是否有数（false 时 bone 必然也是 false）。
     bool imu_ok = false;
 };
@@ -210,10 +214,11 @@ public:
 
     /// 由 app_main 每拍填入的**自身语音证据**（骨传导，来自 main/bone_voice.hpp）。
     ///
-    /// `available=false` 时控制器退回 conversation::near_field_own_voice() 的近场代理。
-    /// 两条路都保留：设备没装/没读到 IMU 时不能因为缺证据就完全不动作，而装上 IMU 之后
-    /// 代理那条（已被真机证明会在静音上误触发）就退出主路径。
+    /// 缺证据时的行为默认 **fail-closed**：没有骨传导证据就不下压。理由见 .cpp 里那段注释
+    /// （代理在真机静音素材上 35/75 拍误判）。回放实验与需要旧行为的调用方显式打开开关。
     void set_own_voice_evidence(const OwnVoiceEvidence& evidence) { own_voice_evidence_ = evidence; }
+    void set_allow_near_field_fallback(bool allow) { allow_near_field_fallback_ = allow; }
+    bool allow_near_field_fallback() const { return allow_near_field_fallback_; }
 
 private:
     uint32_t sequence_ = 0;
@@ -227,6 +232,7 @@ private:
     conversation::Awareness awareness_;
     conversation::Output awareness_out_{};
     OwnVoiceEvidence own_voice_evidence_{};
+    bool allow_near_field_fallback_ = false;
 };
 
 const char* adapt_state_name(AdaptState state);

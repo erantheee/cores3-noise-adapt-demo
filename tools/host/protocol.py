@@ -142,7 +142,9 @@ class CommandFrame:
     #: 一次前向的耗时，微秒。设备逐帧实报，不是估算。
     context_us: int | None = None
     #: 自身语音证据（v3）。None 表示这一帧没报——v3 之前的固件不发这几个字段。
-    #: source 是 "bone"（骨传导 IMU）或 "near_field"（近场代理占位）。
+    #: source 有三种：`bone`（骨传导 IMU）、`near_field`（调用方显式打开开关后的代理兜底）、
+    #: `none`（没有证据，fail-closed 不动作）。三态必须分开：把 none 显示成 near_field，
+    #: 看的人会以为代理在跑。
     own_voice_confidence: float | None = None
     own_voice_correlation: float | None = None
     own_voice_source: str | None = None

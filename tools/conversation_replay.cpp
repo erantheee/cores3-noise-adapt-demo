@@ -131,6 +131,10 @@ int main(int argc, char** argv) {
 
     NoiseAnalyzer analyzer;
     AdaptController controller;
+    // 回放工具要检验的正是**近场代理**在真实素材上的行为（它是判断"证据该不该换"的依据），
+    // 所以这里显式打开兜底开关；产品路径默认是 fail-closed，没有骨传导证据就不下压。
+    controller.set_allow_near_field_fallback(true);
+    std::printf("（已打开近场代理兜底：本工具测的就是代理路径，不是产品默认行为）\n");
 
     std::size_t offset = 0;
     int tick = 0;

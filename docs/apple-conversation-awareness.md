@@ -264,8 +264,25 @@ imu_task（5 ms 轮询，100 Hz 采样，优先级 4，低于音频控制任务�
 ```
 
 配对是 1:1 的：控制拍 100 ms、IMU 100 Hz，一拍正好 10 个采样。
-**证据优先级**：`imu_ok` 时用骨传导，否则退回近场代理 —— 没装/没读到 IMU 时不能因为缺证据
-就完全不动作，而装上之后代理（已被真机证明会误触发）就退出主路径。
+
+### 11.5.1 缺证据时 fail-closed（2026-10-16 决定）
+
+证据来源只有三种状态，遥测里必须分开报：
+
+| `own_voice_source` | 含义 | 会不会下压 |
+|---|---|---|
+| `bone` | 骨传导 IMU 证据 | 会 |
+| `near_field` | 近场代理兜底（调用方**显式**打开开关） | 会 |
+| `none` | 没有证据，fail-closed | **不会** |
+
+**为什么默认不拿代理兜底**：代理的判据是"语音判据 × 电平"，它在设备自己录的静音素材上把
+**35/75 拍**判成语音并压到 25%（第 10.4 节），而且分不出"自己说"和"旁边人说"。让它在 IMU
+挂掉时兜底，等于把"特征暂时不工作"变成"音乐时不时无故被压"——后者难查得多。
+代理本身保留：回放工具（`tools/conversation_replay.cpp`）显式打开开关继续用它检验判据形状，
+产品路径默认不经过它。
+
+回归断言：`test/controller_test.cpp` 的 "clear speech with no own-voice evidence does not duck
+(fail-closed)" 与 "the proxy fallback still exists when a caller opts in"。
 
 ### 11.5 测试抓到的两个真 bug（都不是调参）
 
@@ -322,14 +339,25 @@ other_speech  旁人说话 12 s  → 不得下压（可用 --skip-other-speech �
 | C8 | 运动相 `imu_motion` 出现过，且全程不下压 |
 | C9 | 旁人说话相下压帧为 0 |
 
-### 12.2 怎么跑
+### 12.2 怎么跑（含烧写与回滚）
+
+这台设备的串口是 `/dev/cu.usbmodem101`，上位机面板（`tools/host`）会一直占着它。
 
 ```bash
-CORES3_PORT=/dev/cu.usbmodem101 sh tools/free_port.sh --kill        # 让出串口
+# 0) 记下当前分支固件的指纹（事后核对用）
+shasum -a 256 build/cores3_noise_adapt_demo.bin
+
+# 1) 让出串口 → 烧分支固件 → 跑五相 → 把面板拉回来
+CORES3_PORT=/dev/cu.usbmodem101 sh tools/free_port.sh --kill
+CORES3_PORT=/dev/cu.usbmodem101 sh tools/flash.sh build
 ./.venv/bin/python tools/verify_conversation_awareness.py --port /dev/cu.usbmodem101
-# 跑完把面板拉回来
 cd tools && nohup ../.venv/bin/python -u -m host --port /dev/cu.usbmodem101 --web-port 8787 --no-browser &
+
+# 回滚：outputs/current 就是当前在跑的 3b744cc（SHA256 e742b491…，与 plan-status 记录一致）
+CORES3_PORT=/dev/cu.usbmodem101 sh tools/flash.sh
 ```
+
+烧之前可以先干跑一次：`--dry-run` 只读两秒、确认固件版本，不会执行任何相。
 
 报告落在 `记录/对话感知验证/<时间戳>/report.json`（逐相统计 + 每条断言的证据）。
 退出码：`0` 全过 · `1` 有断言失败 · `2` 设备/固件不对 · `3` 串口被占。

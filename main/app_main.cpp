@@ -117,7 +117,8 @@ void emit_command_json(const EarbudCommand& command) {
                 static_cast<double>(command.own_voice.correlation),
                 static_cast<double>(command.own_voice.vibration_rms),
                 static_cast<double>(command.own_voice.gravity),
-                command.own_voice.bone ? "bone" : "near_field",
+                command.own_voice.bone ? "bone"
+                                       : (command.own_voice.proxy ? "near_field" : "none"),
                 command.own_voice.imu_ok ? "true" : "false",
                 command.own_voice.motion ? "true" : "false",
                 static_cast<unsigned long>(g_imu_drops));
