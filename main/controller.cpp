@@ -56,6 +56,40 @@ constexpr float kExcitedBandSoftness = 2.0f;
 /// Softness of the flatness and peakiness gates. Smaller is a harder edge.
 constexpr float kFlatnessSoftness = 0.10f;
 constexpr float kPeakSoftness = 0.08f;
+
+// ── Temporal gate ────────────────────────────────────────────────────────────────
+//
+// Everything above judges ONE frame. That is not enough, and the failure is measured:
+// a hum at f0 ~200 Hz carries ~20 harmonics spaced 200 Hz apart, which land in 8-11 of
+// the 24 bands. Peakiness then sits at 0.54-0.63, under kMaxVocalPeakiness (0.72), so the
+// gate that exists to reject steady tones never fires and the product reaches 1.00.
+// Sweeping 648 physically plausible hums, 47 crossed the 0.55 speech cut, the worst at
+// 1.0000 (reproduce with tools/voice_decision_sweep.cpp).
+//
+// Speech and hum differ in the TIME domain, not the frame. Measured per frame over 6 s:
+//
+//     speech                level step 5.44 dB   vocal-ratio step 0.107
+//     hum f0=200 roll=1.0   level step 0.13 dB   vocal-ratio step 0.003   (the leak)
+//     breath                (already rejected by the flatness gate)
+//
+// **The statistic is the MEDIAN OF SUCCESSIVE ABSOLUTE DIFFERENCES, not the variance.**
+// This was measured, not assumed: using the standard deviation over the window, a hum that
+// arrives after silence keeps the gate open for a whole window, because the single
+// silence-to-sound jump dominates the variance. Measured on 2 s of silence followed by 4 s
+// of hum: 14 frames of a 92-frame segment stayed above the 0.55 cut. The median ignores
+// that one jump (0.12 dB for silence-then-hum against 1.97 dB for silence-then-speech), so
+// the gate reads the *current sound* rather than the transition into it.
+//
+// The gate takes whichever descriptor moves, which keeps monotone speech (steady level,
+// moving formants) passing.
+/// Median frame-to-frame level change at which the gate starts to open.
+constexpr float kMinLevelStepDb = 0.8f;
+/// Ramp width above kMinLevelStepDb.
+constexpr float kLevelStepSpanDb = 1.2f;
+/// Median frame-to-frame vocal-ratio change at which the gate starts to open.
+constexpr float kMinRatioStep = 0.02f;
+constexpr float kRatioStepSpan = 0.04f;
+
 }  // namespace voice_thresholds
 
 /// Ramps 0 -> 1 as value rises from `edge` to `edge + softness`.
@@ -142,8 +176,49 @@ float goertzel_dbfs(const int16_t* samples, std::size_t count, float frequency) 
 }
 }  // namespace
 
+void NoiseAnalyzer::reset() {
+    history_count_ = 0;
+}
+
+
+float NoiseAnalyzer::modulation_term() const {
+    using namespace voice_thresholds;
+    if (history_count_ < kMinHistoryFrames) return 1.0f;
+
+    const std::size_t n = history_count_;
+    // Walk the ring oldest -> newest so these are real successive differences.
+    const std::size_t oldest = (history_next_ + kHistoryFrames - n) % kHistoryFrames;
+    std::array<float, kHistoryFrames> level_steps{};
+    std::array<float, kHistoryFrames> ratio_steps{};
+    std::size_t steps = 0;
+    for (std::size_t i = 1; i < n; ++i) {
+        const std::size_t a = (oldest + i - 1) % kHistoryFrames;
+        const std::size_t b = (oldest + i) % kHistoryFrames;
+        level_steps[steps] = std::fabs(level_history_[b] - level_history_[a]);
+        ratio_steps[steps] = std::fabs(ratio_history_[b] - ratio_history_[a]);
+        ++steps;
+    }
+    if (steps == 0) return 1.0f;
+
+    // Median, not variance: see the note on kMinLevelStepDb — one silence-to-sound jump
+    // would otherwise hold the gate open across a whole window.
+    const auto median = [&steps](std::array<float, kHistoryFrames>& v) {
+        std::sort(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(steps));
+        return v[steps / 2];
+    };
+    const float level_step = median(level_steps);
+    const float ratio_step = median(ratio_steps);
+
+    // Whichever descriptor shows movement opens the gate. Using the max rather than the
+    // product keeps monotone speech (steady level, moving formants) passing, and it cannot
+    // open the gate for a sound that is steady in both.
+    const float by_level = clamp01((level_step - kMinLevelStepDb) / kLevelStepSpanDb);
+    const float by_ratio = clamp01((ratio_step - kMinRatioStep) / kRatioStepSpan);
+    return std::max(by_level, by_ratio);
+}
+
 AnalysisFrame NoiseAnalyzer::analyze(const int16_t* mono, std::size_t count,
-                                     uint32_t timestamp_ms, float motion) const {
+                                     uint32_t timestamp_ms, float motion) {
     AnalysisFrame frame;
     frame.timestamp_ms = timestamp_ms;
     frame.motion = motion;
@@ -174,7 +249,18 @@ AnalysisFrame NoiseAnalyzer::analyze(const int16_t* mono, std::size_t count,
         frame.band_center_hz[band] = kBandCenter[band];
         frame.band_dbfs[band] = goertzel_dbfs(mono, count, kBandCenter[band]);
     }
-    frame.voice_likelihood = voice_likelihood_from_features(extract_voice_features(frame));
+    const VoiceFeatures features = extract_voice_features(frame);
+    frame.voice_likelihood = voice_likelihood_from_features(features);
+
+    // Temporal gate. The current frame is pushed first so it participates in its own
+    // window; with kHistoryFrames = 15 a single frame cannot move the variance much.
+    level_history_[history_next_] = frame.broadband_dbfs;
+    ratio_history_[history_next_] = features.vocal_ratio;
+    history_next_ = (history_next_ + 1) % kHistoryFrames;
+    if (history_count_ < kHistoryFrames) ++history_count_;
+    frame.voice_likelihood *= modulation_term();
+
+
     return frame;
 }
 

@@ -8,6 +8,7 @@
 // on scope: these pin the *shape* of the decision and prove the known false positives are
 // gone. They do not establish accuracy on real speech. Thresholds marked CALIBRATION in
 // controller.cpp still have to be re-fitted against real recordings; see docs/.
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -179,6 +180,121 @@ float voice_score(const std::vector<float>& signal, float dbfs) {
     const auto pcm = quantise(signal, dbfs);
     return analyzer.analyze(pcm.data(), pcm.size(), 0).voice_likelihood;
 }
+
+// ── Sequence helpers ────────────────────────────────────────────────────────────
+//
+// The voice decision is stateful, so anything about a *sustained* sound has to be measured
+// over a sequence driven through ONE analyzer. `voice_score` above deliberately does the
+// opposite (fresh analyzer, one frame) because that is what the original per-frame cases
+// pin; both are needed and they must not be confused.
+
+/// Analysis frame the firmware actually uses: 512 samples per read, five reads = 2560.
+constexpr std::size_t kSequenceFrame = 2560;
+/// NoiseAnalyzer::kMinHistoryFrames. Frames before this cannot be judged for steadiness.
+constexpr int kWarmupFrames = 5;
+
+int sequence_crossings(const std::vector<float>& signal, float dbfs, int skip_frames = 0) {
+    NoiseAnalyzer analyzer;
+    const auto pcm = quantise(signal, dbfs);
+    const std::size_t frames = pcm.size() / kSequenceFrame;
+    int over = 0;
+    for (std::size_t k = 0; k < frames; ++k) {
+        const auto frame = analyzer.analyze(pcm.data() + k * kSequenceFrame, kSequenceFrame,
+                                            static_cast<uint32_t>(k * 100));
+        if (static_cast<int>(k) >= skip_frames && frame.voice_likelihood >= kVoiceCut) ++over;
+    }
+    return over;
+}
+
+float sequence_median(const std::vector<float>& signal, float dbfs) {
+    NoiseAnalyzer analyzer;
+    const auto pcm = quantise(signal, dbfs);
+    const std::size_t frames = pcm.size() / kSequenceFrame;
+    std::vector<float> scores;
+    scores.reserve(frames);
+    for (std::size_t k = 0; k < frames; ++k) {
+        scores.push_back(analyzer.analyze(pcm.data() + k * kSequenceFrame, kSequenceFrame,
+                                          static_cast<uint32_t>(k * 100))
+                             .voice_likelihood);
+    }
+    if (scores.empty()) return 0.0f;
+    std::sort(scores.begin(), scores.end());
+    return scores[scores.size() / 2];
+}
+
+/// Sustained closed-mouth vocalisation: glottal harmonics through two low formants.
+/// **No modulation at all** — that is the structural difference from speech, and the whole
+/// point of the case.
+std::vector<float> hum_sequence(float f0, float rolloff, float formant_hz, float seconds,
+                                uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    const std::size_t n = static_cast<std::size_t>(seconds * kSampleRate);
+    std::vector<float> out(n);
+    Resonator r1, r2;
+    r1.set(formant_hz, 260.0f);
+    r2.set(formant_hz * 2.4f, 420.0f);
+    const int harmonics = static_cast<int>(3500.0f / f0);
+    for (std::size_t i = 0; i < n; ++i) {
+        const float t = static_cast<float>(i) / kSampleRate;
+        float glottal = 0.0f;
+        for (int h = 1; h <= harmonics; ++h) {
+            glottal += std::sin(2.0f * float(M_PI) * f0 * h * t) /
+                       std::pow(static_cast<float>(h), rolloff);
+        }
+        glottal += 0.02f * normal(rng);
+        out[i] = r1.process(glottal) + 0.5f * r2.process(glottal);
+    }
+    normalise_band(out, 300.0f, 4000.0f, -20.0f);
+    return out;
+}
+
+/// Turbulent airflow, shaped and gated at respiration rate. No harmonic structure.
+std::vector<float> breath_sequence(float hp_coeff, float rumble_mix, float rate_hz,
+                                   float seconds, uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    const std::size_t n = static_cast<std::size_t>(seconds * kSampleRate);
+    std::vector<float> out(n);
+    float hpf = 0.0f, prev = 0.0f, rumble = 0.0f;
+    for (std::size_t i = 0; i < n; ++i) {
+        const float t = static_cast<float>(i) / kSampleRate;
+        const float nz = normal(rng);
+        hpf = hp_coeff * (hpf + nz - prev);
+        prev = nz;
+        rumble = 0.995f * rumble + 0.005f * nz;
+        const float env = 0.5f - 0.5f * std::cos(2.0f * float(M_PI) * rate_hz * t);
+        out[i] = (hpf + rumble_mix * rumble) * env;
+    }
+    normalise_band(out, 300.0f, 4000.0f, -20.0f);
+    return out;
+}
+
+/// Continuous speech: syllable-rate modulation, moving formants, gated fricatives.
+std::vector<float> speech_sequence(float seconds, uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    const std::size_t n = static_cast<std::size_t>(seconds * kSampleRate);
+    std::vector<float> out(n);
+    Resonator f1, f2, f3;
+    float hpf = 0.0f, prev = 0.0f;
+    for (std::size_t i = 0; i < n; ++i) {
+        const float t = static_cast<float>(i) / kSampleRate;
+        f1.set(500.0f + 300.0f * std::sin(2.0f * float(M_PI) * 0.7f * t), 160.0f);
+        f2.set(1300.0f + 500.0f * std::sin(2.0f * float(M_PI) * 0.5f * t + 1.0f), 200.0f);
+        f3.set(2500.0f + 400.0f * std::sin(2.0f * float(M_PI) * 0.3f * t), 320.0f);
+        const float g = normal(rng);
+        const float voiced = f1.process(g) + 0.6f * f2.process(g) + 0.3f * f3.process(g);
+        const float syllable = 0.5f - 0.5f * std::cos(2.0f * float(M_PI) * 4.0f * t);
+        const float nz = normal(rng);
+        hpf = 0.93f * (hpf + nz - prev);
+        prev = nz;
+        const float blink = syllable > 0.72f ? 1.0f : 0.0f;
+        out[i] = voiced * (0.6f + 0.4f * syllable) + 0.35f * hpf * blink;
+    }
+    normalise_band(out, 300.0f, 4000.0f, -20.0f);
+    return out;
+}
 }  // namespace
 
 int main() {
@@ -226,6 +342,62 @@ int main() {
     // Recorded so a future threshold change cannot silently make it worse.
     check(voice_score(speech_signal(), -25.0f) >= kVoiceCut,
           "speech at -25 dBFS is voice (known borderline peakiness case)");
+
+    // --- Sustained sounds: the per-frame product is not enough ---------------------
+    // Measured failure: EVERY frame of a hum at f0 ~200 Hz scored 1.0000, because ~20
+    // harmonics spaced 200 Hz apart land in 8-11 of the 24 bands and peakiness stays under
+    // its 0.72 ceiling. See the temporal-gate note in controller.cpp.
+    //
+    // These cases drive a SEQUENCE through one analyzer, which is what the firmware does.
+    // A fresh analyzer per frame would leave the gate permanently at 1.0 and pin the old,
+    // broken behaviour instead. That mistake was made once already: the first version of
+    // tools/voice_decision_sweep.cpp measured single frames taken from the start of a
+    // signal — the quiet half of a breathing cycle — and reported breath as safe.
+    {
+        const auto steady_hum = hum_sequence(200.0f, 1.0f, 600.0f, 6.0f, 4001);
+        check(sequence_median(steady_hum, -30.0f) < kVoiceCut,
+              "a sustained hum at 200 Hz is not voice (median over the sequence)");
+        check(sequence_crossings(steady_hum, -30.0f) <= kWarmupFrames,
+              "a sustained hum crosses the cut only while the history is filling");
+    }
+    {
+        const auto low_hum = hum_sequence(110.0f, 1.2f, 600.0f, 6.0f, 4002);
+        check(sequence_median(low_hum, -30.0f) < kVoiceCut,
+              "a sustained low hum at 110 Hz is not voice");
+        check(sequence_crossings(low_hum, -30.0f) <= kWarmupFrames,
+              "a sustained low hum crosses the cut only while the history is filling");
+    }
+    // A hum that arrives after silence must be gated from its first frames, not after a
+    // whole window: with a variance statistic the single silence-to-sound jump held the
+    // gate open and 14 of 92 frames crossed. The median of successive differences is what
+    // makes this pass; see the note on kMinLevelStepDb.
+    {
+        std::vector<float> after_silence(kSampleRate * 2, 0.0f);
+        const auto hum = hum_sequence(200.0f, 1.0f, 600.0f, 4.0f, 4003);
+        after_silence.insert(after_silence.end(), hum.begin(), hum.end());
+        check(sequence_crossings(after_silence, -30.0f, /*skip_frames=*/45) == 0,
+              "a hum arriving after silence is gated immediately, not after a window");
+    }
+    // Speech must survive the same gate. This is the half that keeps the fix from simply
+    // trading one false negative for another.
+    {
+        const auto speech = speech_sequence(6.0f, 11);
+        check(sequence_crossings(speech, -30.0f) > 10,
+              "speech still crosses the cut after the temporal gate is added");
+    }
+
+    // --- Breathing: measured, still open -------------------------------------------
+    // A breath burst is amplitude-modulated (0.2-1 Hz respiration), so the temporal gate
+    // does not reject it: the gate measures HOW MUCH the level moves, not HOW FAST. On the
+    // loud half of a burst the per-frame product reaches 1.00 and up to 23 of 75 frames
+    // crossed the cut. This asserts only the median; the tail is tracked as open item 35
+    // in docs/plan-status.md and is expected to need a modulation-RATE term (syllable rate
+    // 2-8 Hz against respiration 0.2-1 Hz), not a deeper depth threshold.
+    {
+        const auto breath = breath_sequence(0.86f, 0.4f, 0.6f, 6.0f, 5001);
+        check(sequence_median(breath, -25.0f) < kVoiceCut,
+              "the median frame of a breath burst is not voice");
+    }
 
     // --- Silence ------------------------------------------------------------------
     {

@@ -25,10 +25,27 @@
     录的时候刻意改变条件（距离、音量、有无背景声），因为真实场景就是会漂移。
     只在一个条件下录出来的"稳定"声纹，在真实使用中不成立。
 
-依赖
-----
-需要 speaker embedding 模型。本工具**不内置模型**，也不假装能算：它检查依赖是否就位，
-缺什么就明确报缺什么。可选实现见 --backend。
+    录素材用 tools/record_voiceprints.py，它按这个协议走并当场检查电平。
+
+依赖与运行
+----------
+后端是 ECAPA-TDNN（speechbrain 的 `spkrec-ecapa-voxceleb`，192 维，与
+`main/voiceprint_gate.hpp` 里 `kEmbeddingSize` 的假设一致）。第一次跑会从 HuggingFace
+下模型（约 80 MB），缓存在 `~/.cache/voice_separability/`，不进仓库。
+
+**必须用仓库根目录的 `.venv` 跑，不能用 DSH 自带的那个 python。**
+后者是签名过的宿主进程，硬运行时不允许加载 Team ID 不同的 dylib，`import torch` 会
+直接报 `different Team IDs` 而失败。建环境：
+
+    uv venv --python 3.12 .venv
+    uv pip install --python .venv/bin/python numpy torch torchaudio speechbrain
+
+然后：
+
+    .venv/bin/python tools/voice_separability.py --enroll-dir ... --impostor-dir ...
+
+本工具**不内置模型**，也不假装能算：依赖没就位就明确报缺什么（退出码 3），
+不会给一个假结果。退出码：0 通过 / 1 不通过 / 2 参数或文件问题 / 3 依赖缺失。
 """
 
 from __future__ import annotations
@@ -96,18 +113,57 @@ def load_audio(path: Path, target_sr: int = 16000):
     return samples, rate
 
 
+#: 模型只加载一次；每条录音都重载会慢几十倍。
+_EMBED_CACHE: dict[str, object] = {}
+
+#: 用哪个预训练模型。ECAPA-TDNN / VoxCeleb 是这个任务上的参考实现，
+#: 维度 192 —— 与 voiceprint_gate.hpp 里 kEmbeddingSize 的假设一致。
+ECAPA_SOURCE = "speechbrain/spkrec-ecapa-voxceleb"
+
+
+def _import_attr(module: str, attr: str):
+    import importlib
+
+    try:
+        mod = importlib.import_module(module)
+    except ImportError as exc:
+        raise MissingDependency(f"缺少 {module}：{exc}。") from exc
+    try:
+        return getattr(mod, attr)
+    except AttributeError as exc:
+        raise MissingDependency(f"{module} 里没有 {attr}，版本不匹配。") from exc
+
+
+def _ecapa_classifier():
+    if "ecapa" not in _EMBED_CACHE:
+        _require("torch", "pip install torch")
+        _require("numpy", "pip install numpy")
+        encoder_classifier = _import_attr("speechbrain.inference.speaker", "EncoderClassifier")
+        # 第一次会从 HuggingFace 拉模型（约 80 MB）；之后走本地缓存。
+        # 缓存放在 home 下，不放仓库里 —— 二进制权重不该进 git。
+        savedir = Path.home() / ".cache" / "voice_separability" / "ecapa-voxceleb"
+        savedir.mkdir(parents=True, exist_ok=True)
+        _EMBED_CACHE["ecapa"] = encoder_classifier.from_hparams(
+            source=ECAPA_SOURCE, savedir=str(savedir), run_opts={"device": "cpu"}
+        )
+    return _EMBED_CACHE["ecapa"]
+
+
 def embed(samples, rate: int, backend: str):
     """产出一条单位长度的 speaker embedding。"""
     if backend == "speechbrain":
-        _require("torch", "pip install torch")
-        _require("speechbrain", "pip install speechbrain")
-        raise MissingDependency(
-            "speechbrain 后端尚未接线。请在此处接入 ECAPA-TDNN：\n"
-            "  from speechbrain.inference.speaker import EncoderClassifier\n"
-            "  clf = EncoderClassifier.from_hparams(source='speechbrain/spkrec-ecapa-voxceleb')\n"
-            "  返回 clf.encode_batch(torch.from_numpy(samples)[None, None]).squeeze().numpy()\n"
-            "接好之后把本 raise 换成真实实现，并保持返回向量已 L2 归一化。"
-        )
+        torch = _require("torch", "pip install torch")
+        import numpy as np  # noqa: PLC0415
+
+        classifier = _ecapa_classifier()
+        with torch.no_grad():
+            tensor = torch.from_numpy(np.asarray(samples, dtype=np.float32)).unsqueeze(0)
+            vector = classifier.encode_batch(tensor).squeeze().cpu().numpy()
+        vector = np.asarray(vector, dtype=np.float64).ravel()
+        norm = float(np.linalg.norm(vector))
+        if norm == 0.0:
+            raise MissingDependency("embedding 全零，模型没有正常工作。")
+        return vector / norm
     if backend == "esp-sr":
         raise MissingDependency(
             "esp-sr 的声纹模型只跑在 ESP 芯片上，不能用于本机测量。\n"

@@ -1,9 +1,22 @@
 #include "ui.hpp"
 #include "lvgl.h"
+#include "esp_log.h"
 #include <cstdio>
 #include <algorithm>
 LV_FONT_DECLARE(ear_font16);
 LV_FONT_DECLARE(ear_font24);
+static const char* kTag="ui";
+/* The fonts are generated with `--no-compress --no-prefilter`, so their glyphs are stored as
+ * plain bitmaps (bitmap_format == LV_FONT_FMT_TXT_PLAIN). Regenerating one without
+ * `--no-compress` stores RLE bitmaps instead, and because LV_USE_FONT_COMPRESSED is off in this
+ * project lv_font_get_bitmap_fmt_txt() then returns NULL for *every* glyph: panels and bars still
+ * draw, but no text appears anywhere. That failure is completely silent, so check at boot. */
+static void check_font(const lv_font_t* font,const char* name) {
+    const auto* dsc=static_cast<const lv_font_fmt_txt_dsc_t*>(font->dsc);
+    if(!LV_USE_FONT_COMPRESSED && dsc && dsc->bitmap_format!=LV_FONT_FMT_TXT_PLAIN)
+        ESP_LOGE(kTag,"%s has compressed glyph bitmaps but LV_USE_FONT_COMPRESSED=0: "
+                      "no text will be drawn. Regenerate it with --no-compress --no-prefilter.",name);
+}
 static lv_obj_t *home,*detail,*scene,*subtitle,*level,*motion,*meter,*diagnostic,*nav;
 static bool details=false;
 static lv_obj_t* label(lv_obj_t* p,int x,int y,int width,const char* text,uint32_t color=0xDCE8F2) {
@@ -17,6 +30,7 @@ static lv_obj_t* panel(lv_obj_t* p,int x,int y,int w,int h) {
     lv_obj_set_style_border_width(o,0,0); lv_obj_set_style_radius(o,12,0); lv_obj_set_style_pad_all(o,0,0); return o;
 }
 void ui_create() {
+    check_font(&ear_font16,"ear_font16"); check_font(&ear_font24,"ear_font24");
     auto root=lv_screen_active();
     lv_obj_set_style_bg_color(root,lv_color_hex(0x091520),0);
     lv_obj_set_style_text_font(root,&ear_font16,0);

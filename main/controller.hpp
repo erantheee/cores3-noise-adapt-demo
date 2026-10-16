@@ -116,10 +116,39 @@ struct EarbudCommand {
     ConversationState conversation = ConversationState::none;
 };
 
+/// Turns one analysis frame into an `AnalysisFrame`, including the voice decision.
+///
+/// **Stateful.** The per-frame voice decision alone cannot separate speech from a sustained
+/// hum: a hum at f0 ~200 Hz has ~20 harmonics spread over 8-11 of the 24 bands, so the
+/// peakiness gate (designed for a single steady tone) never fires and the per-frame product
+/// reaches 1.00. Speech and hum differ in the *time* domain, so the analyzer keeps a short
+/// history of two descriptors and applies a modulation gate on top of the per-frame score.
+/// See `voice_thresholds::kMinLevelStdDb` in controller.cpp for the measured numbers.
 class NoiseAnalyzer {
 public:
     AnalysisFrame analyze(const int16_t* mono, std::size_t count, uint32_t timestamp_ms,
-                          float motion = 0.0f) const;
+                          float motion = 0.0f);
+
+    /// Drop the accumulated history. Call when the input stream is interrupted, so a gap
+    /// is not mistaken for a steady sound (or for modulation that never happened).
+    void reset();
+
+private:
+    /// ~1.5 s at the firmware's 100 ms control period.
+    static constexpr std::size_t kHistoryFrames = 15;
+    /// Frames required before the gate applies. Below this the returned score is exactly
+    /// the per-frame product, which is what keeps single-frame callers (and their tests)
+    /// behaving as before.
+    static constexpr std::size_t kMinHistoryFrames = 5;
+
+    /// Gate in [0, 1]; 1.0 when the sound moves the way speech does. Only ever lowers the
+    /// score it is multiplied into.
+    float modulation_term() const;
+
+    std::array<float, kHistoryFrames> level_history_{};
+    std::array<float, kHistoryFrames> ratio_history_{};
+    std::size_t history_count_ = 0;
+    std::size_t history_next_ = 0;
 };
 
 class AdaptController {

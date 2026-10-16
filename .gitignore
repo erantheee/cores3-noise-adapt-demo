@@ -14,3 +14,6 @@ recordings/
 tools/player/player
 # 中继播放端的编译产物（源码是 tools/relay/relaysink.swift，用 sh tools/relay/build.sh 生成）
 tools/relay/relaysink
+
+# 声纹止损门用的独立 venv（torch 无法在 DSH 自带 python 里加载）
+.venv/
