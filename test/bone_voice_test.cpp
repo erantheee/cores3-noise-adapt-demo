@@ -75,6 +75,9 @@ int main() {
         run(voice, vib, audio, &out);
         check(out.ready, "silence still fills the window");
         check(out.confidence == 0.0f, "silence produces no bone evidence");
+        // 重力基线是量程/单位/装配的体检指标：静止时应当读到 9.81 附近。
+        check(out.gravity > 9.5f && out.gravity < 10.1f,
+              "gravity baseline reports a plausible magnitude for +/-4g in m/s^2");
         check(std::fabs(out.correlation) < 1e-6f, "silence has no correlation to report");
     }
 

@@ -146,9 +146,14 @@ class CommandFrame:
     own_voice_confidence: float | None = None
     own_voice_correlation: float | None = None
     own_voice_source: str | None = None
+    #: IMU 重力基线模长（m/s²）。静止时 ≈9.81 才说明量程与单位对；0 表示没有 IMU 数据。
+    imu_gravity: float | None = None
     #: IMU 这一拍是否有数，以及运动否决是否生效。None = 这一帧没报。
     imu_ok: bool | None = None
     imu_motion: bool | None = None
+    #: IMU 队列累计丢弃数（诊断计数）。它是"与音频任务同跑会不会丢采样"的直接证据：
+    #: 真机验证看的是它在整个验证过程里有没有增长，而不是某一帧的绝对值。
+    imu_drops: int | None = None
     schema_version: int = SCHEMA_VERSION
     #: 越界或无法解释的字段说明。空表示这一帧通过了全部校验。
     problems: tuple[str, ...] = ()
@@ -300,10 +305,12 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
     own_voice_confidence = _as_float(payload, "own_voice_confidence")
     own_voice_correlation = _as_float(payload, "own_voice_correlation")
     own_voice_source = _as_str(payload, "own_voice_source")
+    imu_gravity = _as_float(payload, "imu_gravity")
     raw_imu_ok = payload.get("imu_ok")
     imu_ok = raw_imu_ok if isinstance(raw_imu_ok, bool) else None
     raw_imu_motion = payload.get("imu_motion")
     imu_motion = raw_imu_motion if isinstance(raw_imu_motion, bool) else None
+    imu_drops = _as_int(payload, "imu_drops")
 
     missing = [
         name
@@ -424,9 +431,11 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
             own_voice_correlation=(
                 None if own_voice_correlation is None else d2(own_voice_correlation)
             ),
+            imu_gravity=None if imu_gravity is None else d2(imu_gravity),
             own_voice_source=own_voice_source,
             imu_ok=imu_ok,
             imu_motion=imu_motion,
+            imu_drops=imu_drops,
             schema_version=schema,
         ),
         json_line=True,

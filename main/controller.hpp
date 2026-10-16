@@ -128,6 +128,8 @@ struct ContextResult {
 /// 为什么要进遥测：真机验证时要能分别回答"骨传导有没有给出证据""给错的时候长什么样"，
 /// 只看 media_percent 无法区分"证据没来"和"证据来了但状态机没动"。
 struct OwnVoiceEvidence {
+    /// IMU 的重力基线模长（m/s²）。近场代理时是 0（没有 IMU 数据）。
+    float gravity = 0.0f;
     float confidence = 0.0f;
     float correlation = 0.0f;
     float vibration_rms = 0.0f;
@@ -140,7 +142,8 @@ struct OwnVoiceEvidence {
 };
 
 struct EarbudCommand {
-    /// v3 加了自身语音证据（own_voice）。v2 及以前没有这几个字段。
+    /// v3 加了自身语音证据（own_voice，含 imu_gravity）。v2 及以前没有这几个字段。
+    /// v3 尚未烧到任何设备，所以补字段不另起版本号；一旦上过机就必须再涨版本。
     uint32_t schema_version = 3;
     uint32_t sequence = 0;
     uint32_t timestamp_ms = 0;

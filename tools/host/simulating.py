@@ -205,6 +205,8 @@ class MockDevice:
                         "own_voice_confidence": 0.82 if target["conversation"] == "LIKELY" else 0.05,
                         "own_voice_correlation": 0.90 if target["conversation"] == "LIKELY" else 0.03,
                         "own_voice_source": "bone",
+                        # 静止时的重力模长：模拟一个量程/单位正确的 ±4g 设备。
+                        "imu_gravity": 9.81,
                         "imu_ok": True,
                         "imu_motion": False,
                         "imu_drops": 0,

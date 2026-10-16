@@ -99,7 +99,8 @@ void emit_command_json(const EarbudCommand& command) {
                 "\"state\":\"%s\",\"environment\":\"%s\",\"mode\":\"%s\","
                 "\"conversation\":\"%s\",\"confidence\":%.2f,"
                 "\"own_voice_confidence\":%.3f,\"own_voice_correlation\":%.3f,"
-                "\"own_voice_vibration\":%.4f,\"own_voice_source\":\"%s\","
+                "\"own_voice_vibration\":%.4f,\"imu_gravity\":%.3f,"
+                "\"own_voice_source\":\"%s\","
                 "\"imu_ok\":%s,\"imu_motion\":%s,\"imu_drops\":%lu,"
                 "\"execution\":\"decision_only\",\"link\":\"simulated\","
                 "\"eq_gain_db\":[",
@@ -115,6 +116,7 @@ void emit_command_json(const EarbudCommand& command) {
                 static_cast<double>(command.own_voice.confidence),
                 static_cast<double>(command.own_voice.correlation),
                 static_cast<double>(command.own_voice.vibration_rms),
+                static_cast<double>(command.own_voice.gravity),
                 command.own_voice.bone ? "bone" : "near_field",
                 command.own_voice.imu_ok ? "true" : "false",
                 command.own_voice.motion ? "true" : "false",
@@ -675,6 +677,7 @@ void processing_task(void*) {
         const bone::Output bone_out =
             bone_voice.push_audio(speech_band_dbfs, static_cast<float>(now_us) / 1000.0f);
         OwnVoiceEvidence own_voice;
+        own_voice.gravity = bone_out.gravity;
         own_voice.confidence = bone_out.confidence;
         own_voice.correlation = bone_out.correlation;
         own_voice.vibration_rms = bone_out.vibration_rms;

@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+"""真机验证：Apple 式对话感知在 CoreS3 上到底成不成立。
+
+为什么单独一个脚本
+------------------
+`docs/apple-conversation-awareness.md` 第 11.6 节列了四项只有真机能回答的问题。它们的共同点是
+**光看 media_percent 分不出来**：
+
+    * "证据没来"（IMU 没初始化 / 骨传导判据不成立）→ 要改证据；
+    * "证据来了但没下压"（状态机 / 时序参数）→ 要改参数；
+    * "不该下压的时候下压了"（运动、旁人说话）→ 要改判据的门限或运动否决。
+
+所以这个脚本按**说话人分相**跑，逐相看 own_voice 证据、下压行为与 IMU 健康度，并把三项分开断言。
+
+用法
+----
+    # 真机（先让出串口：sh tools/free_port.sh --kill）
+    ./.venv/bin/python tools/verify_conversation_awareness.py --port /dev/cu.usbmodem1101
+
+    # 只看串口在不在、固件版本对不对，不跑相
+    ./.venv/bin/python tools/verify_conversation_awareness.py --port ... --dry-run
+
+    # 离线分析已抓下来的日志（只需要每行 JSON）
+    ./.venv/bin/python tools/verify_conversation_awareness.py --file capture.log
+
+退出码：0 全过 · 1 有断言失败 · 2 设备/固件不对 · 3 串口被占
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import statistics
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT / "tools"))
+
+from host.protocol import parse_line  # noqa: E402
+
+BAUD = 921600
+TICK_MS = 100.0
+#: 状态机规格：确认 200 ms + 3τ(duck 150 ms) = 650 ms 之内应当压到 60% 以下。
+DUCK_LATENCY_BUDGET_MS = 650.0
+#: 判定"自己说话"的证据门限。低于它说明骨传导判据没成立，不是状态机的问题。
+EVIDENCE_FLOOR = 0.30
+#: 重力基线（±4g，m/s²）。静止时偏离这个区间说明量程/单位/装配有问题。
+GRAVITY_RANGE = (9.0, 10.5)
+
+
+def say(text: str) -> None:
+    if not shutil.which("say"):
+        return
+    if subprocess.run(["say", "-v", "Tingting", text], capture_output=True).returncode != 0:
+        subprocess.run(["say", text], check=False)
+
+
+@dataclass
+class Frame:
+    t_ms: float
+    schema: int
+    media_percent: int
+    conversation: str
+    confidence: float
+    own_voice_confidence: float | None
+    own_voice_correlation: float | None
+    own_voice_source: str | None
+    imu_ok: bool | None
+    imu_motion: bool | None
+    imu_gravity: float | None
+    imu_drops: int | None
+    problems: tuple[str, ...] = ()
+
+
+@dataclass
+class Phase:
+    name: str
+    prompt: str
+    seconds: float
+    frames: list[Frame] = field(default_factory=list)
+
+    # ---- 逐相统计 ----
+    def _values(self, getter) -> list[float]:
+        return [v for v in (getter(f) for f in self.frames) if v is not None]
+
+    @property
+    def own_voice_peak(self) -> float:
+        values = self._values(lambda f: f.own_voice_confidence)
+        return max(values) if values else 0.0
+
+    @property
+    def own_voice_p50(self) -> float:
+        values = self._values(lambda f: f.own_voice_confidence)
+        return statistics.median(values) if values else 0.0
+
+    @property
+    def correlation_p50(self) -> float:
+        values = self._values(lambda f: f.own_voice_correlation)
+        return statistics.median(values) if values else 0.0
+
+    @property
+    def media_min(self) -> int:
+        return min((f.media_percent for f in self.frames), default=100)
+
+    @property
+    def ducked_frames(self) -> int:
+        return sum(1 for f in self.frames if f.media_percent < 99)
+
+    @property
+    def motion_frames(self) -> int:
+        return sum(1 for f in self.frames if f.imu_motion)
+
+    @property
+    def gravity_p50(self) -> float | None:
+        values = self._values(lambda f: f.imu_gravity)
+        return statistics.median(values) if values else None
+
+    @property
+    def drops_last(self) -> int | None:
+        return self.frames[-1].imu_drops if self.frames else None
+
+    @property
+    def first_evidence_ms(self) -> float | None:
+        for f in self.frames:
+            if (f.own_voice_confidence or 0.0) >= 0.5:
+                return f.t_ms
+        return None
+
+    @property
+    def first_duck_ms(self) -> float | None:
+        for f in self.frames:
+            if f.media_percent < 60:
+                return f.t_ms
+        return None
+
+    def summary(self) -> dict:
+        return {
+            "phase": self.name,
+            "frames": len(self.frames),
+            "own_voice_peak": round(self.own_voice_peak, 3),
+            "own_voice_p50": round(self.own_voice_p50, 3),
+            "correlation_p50": round(self.correlation_p50, 3),
+            "media_min": self.media_min,
+            "ducked_frames": self.ducked_frames,
+            "motion_frames": self.motion_frames,
+            "gravity_p50": None if self.gravity_p50 is None else round(self.gravity_p50, 3),
+            "imu_drops": self.drops_last,
+            "imu_samples_dropped": (
+                None
+                if not self.frames or self.frames[0].imu_drops is None
+                else self.frames[-1].imu_drops - self.frames[0].imu_drops
+            ),
+            "duck_latency_ms": self.duck_latency_ms(),
+        }
+
+    def duck_latency_ms(self) -> float | None:
+        evidence = self.first_evidence_ms
+        duck = self.first_duck_ms
+        if evidence is None or duck is None:
+            return None
+        return round(duck - evidence, 1)
+
+
+PHASES: list[tuple[str, str, float]] = [
+    ("baseline", "保持安静，不要动设备，十秒。", 10.0),
+    ("self_speech", "现在开始说话，连着说十二秒，就像跟人聊天。", 12.0),
+    ("quiet_after", "停下来，保持安静十秒。", 10.0),
+    ("motion", "把设备拿起来在手里走动，或者轻轻晃动它，十秒。", 10.0),
+    ("other_speech", "请另一个人对着设备说话，或者用手机在设备旁边放一段播客，十二秒。", 12.0),
+]
+
+
+def read_frames(port: str, phase: Phase, start_ms: float) -> None:
+    import serial  # noqa: PLC0415
+
+    connection = serial.Serial(port=port, baudrate=BAUD, timeout=0.2)
+    # ESP32-S3 内置 USB Serial/JTAG 在 DTR 未置位时根本不发数据（tools/record_from_device.py 踩过）。
+    connection.dtr = True
+    connection.rts = True
+    try:
+        deadline = time.monotonic() + phase.seconds
+        while time.monotonic() < deadline:
+            raw = connection.readline()
+            if not raw:
+                continue
+            line = raw.decode("utf-8", errors="replace")
+            if "earbud_command" not in line:
+                continue
+            parsed = parse_line(line)
+            if parsed.value is None or not hasattr(parsed.value, "media_percent"):
+                continue
+            f = parsed.value
+            phase.frames.append(
+                Frame(
+                    t_ms=(time.monotonic() * 1000.0 - start_ms),
+                    schema=f.schema_version,
+                    media_percent=f.media_percent,
+                    conversation=f.conversation,
+                    confidence=f.confidence,
+                    own_voice_confidence=f.own_voice_confidence,
+                    own_voice_correlation=f.own_voice_correlation,
+                    own_voice_source=f.own_voice_source,
+                    imu_ok=f.imu_ok,
+                    imu_motion=f.imu_motion,
+                    imu_gravity=f.imu_gravity,
+                    imu_drops=f.imu_drops,
+                    problems=parsed.problems,
+                )
+            )
+    finally:
+        connection.close()
+
+
+def analyse(phases: list[Phase]) -> tuple[list[dict], list[str]]:
+    checks: list[dict] = []
+    failures: list[str] = []
+
+    def record(name: str, ok: bool, detail: str) -> None:
+        checks.append({"check": name, "ok": ok, "detail": detail})
+        if not ok:
+            failures.append(f"{name}: {detail}")
+
+    by_name = {p.name: p for p in phases}
+    # 离线模式：日志里没有"相"的边界，分相断言不可能成立。报统计 + 版本检查，
+    # 其余显式说明跳过——让脚本在离线时"绿"起来，比让它报一堆假的失败更危险。
+    offline = "baseline" not in by_name
+    if offline:
+        schemas = {f.schema for p in phases for f in p.frames}
+        v3 = any((f.own_voice_confidence is not None) for p in phases for f in p.frames)
+        record("C1 固件是 v3（带自身语音遥测）", v3,
+               f"帧里的 schema={sorted(schemas)}，own_voice 字段{'有' if v3 else '没有'}")
+        record("C0 离线模式", True,
+               f"日志 {sum(len(p.frames) for p in phases)} 帧：只报统计，分相断言（C2/C3/C5/C6/C7/C8/C9）已跳过")
+        return checks, failures
+    baseline = by_name.get("baseline")
+    self_speech = by_name.get("self_speech")
+    quiet_after = by_name.get("quiet_after")
+    motion = by_name.get("motion")
+    other_speech = by_name.get("other_speech")
+
+    # C1 固件版本：没有 v3 字段就说明烧的不是这一版，后面所有断言都没有意义。
+    schemas = {f.schema for p in phases for f in p.frames}
+    v3 = any((f.own_voice_confidence is not None) for p in phases for f in p.frames)
+    record("C1 固件是 v3（带自身语音遥测）", v3,
+           f"帧里的 schema={sorted(schemas)}，own_voice 字段{'有' if v3 else '没有'}")
+
+    # C2 IMU 就绪
+    if baseline is not None and baseline.frames:
+        ok_frames = sum(1 for f in baseline.frames if f.imu_ok)
+        record("C2 IMU 就绪", ok_frames >= 0.9 * len(baseline.frames),
+               f"静止相 {ok_frames}/{len(baseline.frames)} 帧 imu_ok=true")
+    else:
+        record("C2 IMU 就绪", False, "静止相没有收到任何帧")
+
+    # C3 量程/单位：重力基线
+    if baseline is not None and baseline.gravity_p50 is not None:
+        gravity = baseline.gravity_p50
+        record("C3 重力基线（±4g，m/s²）", GRAVITY_RANGE[0] <= gravity <= GRAVITY_RANGE[1],
+               f"静止相 imu_gravity p50={gravity:.2f}，期望 {GRAVITY_RANGE[0]}–{GRAVITY_RANGE[1]}")
+    else:
+        record("C3 重力基线（±4g，m/s²）", False, "没有 imu_gravity 字段")
+
+    # C4 帧率：控制拍 100 ms，帧数不该明显少于预期
+    for phase in phases:
+        if not phase.frames or phase.seconds <= 0:
+            continue
+        expected = phase.seconds * 1000.0 / TICK_MS
+        ratio = len(phase.frames) / expected if expected else 0.0
+        record(f"C4 {phase.name} 帧率", ratio >= 0.8,
+               f"{len(phase.frames)} 帧 / 预期 {expected:.0f}（{ratio * 100:.0f}%）")
+
+    # C4b IMU 丢采样：控制任务与分析/推理同跑时最容易出问题的地方。
+    # 看的是**整个过程里的增量**，不是某一帧的绝对值。
+    dropped = None
+    for phase in phases:
+        if phase.frames and phase.frames[0].imu_drops is not None and phase.frames[-1].imu_drops is not None:
+            dropped = phase.frames[-1].imu_drops - phase.frames[0].imu_drops
+    if dropped is not None:
+        record("C4b IMU 丢采样", dropped == 0, f"验证过程 imu_drops 增量 {dropped}")
+    else:
+        record("C4b IMU 丢采样", False, "帧里没有 imu_drops 字段")
+
+    # C5 骨传导证据成立：自己说话相必须显著高于静止相
+    if self_speech is not None and baseline is not None:
+        peak = self_speech.own_voice_peak
+        base = baseline.own_voice_peak
+        record("C5 自身语音证据成立", peak >= EVIDENCE_FLOOR and peak >= base + 0.15,
+               f"说话相 own_voice 峰值 {peak:.2f} vs 静止相 {base:.2f}（门限 {EVIDENCE_FLOOR}）")
+        sources = {f.own_voice_source for f in self_speech.frames if f.own_voice_source}
+        record("C5b 证据来源是骨传导", sources == {"bone"}, f"说话相的 source={sorted(sources)}")
+
+    # C6 触发时序：证据 ≥0.5 到下压 <60% 的间隔
+    if self_speech is not None:
+        latency = self_speech.duck_latency_ms()
+        if latency is None:
+            record("C6 下压时序", False,
+                   "说话相没有观察到下压。先看 C5：证据没来就别调时序参数")
+        else:
+            record("C6 下压时序", latency <= DUCK_LATENCY_BUDGET_MS,
+                   f"证据→下压 {latency:.0f} ms（预算 {DUCK_LATENCY_BUDGET_MS:.0f} ms）")
+
+    # C7 恢复
+    if self_speech is not None and quiet_after is not None and self_speech.ducked_frames > 0:
+        record("C7 对话结束后恢复", quiet_after.media_min > 99,
+               f"停止说话相的最低 media_percent={quiet_after.media_min}%")
+    else:
+        record("C7 对话结束后恢复", False, "没有说话相的下压可供恢复验证（见 C6）")
+
+    # C8 运动否决
+    if motion is not None:
+        record("C8 运动否决", motion.motion_frames > 0 and motion.media_min > 99,
+               f"运动相 motion 帧 {motion.motion_frames}/{len(motion.frames)}，最低 media={motion.media_min}%")
+
+    # C9 旁人说话 / 外放不该触发
+    if other_speech is not None and other_speech.frames:
+        record("C9 旁人说话不触发", other_speech.ducked_frames == 0,
+               f"旁人相下压帧 {other_speech.ducked_frames}/{len(other_speech.frames)}，"
+               f"own_voice 峰值 {other_speech.own_voice_peak:.2f}")
+
+    return checks, failures
+
+
+def print_report(phases: list[Phase], checks: list[dict]) -> None:
+    print(f"\n{'相':<14}{'帧数':>6}{'own峰值':>9}{'相关p50':>9}{'最低media':>10}{'下压帧':>8}{'运动帧':>8}{'重力':>8}{'延迟ms':>8}")
+    for phase in phases:
+        s = phase.summary()
+        gravity = "—" if s["gravity_p50"] is None else f"{s['gravity_p50']:.2f}"
+        latency = "—" if s["duck_latency_ms"] is None else f"{s['duck_latency_ms']:.0f}"
+        print(f"{s['phase']:<14}{s['frames']:>6}{s['own_voice_peak']:>9.2f}{s['correlation_p50']:>9.2f}"
+              f"{s['media_min']:>10}{s['ducked_frames']:>8}{s['motion_frames']:>8}{gravity:>8}{latency:>8}")
+    print()
+    for check in checks:
+        print(f"{'✅' if check['ok'] else '❌'} {check['check']}：{check['detail']}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="真机验证 Apple 式对话感知")
+    parser.add_argument("--port", help="串口，例如 /dev/cu.usbmodem1101")
+    parser.add_argument("--file", help="离线分析：一个每行 JSON 的抓包日志")
+    parser.add_argument("--out", default="记录/对话感知验证", help="报告目录")
+    parser.add_argument("--dry-run", action="store_true", help="只检查串口与固件版本，不跑相")
+    parser.add_argument("--skip-other-speech", action="store_true", help="没有人配合时跳过旁人说话相")
+    args = parser.parse_args()
+    if not args.port and not args.file:
+        parser.error("需要 --port 或 --file")
+
+    phases: list[Phase] = []
+
+    if args.file:
+        phase = Phase("offline", "", 0.0)
+        with open(args.file, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if "earbud_command" not in line:
+                    continue
+                parsed = parse_line(line)
+                if parsed.value is None or not hasattr(parsed.value, "media_percent"):
+                    continue
+                f = parsed.value
+                phase.frames.append(Frame(
+                    t_ms=float(len(phase.frames)) * TICK_MS, schema=f.schema_version,
+                    media_percent=f.media_percent, conversation=f.conversation,
+                    confidence=f.confidence, own_voice_confidence=f.own_voice_confidence,
+                    own_voice_correlation=f.own_voice_correlation, own_voice_source=f.own_voice_source,
+                    imu_ok=f.imu_ok, imu_motion=f.imu_motion, imu_gravity=f.imu_gravity,
+                    imu_drops=None, problems=parsed.problems))
+        phases = [phase]
+    else:
+        try:
+            import serial  # noqa: PLC0415
+        except ImportError:
+            print("❌ 缺少 pyserial。用仓库自带的解释器：./.venv/bin/python tools/verify_conversation_awareness.py ...")
+            return 3
+        try:
+            probe = serial.Serial(port=args.port, baudrate=BAUD, timeout=0.2)
+        except Exception as exc:  # noqa: BLE001
+            print(f"❌ 打不开串口 {args.port}：{exc}")
+            print("   先让出串口：CORES3_PORT=%s sh tools/free_port.sh --kill" % args.port)
+            return 3
+        probe.dtr = True
+        probe.rts = True
+        try:
+            # 先读两秒，确认固件版本：不是 v3 就别跑了，跑了也全是假结论。
+            started = time.monotonic()
+            schema_seen = set()
+            own_voice_seen = False
+            while time.monotonic() - started < 2.0:
+                raw = probe.readline()
+                if not raw or "earbud_command" not in raw.decode("utf-8", errors="replace"):
+                    continue
+                parsed = parse_line(raw.decode("utf-8", errors="replace"))
+                if parsed.value is None or not hasattr(parsed.value, "media_percent"):
+                    continue
+                schema_seen.add(parsed.value.schema_version)
+                own_voice_seen = own_voice_seen or parsed.value.own_voice_confidence is not None
+            print(f"设备 schema={sorted(schema_seen)}，自身语音遥测{'有' if own_voice_seen else '没有'}")
+            if not own_voice_seen:
+                print("❌ 设备固件不是 v3：先烧分支固件（bash tools/build.sh && bash tools/flash.sh）")
+                return 2
+        finally:
+            probe.close()
+
+        if args.dry_run:
+            print("✅ 干跑通过：串口可用、固件是 v3。加 --port 再跑一次就是完整验证。")
+            return 0
+
+        todo = [(n, p, s) for (n, p, s) in PHASES if not (args.skip_other_speech and n == "other_speech")]
+        for name, prompt, seconds in todo:
+            phase = Phase(name, prompt, seconds)
+            print(f"\n=== {name}（{seconds:.0f}s）=== {prompt}")
+            say(prompt)
+            time.sleep(1.0)
+            started = time.monotonic() * 1000.0
+            read_frames(args.port, phase, started)
+            phases.append(phase)
+
+    checks, failures = analyse(phases)
+    print_report(phases, checks)
+
+    out_dir = REPO_ROOT / args.out / time.strftime("%Y%m%d-%H%M%S")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    report = {
+        "when": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "port": args.port,
+        "source_file": args.file,
+        "phases": [p.summary() for p in phases],
+        "checks": checks,
+        "failures": failures,
+    }
+    (out_dir / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"\n报告：{out_dir / 'report.json'}")
+    if failures:
+        print(f"\n❌ {len(failures)} 条断言失败：")
+        for item in failures:
+            print(f"  · {item}")
+        return 1
+    print("\n✅ 全部断言通过")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

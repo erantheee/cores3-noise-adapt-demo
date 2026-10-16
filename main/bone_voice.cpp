@@ -72,6 +72,7 @@ Output BoneVoice::push_audio(float speech_band_dbfs, float t_ms) {
     window_next_ = (window_next_ + 1) % kMaxWindow;
     if (window_count_ < kMaxWindow) ++window_count_;
 
+    out.gravity = gravity_;
     out.vibration_rms = vib_rms;
     out.motion = motion;
     out.ready = window_count_ >= params_.min_pairs;
