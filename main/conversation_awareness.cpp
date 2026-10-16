@@ -16,6 +16,15 @@ float approach(float current, float target, float dt_ms, float tau_ms) {
 
 }  // namespace
 
+float near_field_own_voice(float level_dbfs, float voice_likelihood) {
+    constexpr float kNearFieldLowDb = -45.0f;
+    constexpr float kNearFieldHighDb = -25.0f;
+    const float level = std::clamp((level_dbfs - kNearFieldLowDb) /
+                                       (kNearFieldHighDb - kNearFieldLowDb),
+                                   0.0f, 1.0f);
+    return std::clamp(voice_likelihood, 0.0f, 1.0f) * level;
+}
+
 Output Awareness::update(const Evidence& evidence, float dt_ms) {
     const float dt = std::max(dt_ms, 0.0f);
     const bool own_voice = evidence.own_voice >= params_.own_voice_threshold;

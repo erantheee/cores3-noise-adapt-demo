@@ -67,6 +67,15 @@ struct Output {
     std::uint32_t silence_ms = 0;
 };
 
+/// 今天的"自身语音"证据近似：**近场电平优势 x 语音判据**。
+///
+/// 设备上还没有声纹/骨传导检测器（voiceprint_gate 只有接口、主工程没接模型，IMU 也没进主工程），
+/// 所以先用这个可标定的占位。它不是 Apple 的判据：Apple 用内耳麦克风 + 加速度计的骨传导证据，
+/// 因此这份代理**已知会把"附近有人大声说话"误当成佩戴者开口**。
+///
+/// 接入真正的检测器时，只换掉调用点传进来的 Evidence::own_voice，状态机与全部时序参数不动。
+float near_field_own_voice(float level_dbfs, float voice_likelihood);
+
 class Awareness {
 public:
     Output update(const Evidence& evidence, float dt_ms);

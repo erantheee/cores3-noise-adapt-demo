@@ -181,6 +181,10 @@ public:
     EarbudCommand update(const AnalysisFrame& frame, float dt_ms);
     void reset();
 
+    /// 最近一次对话感知输出。工具与测试用它读 own_voice / 状态 / 已下压时长，
+    /// 不必为了遥测往协议里加字段。
+    const conversation::Output& awareness() const { return awareness_out_; }
+
 private:
     uint32_t sequence_ = 0;
     float speech_gain_db_ = 0.0f;
@@ -191,6 +195,7 @@ private:
     /// 触发证据、时序参数与状态机都在 main/conversation_awareness.hpp 里；
     /// 旧实现的轮次启发式（语音→停顿→再语音）已删除，理由见 docs/apple-conversation-awareness.md。
     conversation::Awareness awareness_;
+    conversation::Output awareness_out_{};
 };
 
 const char* adapt_state_name(AdaptState state);

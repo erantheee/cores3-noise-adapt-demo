@@ -347,20 +347,6 @@ float voice_likelihood_from_features(const VoiceFeatures& features) {
     return band_term * peak_term * noise_term * spread_term * features.level_gate;
 }
 
-/// 今天的"自身语音"证据近似。
-///
-/// 设备上还没有声纹/骨传导检测器（voiceprint_gate 只有接口，主工程没接模型；IMU 也没进主工程），
-/// 所以这里用"近场电平优势 x 语音判据"作为可标定的占位。**它不是 Apple 的判据**：Apple 用的是
-/// 内耳麦克风 + 加速度计的骨传导证据，因此这份代理已知会把"附近有人大声说话"误当成自己开口。
-/// 接入真正的自身语音检测器时只替换这个函数，conversation::Awareness 与其全部时序参数都不动。
-float own_voice_proxy(const AnalysisFrame& frame, float voice) {
-    constexpr float kNearFieldLowDb = -45.0f;
-    constexpr float kNearFieldHighDb = -25.0f;
-    const float level = clamp01((frame.broadband_dbfs - kNearFieldLowDb) /
-                                (kNearFieldHighDb - kNearFieldLowDb));
-    return clamp01(voice) * level;
-}
-
 EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
     EarbudCommand command;
     command.sequence = ++sequence_;
@@ -390,8 +376,9 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
         evidence.speech_active = speech_active;
         evidence.voice_likelihood = voice;
         evidence.level_dbfs = frame.broadband_dbfs;
-        evidence.own_voice = own_voice_proxy(frame, voice);
-        const conversation::Output awareness_out = awareness_.update(evidence, dt_ms);
+        evidence.own_voice = conversation::near_field_own_voice(frame.broadband_dbfs, voice);
+        awareness_out_ = awareness_.update(evidence, dt_ms);
+        const conversation::Output& awareness_out = awareness_out_;
 
         command.conversation = awareness_out.engaged
                                    ? ConversationState::likely
