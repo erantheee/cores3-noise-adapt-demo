@@ -286,10 +286,12 @@ def analyse(phases: list[Phase]) -> tuple[list[dict], list[str]]:
         record("C4b IMU 丢采样", False, "帧里没有 imu_drops 字段")
 
     # C5 骨传导证据成立：自己说话相必须显著高于静止相
+    evidence_ok = False
     if self_speech is not None and baseline is not None:
         peak = self_speech.own_voice_peak
         base = baseline.own_voice_peak
-        record("C5 自身语音证据成立", peak >= EVIDENCE_FLOOR and peak >= base + 0.15,
+        evidence_ok = peak >= EVIDENCE_FLOOR and peak >= base + 0.15
+        record("C5 自身语音证据成立", evidence_ok,
                f"说话相 own_voice 峰值 {peak:.2f} vs 静止相 {base:.2f}（门限 {EVIDENCE_FLOOR}）")
         sources = {f.own_voice_source for f in self_speech.frames if f.own_voice_source}
         record("C5b 证据来源是骨传导", sources == {"bone"}, f"说话相的 source={sorted(sources)}")
@@ -298,8 +300,12 @@ def analyse(phases: list[Phase]) -> tuple[list[dict], list[str]]:
     if self_speech is not None:
         latency = self_speech.duck_latency_ms()
         if latency is None:
-            record("C6 下压时序", False,
-                   "说话相没有观察到下压。先看 C5：证据没来就别调时序参数")
+            # 提示必须跟着 C5 的结论走。第一版对两种情况用同一句话，于是"证据明明到了"
+            # 那次也提示"先看证据"——而把这两种情况搞混正是这个脚本存在的理由。
+            hint = ("证据到了但没下压 → 该看状态机与时序（conversation::Params）"
+                    if evidence_ok else
+                    "证据没来 → 先修证据（骨传导判据 / IMU），别急着调时序参数")
+            record("C6 下压时序", False, f"说话相没有观察到下压。{hint}")
         else:
             record("C6 下压时序", latency <= DUCK_LATENCY_BUDGET_MS,
                    f"证据→下压 {latency:.0f} ms（预算 {DUCK_LATENCY_BUDGET_MS:.0f} ms）")
@@ -325,6 +331,69 @@ def analyse(phases: list[Phase]) -> tuple[list[dict], list[str]]:
     return checks, failures
 
 
+def make_phase(name: str, seconds: float, *, own_voice: float = 0.02, media: int = 100,
+               duck_at_ms: float | None = None, duck_percent: int = 25, motion: bool = False,
+               imu_ok: bool = True, gravity: float = 9.81) -> Phase:
+    """造一个相的合成帧序列。只用于 `--selftest`：验证**检查器本身**在已知好坏的数据上
+    会不会给出正确结论。真机数据永远从串口来。"""
+    frames = []
+    count = int(round(seconds * 1000.0 / TICK_MS))
+    for index in range(count):
+        t = index * TICK_MS
+        ducked = duck_at_ms is not None and t >= duck_at_ms
+        frames.append(Frame(
+            t_ms=t, schema=3, media_percent=(duck_percent if ducked else media),
+            conversation="LIKELY" if ducked else "NONE", confidence=0.8,
+            own_voice_confidence=own_voice,
+            own_voice_correlation=0.9 if own_voice > 0.3 else 0.02,
+            own_voice_source="bone" if imu_ok else "none",
+            imu_ok=imu_ok, imu_motion=motion, imu_gravity=gravity, imu_drops=0))
+    return Phase(name=name, prompt="", seconds=seconds, frames=frames)
+
+
+def selftest() -> int:
+    """用合成数据证明"检查器"能分辨三种失败——这是脚本存在的全部理由。
+
+    它必须能分开：证据没来（C5 挂）、证据来了但没下压（C5 过、C6 挂）、
+    以及不该下压时下压了（C9 挂）。做不到这一点，真机那次跑出来的报告就没法用来决策。
+    """
+    scenarios = [
+        ("good", dict(self_speech=dict(own_voice=0.85, duck_at_ms=300.0),
+                      quiet_after=dict(media=100)), []),
+        ("no_evidence", dict(self_speech=dict(own_voice=0.02)), ["C5", "C6", "C7"]),
+        ("evidence_no_duck", dict(self_speech=dict(own_voice=0.85)), ["C6", "C7"]),
+        ("ducks_on_others", dict(self_speech=dict(own_voice=0.85, duck_at_ms=300.0),
+                                 other_speech=dict(own_voice=0.05, media=25)), ["C9"]),
+        # IMU 挂掉 → 控制器 fail-closed：置信度 0、来源 none、不下压。合成数据必须按这个来，
+        # 否则就是在拿一个现实中不存在的组合去测检查器。
+        ("imu_dead", dict(imu_ok=False, gravity=0.0, self_speech=dict(own_voice=0.0)),
+         ["C2", "C3", "C5", "C5b", "C6", "C7"]),
+    ]
+    failures = 0
+    for name, overrides, expected in scenarios:
+        defaults = dict(baseline=dict(), self_speech=dict(), quiet_after=dict(),
+                        motion=dict(motion=True), other_speech=dict(own_voice=0.05))
+        global_imu = overrides.pop("imu_ok", True)
+        global_gravity = overrides.pop("gravity", 9.81)
+        phases = []
+        for phase_name, prompt, seconds in PHASES:
+            kwargs = dict(defaults.get(phase_name, {}))
+            kwargs.update(overrides.get(phase_name, {}))
+            phases.append(make_phase(phase_name, seconds, imu_ok=global_imu,
+                                     gravity=global_gravity, **kwargs))
+        checks, failed = analyse(phases)
+        failing = sorted({c["check"].split()[0] for c in checks if not c["ok"]})
+        ok = failing == sorted(expected)
+        print(f"{'PASS' if ok else 'FAIL'} 自测[{name}]：预期失败 {sorted(expected) or '无'}，"
+              f"实得 {failing or '无'}")
+        for item in failed:
+            print(f"     {item}")
+        if not ok:
+            failures += 1
+    print(f"\n检查器自测：{'全部符合预期' if failures == 0 else f'{failures} 个场景与预期不符'}")
+    return 1 if failures else 0
+
+
 def print_report(phases: list[Phase], checks: list[dict]) -> None:
     print(f"\n{'相':<14}{'帧数':>6}{'own峰值':>9}{'相关p50':>9}{'最低media':>10}{'下压帧':>8}{'运动帧':>8}{'重力':>8}{'延迟ms':>8}")
     for phase in phases:
@@ -345,7 +414,11 @@ def main() -> int:
     parser.add_argument("--out", default="记录/对话感知验证", help="报告目录")
     parser.add_argument("--dry-run", action="store_true", help="只检查串口与固件版本，不跑相")
     parser.add_argument("--skip-other-speech", action="store_true", help="没有人配合时跳过旁人说话相")
+    parser.add_argument("--selftest", action="store_true",
+                        help="用合成数据验证检查器本身（不需要设备、不需要人）")
     args = parser.parse_args()
+    if args.selftest:
+        return selftest()
     if not args.port and not args.file:
         parser.error("需要 --port 或 --file")
 
