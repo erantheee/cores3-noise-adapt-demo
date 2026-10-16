@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "app_main.cpp"
         "controller.cpp"
+        "conversation_awareness.cpp"
         "latency_profiler.cpp"
         "mic_capture.cpp"
         "mic_decimator.cpp"

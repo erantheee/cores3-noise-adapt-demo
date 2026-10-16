@@ -347,6 +347,20 @@ float voice_likelihood_from_features(const VoiceFeatures& features) {
     return band_term * peak_term * noise_term * spread_term * features.level_gate;
 }
 
+/// 今天的"自身语音"证据近似。
+///
+/// 设备上还没有声纹/骨传导检测器（voiceprint_gate 只有接口，主工程没接模型；IMU 也没进主工程），
+/// 所以这里用"近场电平优势 x 语音判据"作为可标定的占位。**它不是 Apple 的判据**：Apple 用的是
+/// 内耳麦克风 + 加速度计的骨传导证据，因此这份代理已知会把"附近有人大声说话"误当成自己开口。
+/// 接入真正的自身语音检测器时只替换这个函数，conversation::Awareness 与其全部时序参数都不动。
+float own_voice_proxy(const AnalysisFrame& frame, float voice) {
+    constexpr float kNearFieldLowDb = -45.0f;
+    constexpr float kNearFieldHighDb = -25.0f;
+    const float level = clamp01((frame.broadband_dbfs - kNearFieldLowDb) /
+                                (kNearFieldHighDb - kNearFieldLowDb));
+    return clamp01(voice) * level;
+}
+
 EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
     EarbudCommand command;
     command.sequence = ++sequence_;
@@ -359,10 +373,8 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
         valid_ms_ = 0.0f;
         speech_gain_db_ = slew(speech_gain_db_, 0.0f, dt_ms, 100.0f, 250.0f);
         media_percent_ = slew(media_percent_, 100.0f, dt_ms, 100.0f, 250.0f);
-        speech_run_ms_ = 0.0f;
-        silence_run_ms_ += dt_ms;
-        conversation_hold_ms_ = std::max(0.0f, conversation_hold_ms_ - dt_ms);
-        previous_speech_active_ = false;
+        // 麦克风不可信时不能留着下压：状态机整体复位，媒体由上面的 slew 带回 100%。
+        awareness_.reset();
         command.state = invalid_ms_ >= 250.0f ? AdaptState::mic_fault : AdaptState::recovering;
     } else {
         invalid_ms_ = 0.0f;
@@ -371,34 +383,20 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
         const float voice = clamp01(frame.voice_likelihood);
         const bool speech_active = voice > 0.55f && frame.broadband_dbfs > -58.0f;
 
-        // A single voice-like frame means only "speech nearby".  It is not evidence that the
-        // wearer is in a conversation: a podcast, television or one passing sentence has the
-        // same spectrum.  Conversation becomes likely only after turn-shaped activity (speech,
-        // a 300-2500 ms pause, then speech again), or after sustained nearby speech.  It is held
-        // briefly so a natural pause does not make the UI and tuning flap.
-        if (speech_active) {
-            if (!previous_speech_active_ && silence_run_ms_ >= 300.0f &&
-                silence_run_ms_ <= 2500.0f) {
-                speech_turns_ = static_cast<uint8_t>(std::min<int>(speech_turns_ + 1, 3));
-            }
-            speech_run_ms_ += dt_ms;
-            silence_run_ms_ = 0.0f;
-            if (speech_turns_ >= 2 || speech_run_ms_ >= 2400.0f) {
-                conversation_hold_ms_ = 3500.0f;
-            }
-        } else {
-            silence_run_ms_ += dt_ms;
-            speech_run_ms_ = 0.0f;
-            conversation_hold_ms_ = std::max(0.0f, conversation_hold_ms_ - dt_ms);
-            if (silence_run_ms_ > 5000.0f) speech_turns_ = 0;
-        }
-        previous_speech_active_ = speech_active;
+        // 触发交给 Apple 式对话感知：判据是"佩戴者自己开口"，不是"附近有人在说话"。
+        // 旧轮次启发式（语音→300-2500 ms 停顿→再语音，或 2.4 s 持续语音）已删除：它检的是
+        // "这段音频像不像对话"，播客/电视/路人说话都能满足，方向就是错的。
+        conversation::Evidence evidence;
+        evidence.speech_active = speech_active;
+        evidence.voice_likelihood = voice;
+        evidence.level_dbfs = frame.broadband_dbfs;
+        evidence.own_voice = own_voice_proxy(frame, voice);
+        const conversation::Output awareness_out = awareness_.update(evidence, dt_ms);
 
-        if (conversation_hold_ms_ > 0.0f) {
-            command.conversation = ConversationState::likely;
-        } else if (speech_active) {
-            command.conversation = ConversationState::speech_nearby;
-        }
+        command.conversation = awareness_out.engaged
+                                   ? ConversationState::likely
+                                   : (speech_active ? ConversationState::speech_nearby
+                                                    : ConversationState::none);
 
         // The actions are deliberately distinct:
         //   * SONG_EQ asks the Mac renderer to adapt one of the three local songs.
@@ -445,13 +443,18 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
             // should not slam the bed to the floor.
             // 深度斜坡：从"刚听到人声"到"压到底"用 250 ms。原来是 600 ms，叠加 slew 的
             // 时间常数后实测要 700 ms 才压到 30%——用户的原话是"反应略慢"。
-            const float duck_depth = clamp01(speech_run_ms_ / 250.0f);
-            media_target =
-                100.0f - (100.0f - static_cast<float>(kDemoMediaFloorPercent)) * duck_depth;
+            // 下压深度由状态机给出（它自己负责 onset/duck/hold/restore 全程）。这里不再用
+            // "持续语音时长"算第二遍深度：两处各算一次，斜坡就会互相打架 —— 项目里已经有过
+            // 一次这样的记录（每秒级抖动让媒体只压到 46%）。
+            media_target = awareness_out.media_percent;
         } else if (command.tuning_mode == TuningMode::safety_hold) {
             // Never add gain in a loud non-speech environment.
             voice_target = 0.0f;
         }
+        // 对话感知一旦成立，媒体就下压，与选哪种调音模式无关：Apple 这条功能不挑模式，
+        // 而且"我在说话"本身不依赖环境判据。旧实现把下压挂在 external_voice_intent 分支里，
+        // 结果是安静环境下说话（环境判据 quiet → flat）根本不会下压。
+        media_target = awareness_out.media_percent;
         const float speech_target = voice_target;
         // Ramps are chosen to be seen and heard. `slew` uses attack_ms when the value rises and
         // release_ms when it falls, so the media ducking -- a fall -- was running on the 800 ms
@@ -517,11 +520,12 @@ void AdaptController::reset() {
     media_percent_ = 100.0f;
     valid_ms_ = 0.0f;
     invalid_ms_ = 0.0f;
-    speech_run_ms_ = 0.0f;
-    silence_run_ms_ = 1000.0f;
-    conversation_hold_ms_ = 0.0f;
-    speech_turns_ = 0;
-    previous_speech_active_ = false;
+    // 下压地板只有一处定义：kDemoMediaFloorPercent。把它推进状态机的参数里，
+    // 模块默认值只是同名同值的兜底。
+    conversation::Params awareness_params;
+    awareness_params.duck_floor_percent = static_cast<float>(kDemoMediaFloorPercent);
+    awareness_.set_params(awareness_params);
+    awareness_.reset();
 }
 
 const char* adapt_state_name(AdaptState state) {

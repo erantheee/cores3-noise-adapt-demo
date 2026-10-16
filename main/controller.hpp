@@ -4,6 +4,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "conversation_awareness.hpp"
+
 constexpr std::size_t kBandCount = 24;
 /// Largest analysis frame the window table will hold. The audio task uses 2048 samples.
 constexpr std::size_t kMaxAnalysisFrame = 4096;
@@ -185,11 +187,10 @@ private:
     float media_percent_ = 100.0f;
     float valid_ms_ = 0.0f;
     float invalid_ms_ = 0.0f;
-    float speech_run_ms_ = 0.0f;
-    float silence_run_ms_ = 1000.0f;
-    float conversation_hold_ms_ = 0.0f;
-    uint8_t speech_turns_ = 0;
-    bool previous_speech_active_ = false;
+    /// Apple 式对话感知：自身语音触发 → 下压媒体 → 保持 → 恢复。
+    /// 触发证据、时序参数与状态机都在 main/conversation_awareness.hpp 里；
+    /// 旧实现的轮次启发式（语音→停顿→再语音）已删除，理由见 docs/apple-conversation-awareness.md。
+    conversation::Awareness awareness_;
 };
 
 const char* adapt_state_name(AdaptState state);

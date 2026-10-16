@@ -14,6 +14,7 @@ set(COMMON_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/mic_capture.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/mic_decimator.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/voiceprint_gate.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../main/conversation_awareness.cpp
 )
 
 enable_testing()
@@ -48,3 +49,9 @@ add_test(NAME voiceprint_gate_test COMMAND voiceprint_gate_test)
 add_executable(context_window_test context_window_test.cpp)
 target_include_directories(context_window_test PRIVATE ../main)
 add_test(NAME context_window_test COMMAND context_window_test)
+
+# Apple 式对话感知（自身语音触发 → 下压媒体 → 保持 → 恢复）。只有它自己的状态机，
+# 不依赖分析器：证据由调用方填，所以这个套件能在几毫秒内跑完所有时序分支。
+add_executable(conversation_awareness_test conversation_awareness_test.cpp ${COMMON_SOURCES})
+target_include_directories(conversation_awareness_test PRIVATE ../main)
+add_test(NAME conversation_awareness_test COMMAND conversation_awareness_test)
