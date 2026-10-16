@@ -413,6 +413,9 @@ CORES3_PORT=/dev/cu.usbmodem101 sh tools/flash.sh
 ——100.1 Hz 六轴、186 秒、8 段人工标签（`silent` / `self_speech` / `fidget` / `chew_nod` /
 `speech_music`），另有宿主麦克风录音。会话用途写着 "self-voice separability probe from IMU only"。
 
+⚠️ **这批会话数据是本地数据**：`experiments/.gitignore` 忽略 `**/data/`，所以它不在仓库里。
+两个工具（导出脚本与回放工具）在仓库里，结论数字也抄进了本节；换机器重跑需要先有数据。
+
 ### 13.2 方法（可复现）
 
 ```bash
