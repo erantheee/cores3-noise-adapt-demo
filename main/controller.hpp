@@ -122,6 +122,20 @@ struct ContextResult {
     const char* class_name = "unknown";
 };
 
+/// 自身语音证据的来源策略。
+///
+/// 三条路的**可信度与失败方式完全不同**，所以它必须是一个显式策略、并且要进遥测：
+///   * `bone_only`：真机数据已否定骨传导判据（docs/apple-conversation-awareness.md 第 13 节），
+///     所以这条路的实际表现是"不动作"——安全，但功能看不见；
+///   * `near_field_demo`：用近场代理，演示时行为可见；代价是**旁人说话也会触发**（第 14 节），
+///     遥测必须报 `near_field`，不允许说成自身语音；
+///   * `disabled`：什么都不用，用于对比与排查。
+enum class EvidencePolicy : uint8_t {
+    bone_only,
+    near_field_demo,
+    disabled,
+};
+
 /// 自身语音证据。控制器只负责搬运与使用，判定在 main/bone_voice.hpp（骨传导）或
 /// conversation::near_field_own_voice()（近场代理）。
 ///
@@ -164,6 +178,9 @@ struct EarbudCommand {
     ConversationState conversation = ConversationState::none;
     /// 自身语音证据（这一拍实际生效的那一份，含来源）。
     OwnVoiceEvidence own_voice;
+    /// 产生这一帧时用的证据策略。遥测要报它，否则看数据的人无法判断
+    /// `own_voice_source=near_field` 是"演示模式"还是"故障"。
+    EvidencePolicy evidence_policy = EvidencePolicy::bone_only;
     /// Model telemetry. `AdaptController` never touches this field.
     ContextResult context;
 };
@@ -217,8 +234,11 @@ public:
     /// 缺证据时的行为默认 **fail-closed**：没有骨传导证据就不下压。理由见 .cpp 里那段注释
     /// （代理在真机静音素材上 35/75 拍误判）。回放实验与需要旧行为的调用方显式打开开关。
     void set_own_voice_evidence(const OwnVoiceEvidence& evidence) { own_voice_evidence_ = evidence; }
-    void set_allow_near_field_fallback(bool allow) { allow_near_field_fallback_ = allow; }
-    bool allow_near_field_fallback() const { return allow_near_field_fallback_; }
+
+    /// 证据来源策略。**默认 bone_only（fail-closed）**：没有骨传导证据就不下压。
+    /// 演示模式由调用方显式打开，并且会如实反映在遥测的 own_voice_source 上。
+    void set_evidence_policy(EvidencePolicy policy) { evidence_policy_ = policy; }
+    EvidencePolicy evidence_policy() const { return evidence_policy_; }
 
 private:
     uint32_t sequence_ = 0;
@@ -232,10 +252,11 @@ private:
     conversation::Awareness awareness_;
     conversation::Output awareness_out_{};
     OwnVoiceEvidence own_voice_evidence_{};
-    bool allow_near_field_fallback_ = false;
+    EvidencePolicy evidence_policy_ = EvidencePolicy::bone_only;
 };
 
 const char* adapt_state_name(AdaptState state);
 const char* environment_name(EnvironmentKind environment);
 const char* tuning_mode_name(TuningMode mode);
 const char* conversation_state_name(ConversationState state);
+const char* evidence_policy_name(EvidencePolicy policy);

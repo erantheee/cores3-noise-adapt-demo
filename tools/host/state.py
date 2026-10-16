@@ -671,6 +671,7 @@ class HostState:
                 "own_voice_confidence": frame.own_voice_confidence,
                 "own_voice_correlation": frame.own_voice_correlation,
                 "own_voice_source": frame.own_voice_source,
+                "evidence_policy": frame.evidence_policy,
                 "imu_gravity": frame.imu_gravity,
                 "imu_ok": frame.imu_ok,
                 "imu_motion": frame.imu_motion,

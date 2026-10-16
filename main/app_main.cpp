@@ -28,6 +28,14 @@ constexpr uint32_t kSampleRate = 48000;
 /// IMU 采样。BMI270 配成 100 Hz，任务每 5 ms 轮询一次数据就绪位（与 ear-context 实测一致）。
 /// 100 Hz 下 Nyquist 是 50 Hz：看不到骨传导语音振动的频带本身，但**包络**（音节率 2–8 Hz）
 /// 完整可观测，而判据用的就是包络相关性（见 main/bone_voice.hpp）。
+/// 自身语音证据策略（用户 2026-10-16 决定：**演示用近场代理**）。
+///
+/// 为什么是演示模式：骨传导判据已被本仓库自己的真机数据否定（docs/apple-conversation-awareness.md
+/// 第 13 节，与既有 AUC 0.0508 一致），而 fail-closed 下演示看不到任何行为。
+/// 代价写在文档第 15 节：**旁人说话也会触发**，所以遥测与面板必须显示 `near_field`。
+/// 换回产品默认只需把这一行改成 EvidencePolicy::bone_only。
+constexpr EvidencePolicy kEvidencePolicy = EvidencePolicy::near_field_demo;
+
 constexpr uint32_t kImuPollMs = 5;
 /// 队列深度。60 拍（6 秒）的缓冲：控制任务偶尔被分析/推理拖慢时，IMU 采样不丢。
 constexpr UBaseType_t kImuQueueDepth = 64;
@@ -102,7 +110,7 @@ void emit_command_json(const EarbudCommand& command) {
                 "\"own_voice_vibration\":%.4f,\"imu_gravity\":%.3f,"
                 "\"own_voice_source\":\"%s\","
                 "\"imu_ok\":%s,\"imu_motion\":%s,\"imu_drops\":%lu,"
-                "\"imu_samples\":%lu,"
+                "\"imu_samples\":%lu,\"own_voice_policy\":\"%s\","
                 "\"execution\":\"decision_only\",\"link\":\"simulated\","
                 "\"eq_gain_db\":[",
                 static_cast<unsigned long>(command.schema_version),
@@ -123,7 +131,8 @@ void emit_command_json(const EarbudCommand& command) {
                 command.own_voice.imu_ok ? "true" : "false",
                 command.own_voice.motion ? "true" : "false",
                 static_cast<unsigned long>(g_imu_drops),
-                static_cast<unsigned long>(g_imu_samples));
+                static_cast<unsigned long>(g_imu_samples),
+                evidence_policy_name(command.evidence_policy));
     for (std::size_t band = 0; band < kBandCount; ++band) {
         std::printf("%s%.1f", band == 0 ? "" : ",", static_cast<double>(command.eq_gain_db[band]));
     }
@@ -395,6 +404,7 @@ void processing_task(void*) {
 
     NoiseAnalyzer analyzer;
     AdaptController controller;
+    controller.set_evidence_policy(kEvidencePolicy);
     latency::LatencyProfiler profiler;
     latency::ProfilerOverhead overhead;
     int64_t next_latency_report_us = esp_timer_get_time() + kLatencyReportPeriodUs;

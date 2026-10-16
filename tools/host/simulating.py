@@ -204,7 +204,10 @@ class MockDevice:
                         # 模拟源固定报 bone（模拟一个 IMU 正常的设备）。
                         "own_voice_confidence": 0.82 if target["conversation"] == "LIKELY" else 0.05,
                         "own_voice_correlation": 0.90 if target["conversation"] == "LIKELY" else 0.03,
-                        "own_voice_source": "bone",
+                        # 模拟源与**当前固件配置**对齐：演示模式用近场代理。
+                        # 串口/面板上看到的 near_field 就是它，不是骨传导。
+                        "own_voice_source": "near_field",
+                        "own_voice_policy": "near_field_demo",
                         # 静止时的重力模长：模拟一个量程/单位正确的 ±4g 设备。
                         "imu_gravity": 9.81,
                         "imu_ok": True,

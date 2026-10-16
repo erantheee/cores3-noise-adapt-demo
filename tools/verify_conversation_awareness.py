@@ -75,6 +75,7 @@ class Frame:
     imu_gravity: float | None
     imu_drops: int | None
     imu_samples: int | None = None
+    evidence_policy: str | None = None
     problems: tuple[str, ...] = ()
 
 
@@ -221,6 +222,7 @@ def read_frames(port: str, phase: Phase, start_ms: float) -> None:
                     imu_gravity=f.imu_gravity,
                     imu_drops=f.imu_drops,
                     imu_samples=f.imu_samples,
+                    evidence_policy=f.evidence_policy,
                     problems=parsed.problems,
                 )
             )
@@ -314,8 +316,18 @@ def analyse(phases: list[Phase]) -> tuple[list[dict], list[str]]:
         evidence_ok = peak >= EVIDENCE_FLOOR and peak >= base + 0.15
         record("C5 自身语音证据成立", evidence_ok,
                f"说话相 own_voice 峰值 {peak:.2f} vs 静止相 {base:.2f}（门限 {EVIDENCE_FLOOR}）")
+        # C5b：来源必须与**帧里自报的策略**一致。用策略而不是硬编码 "bone"，
+        # 是因为演示模式（near_field_demo）是刻意的选择，而把演示说成骨传导才是错误。
+        expected_by_policy = {"bone_only": {"bone"}, "near_field_demo": {"near_field"},
+                              "disabled": {"none"}}
+        policy = next((f.evidence_policy for p in phases for f in p.frames if f.evidence_policy), None)
         sources = {f.own_voice_source for f in self_speech.frames if f.own_voice_source}
-        record("C5b 证据来源是骨传导", sources == {"bone"}, f"说话相的 source={sorted(sources)}")
+        if policy in expected_by_policy:
+            want = expected_by_policy[policy]
+            record(f"C5b 证据来源与策略一致（{policy}）", sources == want,
+                   f"说话相 source={sorted(sources)}，期望 {sorted(want)}")
+        else:
+            record("C5b 证据来源与策略一致", False, f"帧里没有 own_voice_policy（source={sorted(sources)}）")
 
     # C6 触发时序：证据 ≥0.5 到下压 <60% 的间隔
     if self_speech is not None:
@@ -343,18 +355,23 @@ def analyse(phases: list[Phase]) -> tuple[list[dict], list[str]]:
         record("C8 运动否决", motion.motion_frames > 0 and motion.media_min > 99,
                f"运动相 motion 帧 {motion.motion_frames}/{len(motion.frames)}，最低 media={motion.media_min}%")
 
-    # C9 旁人说话 / 外放不该触发
+    # C9 旁人说话 / 外放不该触发。演示模式（near_field_demo）下这条**预期会失败**：
+    # 代理只知道"有人说话"，这正是它的已知代价（docs/apple-conversation-awareness.md 第 15 节）。
+    # 失败信息里要写清这一点，否则看报告的人会以为是新故障。
     if other_speech is not None and other_speech.frames:
-        record("C9 旁人说话不触发", other_speech.ducked_frames == 0,
-               f"旁人相下压帧 {other_speech.ducked_frames}/{len(other_speech.frames)}，"
-               f"own_voice 峰值 {other_speech.own_voice_peak:.2f}")
+        detail = (f"旁人相下压帧 {other_speech.ducked_frames}/{len(other_speech.frames)}，"
+                  f"own_voice 峰值 {other_speech.own_voice_peak:.2f}")
+        if policy == "near_field_demo" and other_speech.ducked_frames > 0:
+            detail += "（演示模式已知代价：代理分不出自己与旁人）"
+        record("C9 旁人说话不触发", other_speech.ducked_frames == 0, detail)
 
     return checks, failures
 
 
 def make_phase(name: str, seconds: float, *, own_voice: float = 0.02, media: int = 100,
                duck_at_ms: float | None = None, duck_percent: int = 25, motion: bool = False,
-               imu_ok: bool = True, gravity: float = 9.81, imu_hz: float = 100.0) -> Phase:
+               imu_ok: bool = True, gravity: float = 9.81, imu_hz: float = 100.0,
+               policy: str = "bone_only", source: str | None = None) -> Phase:
     """造一个相的合成帧序列。只用于 `--selftest`：验证**检查器本身**在已知好坏的数据上
     会不会给出正确结论。真机数据永远从串口来。"""
     frames = []
@@ -367,7 +384,8 @@ def make_phase(name: str, seconds: float, *, own_voice: float = 0.02, media: int
             conversation="LIKELY" if ducked else "NONE", confidence=0.8,
             own_voice_confidence=own_voice,
             own_voice_correlation=0.9 if own_voice > 0.3 else 0.02,
-            own_voice_source="bone" if imu_ok else "none",
+            own_voice_source=source if source is not None else ("bone" if imu_ok else "none"),
+            evidence_policy=policy,
             imu_ok=imu_ok, imu_motion=motion, imu_gravity=gravity, imu_drops=0,
             imu_samples=int(t / 1000.0 * imu_hz)))
     return Phase(name=name, prompt="", seconds=seconds, frames=frames)
@@ -394,11 +412,23 @@ def selftest() -> int:
         ("imu_half_rate", dict(imu_hz=50.0,
                                self_speech=dict(own_voice=0.85, duck_at_ms=300.0)),
          ["C4c"]),  # 五个相各一条 C4c，断言名都归到这个前缀
+        # 演示模式：来源是 near_field、自己说话会下压——但**旁人说话也会下压**，
+        # 所以 C9 必须挂，而且信息里要写明那是已知代价。
+        ("demo_policy", dict(policy="near_field_demo", source="near_field",
+                             self_speech=dict(own_voice=0.85, duck_at_ms=300.0),
+                             other_speech=dict(own_voice=0.85, duck_at_ms=300.0)),
+         ["C9"]),
+        # 来源与策略不符（例如把代理说成骨传导）：C5b 必须抓住。
+        ("source_mismatch", dict(policy="near_field_demo", source="bone",
+                                 self_speech=dict(own_voice=0.85, duck_at_ms=300.0)),
+         ["C5b"]),
     ]
     failures = 0
     for name, overrides, expected in scenarios:
         defaults = dict(baseline=dict(), self_speech=dict(), quiet_after=dict(),
                         motion=dict(motion=True), other_speech=dict(own_voice=0.05))
+        global_policy = overrides.pop("policy", "bone_only")
+        global_source = overrides.pop("source", None)
         global_imu = overrides.pop("imu_ok", True)
         global_gravity = overrides.pop("gravity", 9.81)
         global_hz = overrides.pop("imu_hz", 100.0)
@@ -407,7 +437,8 @@ def selftest() -> int:
             kwargs = dict(defaults.get(phase_name, {}))
             kwargs.update(overrides.get(phase_name, {}))
             phases.append(make_phase(phase_name, seconds, imu_ok=global_imu,
-                                     gravity=global_gravity, imu_hz=global_hz, **kwargs))
+                                     gravity=global_gravity, imu_hz=global_hz,
+                                     policy=global_policy, source=global_source, **kwargs))
         checks, failed = analyse(phases)
         failing = sorted({c["check"].split()[0] for c in checks if not c["ok"]})
         ok = failing == sorted(expected)
@@ -467,7 +498,8 @@ def main() -> int:
                     confidence=f.confidence, own_voice_confidence=f.own_voice_confidence,
                     own_voice_correlation=f.own_voice_correlation, own_voice_source=f.own_voice_source,
                     imu_ok=f.imu_ok, imu_motion=f.imu_motion, imu_gravity=f.imu_gravity,
-                    imu_drops=None, imu_samples=f.imu_samples, problems=parsed.problems))
+                    imu_drops=None, imu_samples=f.imu_samples,
+                    evidence_policy=f.evidence_policy, problems=parsed.problems))
         phases = [phase]
     else:
         try:

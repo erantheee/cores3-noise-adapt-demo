@@ -376,22 +376,35 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
         evidence.speech_active = speech_active;
         evidence.voice_likelihood = voice;
         evidence.level_dbfs = frame.broadband_dbfs;
-        // 证据来源：骨传导（装了 IMU 且这一拍有数）是主路径；没有它时默认 **不动作**。
-        //
-        // 为什么 fail-closed，而不是退回近场代理兜底：代理的判据是"语音判据 × 电平"，
-        // 它在设备自己录的静音素材上把 35/75 拍判成语音并压到 25%（docs/apple-conversation-awareness.md
-        // 第 10.4 节），而且它分不出"自己说"和"旁边人说"。让它在 IMU 挂掉时兜底，
-        // 等于把"特征暂时不工作"变成"音乐时不时无故被压"——那比不动作难查得多。
-        // 代理本身保留：回放工具与实验还在用它检验判据形状，只是不进产品路径。
+        // 证据来源按**显式策略**决定，而不是"有就用"。三条路的可信度与失败方式不同，
+        // 而且遥测必须如实反映用了哪一条（own_voice_source 与 own_voice_policy）。
         OwnVoiceEvidence effective = own_voice_evidence_;
-        if (!effective.bone) {
-            effective.proxy = allow_near_field_fallback_;
-            effective.confidence = effective.proxy
-                                       ? conversation::near_field_own_voice(frame.broadband_dbfs, voice)
-                                       : 0.0f;
-            effective.correlation = 0.0f;
-            effective.vibration_rms = 0.0f;
-            effective.motion = false;
+        switch (evidence_policy_) {
+            case EvidencePolicy::bone_only:
+                // 产品默认 fail-closed：没有骨传导证据就不动作。骨传导判据已被真机数据否定
+                // （docs/apple-conversation-awareness.md 第 13 节），所以这条路的现实表现是
+                // "功能不动作"——比"用已知会误触发的代理兜底"安全，也好查。
+                if (!effective.bone) {
+                    const bool imu_ok = effective.imu_ok;
+                    effective = OwnVoiceEvidence{};
+                    effective.imu_ok = imu_ok;   // IMU 是否存活仍要如实上报
+                }
+                break;
+            case EvidencePolicy::near_field_demo:
+                // 演示模式：明知它只知道"有人说话"。所以 bone 必须是 false、proxy 必须是 true，
+                // 面板与串口都会显示 near_field —— 演示可以宽松，口径不能脏。
+                effective.bone = false;
+                effective.proxy = true;
+                effective.confidence =
+                    conversation::near_field_own_voice(frame.broadband_dbfs, voice);
+                effective.correlation = 0.0f;
+                effective.vibration_rms = 0.0f;
+                effective.motion = false;
+                break;
+            case EvidencePolicy::disabled:
+                effective = OwnVoiceEvidence{};
+                effective.imu_ok = own_voice_evidence_.imu_ok;
+                break;
         }
         evidence.own_voice = effective.confidence;
         awareness_out_ = awareness_.update(evidence, dt_ms);
@@ -404,6 +417,7 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
 
         // 遥测：报"实际生效的那一份"证据（骨传导或代理），而不是原始输入。
         command.own_voice = effective;
+        command.evidence_policy = evidence_policy_;
 
         // The actions are deliberately distinct:
         //   * SONG_EQ asks the Mac renderer to adapt one of the three local songs.
@@ -562,6 +576,15 @@ const char* tuning_mode_name(TuningMode mode) {
         case TuningMode::song_eq: return "SONG_EQ";
         case TuningMode::external_voice_intent: return "EXTERNAL_VOICE_INTENT";
         case TuningMode::safety_hold: return "SAFETY_HOLD";
+    }
+    return "UNKNOWN";
+}
+
+const char* evidence_policy_name(EvidencePolicy policy) {
+    switch (policy) {
+        case EvidencePolicy::bone_only: return "bone_only";
+        case EvidencePolicy::near_field_demo: return "near_field_demo";
+        case EvidencePolicy::disabled: return "disabled";
     }
     return "UNKNOWN";
 }

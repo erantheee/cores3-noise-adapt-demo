@@ -150,6 +150,10 @@ class CommandFrame:
     own_voice_source: str | None = None
     #: IMU 重力基线模长（m/s²）。静止时 ≈9.81 才说明量程与单位对；0 表示没有 IMU 数据。
     imu_gravity: float | None = None
+    #: 产生这一帧时用的证据策略：`bone_only` / `near_field_demo` / `disabled`。
+    #: 没有它，看数据的人分不清 `own_voice_source=near_field` 是"演示模式的刻意选择"
+    #: 还是"骨传导挂了在兜底"——这两种情况的处置完全不同。
+    evidence_policy: str | None = None
     #: IMU 这一拍是否有数，以及运动否决是否生效。None = 这一帧没报。
     imu_ok: bool | None = None
     imu_motion: bool | None = None
@@ -311,6 +315,7 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
     own_voice_correlation = _as_float(payload, "own_voice_correlation")
     own_voice_source = _as_str(payload, "own_voice_source")
     imu_gravity = _as_float(payload, "imu_gravity")
+    evidence_policy = _as_str(payload, "own_voice_policy")
     raw_imu_ok = payload.get("imu_ok")
     imu_ok = raw_imu_ok if isinstance(raw_imu_ok, bool) else None
     raw_imu_motion = payload.get("imu_motion")
@@ -438,6 +443,7 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
                 None if own_voice_correlation is None else d2(own_voice_correlation)
             ),
             imu_gravity=None if imu_gravity is None else d2(imu_gravity),
+            evidence_policy=evidence_policy,
             own_voice_source=own_voice_source,
             imu_ok=imu_ok,
             imu_motion=imu_motion,

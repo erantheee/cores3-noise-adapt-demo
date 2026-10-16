@@ -139,23 +139,49 @@ int main() {
         }
     }
 
-    // 没有证据就不下压（fail-closed）。这条断言是 2026-10-16 的近场代理实测逼出来的：
-    // 代理在设备自己录的静音素材上 35/75 拍误判并压到 25%，所以"证据没来"时宁可什么都不做。
-    // 没有它，IMU 挂掉会静默退化成"音乐时不时无故被压"，而那是最难查的一类故障。
+    // 证据策略三态。这一段是 2026-10-16 的真机数据逼出来的：
+    //   * 骨传导判据被本仓库自己的数据否定（docs/apple-conversation-awareness.md 第 13 节）；
+    //   * 近场代理只知道"有人说话"（第 14 节），所以它只能作为**显式的演示模式**，
+    //     而且遥测必须如实报 near_field；
+    //   * 默认 bone_only 是 fail-closed：没有证据就不动作。
     {
-        AdaptController no_evidence;
+        AdaptController no_evidence;   // 默认策略 = bone_only
         EarbudCommand without_evidence;
         for (int i = 0; i < 20; ++i) without_evidence = no_evidence.update(frame(-28, 0.8f), 150);
         check(without_evidence.media_percent == 100,
-              "clear speech with no own-voice evidence does not duck (fail-closed)");
+              "bone_only with no evidence does not duck (fail-closed)");
         check(without_evidence.conversation != ConversationState::likely,
               "no evidence never reaches the engaged conversation state");
+        check(without_evidence.own_voice.bone == false && without_evidence.own_voice.proxy == false,
+              "fail-closed reports neither bone nor proxy evidence");
+        check(std::string(evidence_policy_name(without_evidence.evidence_policy)) == "bone_only",
+              "the frame carries the policy that produced it");
 
-        no_evidence.set_allow_near_field_fallback(true);
-        EarbudCommand with_fallback;
-        for (int i = 0; i < 20; ++i) with_fallback = no_evidence.update(frame(-28, 0.8f), 150);
-        check(with_fallback.media_percent < 60,
-              "the proxy fallback still exists when a caller opts in");
+        AdaptController demo;
+        demo.set_evidence_policy(EvidencePolicy::near_field_demo);
+        EarbudCommand with_demo;
+        for (int i = 0; i < 20; ++i) with_demo = demo.update(frame(-28, 0.8f), 150);
+        check(with_demo.media_percent < 60, "near_field_demo ducks on nearby speech");
+        check(with_demo.own_voice.proxy && !with_demo.own_voice.bone,
+              "near_field_demo never claims bone evidence");
+
+        AdaptController off;
+        off.set_evidence_policy(EvidencePolicy::disabled);
+        EarbudCommand with_disabled;
+        for (int i = 0; i < 20; ++i) with_disabled = off.update(frame(-28, 0.8f), 150);
+        check(with_disabled.media_percent == 100, "disabled never ducks");
+
+        // 骨传导证据在 bone_only 下必须被采用（判据本身另在 bone_voice_test 里测）。
+        AdaptController bone;
+        OwnVoiceEvidence evidence;
+        evidence.bone = true;
+        evidence.imu_ok = true;
+        evidence.gravity = 9.81f;
+        evidence.confidence = 0.9f;
+        bone.set_own_voice_evidence(evidence);
+        EarbudCommand with_bone;
+        for (int i = 0; i < 20; ++i) with_bone = bone.update(frame(-28, 0.8f), 150);
+        check(with_bone.media_percent < 60, "bone_only ducks when bone evidence is present");
     }
 
     check(std::string(adapt_state_name(AdaptState::adjusting)) == "ADJUSTING",

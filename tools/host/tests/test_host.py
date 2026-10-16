@@ -239,13 +239,15 @@ def test_own_voice_frame() -> None:
         '"state":"ADJUSTING","environment":"VOICE","confidence":0.90,'
         '"conversation":"LIKELY","link":"simulated",'
         '"own_voice_confidence":0.812,"own_voice_correlation":0.934,'
-        '"own_voice_source":"bone","imu_ok":true,"imu_motion":false,'
+        '"own_voice_source":"bone","own_voice_policy":"bone_only",'
+        '"imu_ok":true,"imu_motion":false,'
         '"eq_gain_db":[0.0],"ambient_band_dbfs":[-60.0]}'
     )
     parsed = parse_line(line)
     check(not parsed.problems, f"有效 v3 帧不应有异常（实得 {parsed.problems}）")
     frame = parsed.value
     close(frame.own_voice_confidence, 0.81, "自身语音置信度按两位小数读入")
+    eq(frame.evidence_policy, "bone_only", "证据策略原样读出（bone_only）")
     close(frame.own_voice_correlation, 0.93, "相关系数读入")
     eq(frame.own_voice_source, "bone", "来源原样读出，不让上位机猜")
     eq(frame.imu_ok, True, "imu_ok 读为布尔真")
@@ -259,10 +261,13 @@ def test_own_voice_frame() -> None:
         '"state":"HOLDING","environment":"QUIET","confidence":0.50,'
         '"link":"simulated","own_voice_confidence":0.400,'
         '"own_voice_correlation":0.000,"own_voice_source":"near_field",'
+        '"own_voice_policy":"near_field_demo",'
         '"imu_ok":false,"imu_motion":false}'
     )
     check(not fallback.problems, f"代理帧不应有异常（实得 {fallback.problems}）")
     eq(fallback.value.own_voice_source, "near_field", "代理来源要能读出来")
+    eq(fallback.value.evidence_policy, "near_field_demo",
+       "演示模式必须能读出来——它和'骨传导挂了在兜底'是两件事")
 
     # 旧固件（v2）：不发这几个字段，读成 None，而不是 0.0。
     older = parse_line(
