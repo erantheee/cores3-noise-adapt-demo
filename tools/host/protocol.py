@@ -51,6 +51,29 @@ CAPTURE_CHUNK_SAMPLES = 320
 KNOWN_STATES = ("OBSERVING", "ADJUSTING", "HOLDING", "RECOVERING", "MIC FAULT")
 KNOWN_ENVIRONMENTS = ("QUIET", "NOISY", "VOICE", "LOUD")
 
+#: 端侧听音情境模型的 9 个类别，顺序就是 main/listening_model.h 里的类别下标顺序
+#: （export_c.py / `kClassNames`）。融合第二轮（2026-10-16）起固件在 `earbud_command`
+#: 里报 `context` / `context_score` / `context_valid` / `context_us`；旧固件不发这四个字段。
+#:
+#: 这 9 个字符串**不是**上位机可以改的显示文本，它们同时是模型输出的标识：翻译成中文
+#: 只发生在 state.py 的 `context_text()`，别在这里做映射。
+CONTEXT_CLASSES = (
+    "babble",
+    "horn",
+    "music",
+    "near_voice",
+    "other",
+    "quiet",
+    "steady",
+    "street",
+    "wind",
+)
+
+#: `context_valid` 为 false 时固件报的占位类别（窗口还没攒够 2 秒，或输入刚被打断）。
+#: 它**不在**上面那 9 类里：把"还没判断"和"判断为 unknown 情境"混为一谈，界面就会
+#: 把预热期显示成一个结论。
+CONTEXT_UNKNOWN = "unknown"
+
 
 #: 端侧自己测量的阶段。其余阶段由对端上报（本机目前没有对端，所以它们的 n 一直是 0）。
 #: 与 main/latency_profiler.hpp 的 Stage 枚举顺序一致。
@@ -111,6 +134,13 @@ class CommandFrame:
     noise_reduction_db: float | None = None
     #: 设备实际要施加的调音。None 表示这一帧没有报（旧固件不发 eq_gain_db）。
     tuning: Tuning | None = None
+    #: 端侧情境模型（v0.2-s3）的输出。None 表示这一帧没有报这四个字段（融合第二轮之前的
+    #: 固件）。`context_valid=False` 是"窗口还没攒够 2 秒"，不是"模型说是 unknown"。
+    context: str | None = None
+    context_score: float | None = None
+    context_valid: bool | None = None
+    #: 一次前向的耗时，微秒。设备逐帧实报，不是估算。
+    context_us: int | None = None
     schema_version: int = SCHEMA_VERSION
     #: 越界或无法解释的字段说明。空表示这一帧通过了全部校验。
     problems: tuple[str, ...] = ()
@@ -250,6 +280,13 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
     mode = _as_str(payload, "mode") or "LEGACY"
     conversation = _as_str(payload, "conversation") or "NONE"
     execution = _as_str(payload, "execution") or "decision_only"
+    context = _as_str(payload, "context")
+    context_score = _as_float(payload, "context_score")
+    context_us = _as_int(payload, "context_us")
+    raw_valid = payload.get("context_valid")
+    # 只在字段存在时认它：融合第二轮之前的固件根本不发这四个字段，把它们当成"缺字段"
+    # 会把每一帧历史日志都标成异常。
+    context_valid: bool | None = raw_valid if isinstance(raw_valid, bool) else None
 
     missing = [
         name
@@ -321,6 +358,28 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
     if environment not in KNOWN_ENVIRONMENTS:
         problems.append(f"未知环境 {environment!r}")
 
+    # 情境模型那四个字段是一组，一起校验。规则按"设备实际会发什么"写：
+    #   * 只发了一部分 → 说不清这一帧到底有没有模型输出；
+    #   * `context_valid=false` 时固件报占位类别 `unknown`——占位符不该被当成第 10 个类别，
+    #     反过来，valid=false 却报了一个真类别是自相矛盾；
+    #   * `context_valid=true` 时类别必须是那 9 个之一，置信度必须在 [0,1]。
+    context_fields = (context, context_score, context_us, raw_valid)
+    reported = [value is not None for value in context_fields]
+    if any(reported) and not all(reported):
+        problems.append("情境字段只报了一部分（context/context_score/context_valid/context_us 是一组）")
+    elif context_valid is True:
+        if context not in CONTEXT_CLASSES:
+            problems.append(f"未知情境类别 {context!r}")
+        if context_score is None or not 0.0 <= context_score <= 1.0:
+            problems.append(f"情境置信度 {context_score} 不在 [0,1]")
+        if context_us is not None and context_us < 0:
+            problems.append(f"情境推理耗时 {context_us} µs 为负数")
+    elif context_valid is False:
+        if context is not None and context != CONTEXT_UNKNOWN:
+            problems.append(
+                f"context_valid=false 却报了类别 {context!r}（占位符应是 {CONTEXT_UNKNOWN!r}）"
+            )
+
     return ParsedLine(
         value=CommandFrame(
             sequence=sequence,
@@ -338,6 +397,10 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
             execution=execution,
             ambient_band_dbfs=ambient,
             tuning=tuning,
+            context=context,
+            context_score=None if context_score is None else d2(context_score),
+            context_valid=context_valid,
+            context_us=context_us,
             schema_version=schema,
         ),
         json_line=True,

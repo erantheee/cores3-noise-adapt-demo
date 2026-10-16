@@ -125,6 +125,28 @@ check(text("age") !== "", "顶部显示数据年龄");
 
 if (frame) {
   check(text("env") === frame.environment_text, `环境显示为 ${frame.environment_text}`);
+  // 情境卡（融合第二轮）：三种状态必须被分成三种显示。把"还没判断"画成一个类别，
+  // 或把"固件没报"画成一格空白，都会让看板的人以为模型给出了一个结论。
+  if (frame.context_valid === null || frame.context_valid === undefined) {
+    check(text("ctx") === "—", "固件没报情境字段时该格显示 —，不显示任何类别");
+    check(text("ctx-note").includes("未上报"), "并写明是固件没有上报");
+  } else if (!frame.context_valid) {
+    check(text("ctx") === "感知中…", "窗口没满时显示「感知中…」，不显示类别");
+    check(text("ctx-raw").includes("2 秒"), "并写明还差什么");
+  } else {
+    check(text("ctx") === frame.context_text,
+          `情境显示为 ${frame.context_text}（设备报的是 ${frame.context}）`);
+    check(text("ctx").length > 0 && !text("ctx").includes("未知"),
+          "类别必须有中文映射，不得落到「未知(...)」兜底");
+    const pct = Math.round(frame.context_score * 100);
+    check(text("ctx-raw").includes(String(pct)), `同时显示设备实报的置信度 ${pct}%`);
+    if (frame.context_us !== null && frame.context_us !== undefined) {
+      check(text("ctx-note").includes(String(frame.context_us)),
+            "显示这次前向的实测耗时");
+    }
+    check(text("ctx-note").includes("不参与决策"),
+          "必须写明模型现在不参与决策——否则这一格会被读成产品行为");
+  }
   check(text("state") === frame.state_text, `动作显示为 ${frame.state_text}`);
   // 「现实人声增益意图」这一格显示的是 external_voice_gain_db。旧断言比的是
   // speech_gain_db——提交 eb53704 把这一格换了语义之后它就成了假断言：真机上两者恰好都是
@@ -308,7 +330,8 @@ if (failed.length) {
   process.exit(1);
 }
 // 打印关键格子，便于人工核对"界面上到底会显示什么"
-console.log("  环境:", text("env"), "| 动作:", text("state"),
+console.log("  环境:", text("env"), "| 情境（端侧模型）:", text("ctx"),
+            "| 动作:", text("state"),
             "| 语音段增益（调音幅度）:", text("gain"),
             "| 媒体:", text("media"), "| 链路:", text("link"));
 console.log("  数据年龄:", text("age"), "| 帧数:", text("frames"), "| 丢帧:", text("lost"));

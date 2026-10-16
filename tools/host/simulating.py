@@ -47,6 +47,20 @@ TARGETS = {
              "conversation": "NONE"},
 }
 
+#: 模拟的情境模型输出：固件那 4 个环境各自对应的类别与分数。**这是模拟值，不是测量值**——
+#: 它的用途只是让面板在 `--mock` 下把情境卡跑起来（真机现在的实际输出见 plan-status 第 29 项：
+#: 安静房间里模型几乎总是报 other）。
+CONTEXT_FOR_ENVIRONMENT = {
+    "QUIET": ("quiet", 0.93),
+    "NOISY": ("steady", 0.88),
+    "VOICE": ("near_voice", 0.72),
+    "LOUD": ("street", 0.61),
+}
+
+#: 固件要攒满 2 秒窗（20 帧 × 100 ms）才给判断，在那之前报 valid=false + 占位类别 unknown。
+#: 模拟源必须复刻这一段，否则面板会在那两秒里显示一个凭空的类别。
+CONTEXT_WARMUP_S = 2.0
+
 #: 环境序列与各段时长（秒）。刻意包含升段与降段，让面板上的趋势线有形状。
 SCHEDULE: tuple[tuple[str, float], ...] = (
     ("QUIET", 5.0),
@@ -129,6 +143,12 @@ class MockDevice:
         self._gain = self._ramp(self._gain, min(target["gain"], DEMO_SPEECH_GAIN_DB), dt)
         self._media = self._ramp(self._media, float(target["media"]), dt, tau_s=1.6)
 
+        # 情境模型：前 2 秒窗没满，固件报 valid=false；之后按环境给一个类别。一次前向的
+        # 耗时取真机实测的量级（p50 151–158 µs，见 plan-status 第 29 项）。
+        context_valid = at_s >= CONTEXT_WARMUP_S
+        context_class, context_score = CONTEXT_FOR_ENVIRONMENT[environment]
+        context_us = int(155 + 25 * self._random.random())
+
         # 24 段建议的形状按模式给，与固件一致：人声模式抬 8–16 段（两端 0.75 收口），
         # song_eq 抬全部频段但夹在 4 dB 内，flat / safety_hold 一律 0 dB。
         mode = str(target["mode"])
@@ -169,6 +189,13 @@ class MockDevice:
                         "execution": "decision_only",
                         "link": "simulated",
                         "eq_gain_db": bands,
+                        # 情境模型（融合第二轮）。字段名、占位符、以及"窗没满就报 false"的
+                        # 行为都照 main/app_main.cpp 的实发内容来，这样面板的三种状态
+                        # （没有字段 / 还没判断 / 有判断）在 --mock 下都能被看到。
+                        "context": context_class if context_valid else "unknown",
+                        "context_score": round(context_score, 3) if context_valid else 0.0,
+                        "context_valid": context_valid,
+                        "context_us": context_us,
                         # 24 段环境谱：面板用它画趋势与"设备实测"的出处。
                         "ambient_band_dbfs": [round(-72.0 + 40.0 * (i / 23.0), 1)
                                               for i in range(24)],

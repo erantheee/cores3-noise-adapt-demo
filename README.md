@@ -210,7 +210,7 @@ CI 里这一步跑在固件构建**之前**（[`.github/workflows/build.yml`](.g
 上位机（`tools/host/`）另有一套自己的自测，同样是纯 Python、秒级、不需要设备：
 
 ```bash
-python3 tools/host/tests/test_host.py            # 45 组、2735 条断言
+python3 tools/host/tests/test_host.py            # 47 组、4205 条断言
 node tools/host/tests/render_check.js <快照.json> # 可选：用 DOM 桩真跑一遍界面渲染（60 条通过、0 条失败）
 ```
 
@@ -458,7 +458,7 @@ Mac 的 `applied` / `idle` / `silent` / `bypass` / `unavailable`（有证据：
 ### 上位机自测
 
 ```bash
-python3 tools/host/tests/test_host.py      # 45 组、2735 条断言，不需要设备、不需要串口
+python3 tools/host/tests/test_host.py      # 47 组、4205 条断言，不需要设备、不需要串口
 node tools/host/tests/render_check.js <快照.json>   # 用 DOM 桩真跑一遍 render()：60 条通过、0 条失败
 ```
 

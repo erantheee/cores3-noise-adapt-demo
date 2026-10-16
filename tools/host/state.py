@@ -31,6 +31,7 @@ from typing import Any, Callable
 
 from .protocol import (
     CAPTURE_RATE_HZ,
+    CONTEXT_CLASSES,
     DEMO_SPEECH_GAIN_DB,
     KNOWN_ENVIRONMENTS,
     KNOWN_STATES,
@@ -87,6 +88,34 @@ SOURCE_TEXT = {
     "mock": "模拟源（无设备）",
     "replay": "回放（历史日志）",
 }
+
+#: 端侧情境模型的 9 类。中文只在这一层映射（同 state.py 顶部的纪律），固件与协议里始终是
+#: 9 个 ASCII 标识。译名与 ear-context 面板（experiments/ear-context/main/ui.cpp 的
+#: names[]）逐字一致：同一个模型在两块屏幕上不该有两个说法。
+CONTEXT_TEXT = {
+    "babble": "嘈杂人声",
+    "horn": "鸣笛声",
+    "music": "音乐",
+    "near_voice": "近处人声",
+    "other": "其他声音",
+    "quiet": "安静",
+    "steady": "持续噪声",
+    "street": "街道声",
+    "wind": "风声",
+}
+
+
+def context_text(value: str | None) -> str:
+    """模型类别的显示文本。
+
+    `unknown` 单独处理：它是"窗口还没攒够 2 秒"的占位符，不是第 10 个类别。把它显示成
+    "未知情境"会让人以为模型看过并给出了否定答案。
+    """
+    if value is None:
+        return "—"
+    if value == "unknown":
+        return "尚未判断"
+    return CONTEXT_TEXT.get(value, f"未知({value})")
 
 
 def environment_text(value: str | None) -> str:
@@ -254,6 +283,7 @@ class HostState:
         self._expected_chunk: int | None = None
         self._last_state: str | None = None
         self._last_environment: str | None = None
+        self._last_context: str | None = None
         self._last_mic_valid: bool | None = None
 
     # ------------------------------------------------------------------ 连接
@@ -383,6 +413,9 @@ class HostState:
                 "state": frame.state,
                 "mode": frame.mode,
                 "conversation": frame.conversation,
+                # 情境类别（模型的判断）。与 env（固件自己的四分类）是两个不同的量，
+                # 并排看它们的**分歧**才是这个模型现阶段的用处。窗没满时为 None。
+                "ctx": frame.context if frame.context_valid else None,
             }
         )
 
@@ -392,6 +425,15 @@ class HostState:
         if frame.environment != self._last_environment:
             self.log("environment", f"环境 → {environment_text(frame.environment)}", frame.environment)
             self._last_environment = frame.environment
+        # 情境只在**有效**时才记变更。预热期（窗没满）每一帧都是 unknown，若按它记变更，
+        # 开机会刷出一串"情境 → 尚未判断"，把真正的那次变化埋掉。
+        if frame.context_valid and frame.context != self._last_context:
+            self.log(
+                "context",
+                f"情境 → {context_text(frame.context)}（模型 {frame.context_score:.2f}）",
+                frame.context,
+            )
+            self._last_context = frame.context
 
         # 麦克风有效性没有单独字段，只能从 state 判断（固件在 mic_valid 为假时进 mic_fault）。
         mic_valid = frame.state != "MIC FAULT"
@@ -624,6 +666,13 @@ class HostState:
                 "state_text": state_text(frame.state),
                 "environment": frame.environment,
                 "environment_text": environment_text(frame.environment),
+                # 端侧情境模型。四个字段整体为 None 表示这一帧没报（融合第二轮之前的固件），
+                # `valid=false` 表示报了、但窗口还没攒够——界面必须把这两件事分开显示。
+                "context": frame.context,
+                "context_text": context_text(frame.context),
+                "context_score": frame.context_score,
+                "context_valid": frame.context_valid,
+                "context_us": frame.context_us,
                 "mode": frame.mode,
                 "conversation": frame.conversation,
                 "execution": frame.execution,
@@ -712,12 +761,18 @@ def self_check() -> list[str]:
     for name in KNOWN_ENVIRONMENTS:
         if name not in ENVIRONMENT_TEXT:
             notes.append(f"缺少环境中文映射: {name}")
+    # 模型的 9 个类别同理：固件换了类别表而这里没跟上，面板会显示 `未知(horn)`——看得见，
+    # 但不如在单测里就红。
+    for name in CONTEXT_CLASSES:
+        if name not in CONTEXT_TEXT:
+            notes.append(f"缺少情境类别中文映射: {name}")
     return notes
 
 
 __all__ = [
     "CONTROL_PERIOD_MS",
     "CAPTURE_PERIOD_MS",
+    "CONTEXT_TEXT",
     "ENVIRONMENT_TEXT",
     "LINK_TEXT",
     "SOURCE_TEXT",
@@ -728,6 +783,7 @@ __all__ = [
     "Problem",
     "Stats",
     "capture_text",
+    "context_text",
     "environment_text",
     "link_text",
     "self_check",

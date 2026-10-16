@@ -132,6 +132,18 @@
       <div class="value" id="env">—</div>
       <div class="sub" id="env-raw">—</div>
     </div>
+    <!--
+      情境 = 端侧小模型（v0.2-s3，92 维窗）的判断。它与左边「环境」**不是一回事**：
+      环境是固件自己的四分类，情境是模型的九分类。并排放就是为了看清两者的分歧——
+      这个模型现在还没有被信任到能参与决策（integration-plan.md 第二轮）。
+    -->
+    <div class="card" id="ctx-card">
+      <h2>情境（端侧模型）</h2>
+      <div class="value" id="ctx">—</div>
+      <div class="meter"><span id="ctx-bar"></span></div>
+      <div class="sub" id="ctx-raw">—</div>
+      <div class="sub" id="ctx-note">9 分类 · 只显示，不参与决策</div>
+    </div>
     <div class="card">
       <h2>当前动作</h2>
       <div class="value small" id="state">—</div>
@@ -338,6 +350,37 @@ function renderAlerts(s) {
     .join("");
 }
 
+// 情境卡有三种状态，必须分开显示。把"还没判断"画成一个类别，就是在给一个错误解释——
+// 这和固件里不把 −120 dBFS 的填充值当成地板是同一条纪律。
+//   * 四个字段一个都没有：这台固件还没上模型（融合第二轮之前的版本）
+//   * 报了但 valid=false：窗口还没攒满 2 秒，或输入刚被打断
+//   * valid=true：真正的判断，分数与一次前向的耗时都是设备实报的
+function renderContext(f) {
+  const bar = $("ctx-bar");
+  const unknown = f.context_valid === null || f.context_valid === undefined;
+  if (unknown) {
+    $("ctx").textContent = "—";
+    bar.style.width = "0%";
+    $("ctx-raw").textContent = "这一帧没有情境字段";
+    $("ctx-note").textContent = "固件未上报模型输出（融合第二轮之前的版本）";
+    return;
+  }
+  if (!f.context_valid) {
+    $("ctx").textContent = "感知中…";
+    bar.style.width = "0%";
+    $("ctx-raw").textContent = "窗口未满 2 秒";
+    $("ctx-note").textContent = "9 分类 · 只显示，不参与决策";
+    return;
+  }
+  const pct = Math.max(0, Math.min(100, (f.context_score || 0) * 100));
+  $("ctx").textContent = f.context_text;
+  bar.style.width = pct + "%";
+  $("ctx-raw").textContent = `${f.context} · ${pct.toFixed(0)}%`;
+  $("ctx-note").textContent = f.context_us === null || f.context_us === undefined
+    ? "9 分类 · 只显示，不参与决策"
+    : `前向 ${f.context_us} µs · 只显示，不参与决策`;
+}
+
 function render(s) {
   lastSnapshot = s;
   $("source-text").textContent = s.source_text + (s.source_detail ? " · " + s.source_detail : "");
@@ -353,11 +396,14 @@ function render(s) {
 
   const f = s.frame;
   if (!f) {
-    ["env", "state", "gain", "media", "link", "conf"].forEach((id) => ($(id).textContent = "—"));
+    ["env", "ctx", "state", "gain", "media", "link", "conf"].forEach((id) => ($(id).textContent = "—"));
+    $("ctx-bar").style.width = "0%";
+    $("ctx-note").textContent = "9 分类 · 只显示，不参与决策";
   } else {
     $("env").textContent = f.environment_text;
     $("env").className = "value env-" + f.environment;
     $("env-raw").textContent = f.environment;
+    renderContext(f);
     $("state").textContent = f.state_text;
     $("state-raw").textContent = `${f.state} · ${f.conversation || "NONE"}`;
     $("gain").textContent = fmt(f.external_voice_gain_db, 2, " dB");

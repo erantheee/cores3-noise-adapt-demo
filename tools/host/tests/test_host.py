@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[2]  # tools/
 sys.path.insert(0, str(ROOT))
 
 from host.protocol import (  # noqa: E402
+    CONTEXT_CLASSES,
     DEMO_SPEECH_GAIN_DB,
     MAX_NOISE_REDUCTION_DB,
     MAX_SPEECH_GAIN_DB,
@@ -178,6 +179,85 @@ def test_new_firmware_frame_carries_tuning() -> None:
     )
     sparse = parse_line(tilted).value
     check(not sparse.tuning.shape_is_speech_band, "不连续的抬升不应被判成语音段形状")
+
+
+def test_context_model_frame() -> None:
+    """融合第二轮（2026-10-16）起，帧里多了端侧情境模型的四个字段。
+
+    形状照真机实发抄（见 plan-status 第 29 项的实测表）：有效帧报类别 + 置信度 + 一次前向
+    的微秒数；窗没满时报 `context="unknown"` 且 `context_valid=false`。
+    """
+    line = (
+        '{"type":"earbud_command","schema":2,"sequence":7,"timestamp_ms":700,'
+        '"speech_gain_db":0.00,"external_voice_gain_db":0.00,"media_percent":100,'
+        '"state":"OBSERVING","environment":"QUIET","confidence":0.80,'
+        '"link":"simulated","context":"near_voice","context_score":0.873,'
+        '"context_valid":true,"context_us":158}'
+    )
+    parsed = parse_line(line)
+    check(not parsed.problems, f"有效情境帧不应有异常（实得 {parsed.problems}）")
+    frame = parsed.value
+    eq(frame.context, "near_voice", "情境类别原样读出（协议里永远是 ASCII 标识）")
+    close(frame.context_score, 0.87, "置信度按两位小数读入")
+    eq(frame.context_valid, True, "context_valid 读为布尔真")
+    eq(frame.context_us, 158, "一次前向的耗时是设备实报的整数微秒")
+
+    # 窗没满：占位类别 + valid=false。这一帧必须**没有**异常——它是正常的预热帧。
+    warmup = (
+        '{"type":"earbud_command","schema":2,"sequence":1,"timestamp_ms":100,'
+        '"speech_gain_db":0.00,"external_voice_gain_db":0.00,"media_percent":100,'
+        '"state":"OBSERVING","environment":"QUIET","confidence":0.80,'
+        '"link":"simulated","context":"unknown","context_score":0.000,'
+        '"context_valid":false,"context_us":0}'
+    )
+    warm = parse_line(warmup)
+    check(not warm.problems, f"预热帧（窗没满）不应有异常（实得 {warm.problems}）")
+    eq(warm.value.context_valid, False, "预热帧的 context_valid 为假")
+    eq(warm.value.context, "unknown", "预热帧报占位类别")
+
+    # 旧固件：一个情境字段都没有，也不能被当成缺字段。
+    legacy = parse_line(
+        '{"type":"earbud_command","schema":1,"sequence":1,"timestamp_ms":0,'
+        '"speech_gain_db":1.50,"noise_reduction_db":4.10,"media_percent":92,'
+        '"state":"ADJUSTING","environment":"NOISY","confidence":0.90,"link":"simulated"}'
+    )
+    check(not legacy.problems, f"没有情境字段的旧帧不应有异常（实得 {legacy.problems}）")
+    eq(legacy.value.context, None, "旧帧的 context 为 None（不是空串）")
+    eq(legacy.value.context_valid, None, "旧帧的 context_valid 为 None：区分没报与报了假")
+
+
+def test_context_model_is_not_guessed() -> None:
+    """设备报了自相矛盾的情境字段时要能被发现，不能静默当正常帧。
+
+    这个项目里最贵的一类错误是"设备在说别的事，而上位机按自己的理解显示"：
+    `valid=false` 却带一个真类别、类别不在那 9 个里、只报了一半字段——三种都要留下痕迹。
+    """
+    base = (
+        '"type":"earbud_command","schema":2,"sequence":7,"timestamp_ms":700,'
+        '"speech_gain_db":0.00,"external_voice_gain_db":0.00,"media_percent":100,'
+        '"state":"OBSERVING","environment":"QUIET","confidence":0.80,"link":"simulated"'
+    )
+    contradiction = parse_line(
+        "{" + base + ',"context":"music","context_score":0.900,"context_valid":false,"context_us":150}'
+    )
+    check(any("context_valid=false" in p for p in contradiction.problems),
+          f"valid=false 带真类别要报异常（实得 {contradiction.problems}）")
+
+    unknown_class = parse_line(
+        "{" + base + ',"context":"siren","context_score":0.9,"context_valid":true,"context_us":150}'
+    )
+    check(any("未知情境类别" in p for p in unknown_class.problems),
+          f"未知类别要报异常（实得 {unknown_class.problems}）")
+
+    bad_score = parse_line(
+        "{" + base + ',"context":"music","context_score":1.4,"context_valid":true,"context_us":150}'
+    )
+    check(any("情境置信度" in p for p in bad_score.problems),
+          f"置信度越界要报异常（实得 {bad_score.problems}）")
+
+    partial = parse_line("{" + base + ',"context":"music","context_valid":true}')
+    check(any("只报了一部分" in p for p in partial.problems),
+          f"只报一半字段要报异常（实得 {partial.problems}）")
 
 
 def test_old_firmware_frame_still_reads() -> None:
@@ -693,6 +773,20 @@ def test_mock_device_is_wire_compatible() -> None:
             check(max(frame["eq_gain_db"]) == 0.0, f"{frame['mode']} 不得给正增益")
         check(0 <= frame["media_percent"] <= 100, "模拟媒体音量在 0–100")
         check(frame["link"] == "simulated", "模拟源的 link 必须是 simulated")
+        # 情境字段（融合第二轮）。最需要钉住的是**预热段**：真机在窗攒满 2 秒之前报
+        # valid=false，模拟源要是跳过这一段，面板在 --mock 下就会显示一个真机不可能给出的
+        # 类别——而"界面在假数据上看起来对"正是这类工具最容易骗人的地方。
+        check("context_valid" in frame, "模拟帧必须带情境字段")
+        if frame["timestamp_ms"] < 2000:
+            check(frame["context_valid"] is False,
+                  f"{frame['timestamp_ms']} ms 时窗还没满，context_valid 必须是 false")
+            check(frame["context"] == "unknown", "窗没满时报占位类别 unknown")
+        else:
+            check(frame["context_valid"] is True, "窗满之后必须给出判断")
+            check(frame["context"] in CONTEXT_CLASSES,
+                  f"模拟类别必须在模型的 9 类里（实得 {frame['context']}）")
+            check(0.0 <= frame["context_score"] <= 1.0, "模拟置信度在 [0,1]")
+            check(frame["context_us"] > 0, "模拟前向耗时为正值")
 
 
 def test_mock_can_reproduce_faults() -> None:
@@ -1454,6 +1548,8 @@ def main() -> int:
         test_mac_default_output_route,
         test_command_frame_full,
         test_new_firmware_frame_carries_tuning,
+        test_context_model_frame,
+        test_context_model_is_not_guessed,
         test_old_firmware_frame_still_reads,
         test_command_frame_noise_reduction_sign,
         test_command_frame_rejects_bad_input,
