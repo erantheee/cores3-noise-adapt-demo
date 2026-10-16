@@ -6,8 +6,12 @@
 // 所以"第 N 拍触发"与真机上的第 N 拍是同一个刻度。重采样到 48 kHz 是因为分析器的
 // 24 段中心频率按 48 kHz 标定；素材一般是 16 kHz，插值上来即可（判据只看 300-4000 Hz）。
 //
-// **素材口径**：记录/声音类别/ 下的素材是 Mac 麦克风录的（状态总表第 38h 项），
-// 只能验证"触发与时序"，不能用来判定设备判据阈值。
+// **素材口径（两条，都会让结论外推失效）**：
+//   1. 记录/声音类别/ 下的素材是 **Mac 麦克风** 录的（状态总表第 38h 项），判据阈值是在
+//      设备 ES7210 上标定的，所以那批素材只能验证"触发与时序"的形状；
+//   2. 设备端录音只有 **16 kHz**（串口 48 kHz 需要 128 kB/s，可用吞吐 92 kB/s，物理上传不了），
+//      重采样到 48 kHz 后 8 kHz 以上是空的：**涉及高频段的判据会失真**。
+//      工具会对低于 48 kHz 的素材显式警告，不要拿这类结论去改设备判据。
 //
 // 用法：
 //   g++ -std=c++17 -O2 -I main -o /tmp/convreplay tools/conversation_replay.cpp \
@@ -120,6 +124,10 @@ int main(int argc, char** argv) {
     }
     const std::vector<int16_t> audio = resample(wav);
     const double audio_seconds = static_cast<double>(wav.frames) / wav.rate;
+    if (wav.rate < 48000) {
+        std::printf("⚠️ 素材是 %u Hz：重采样到 48 kHz 后 8 kHz 以上无内容，"
+                    "涉及高频段的判据会失真，结论不可直接外推到设备。\n", wav.rate);
+    }
 
     NoiseAnalyzer analyzer;
     AdaptController controller;
