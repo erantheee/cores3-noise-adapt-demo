@@ -156,6 +156,9 @@ class CommandFrame:
     #: IMU 队列累计丢弃数（诊断计数）。它是"与音频任务同跑会不会丢采样"的直接证据：
     #: 真机验证看的是它在整个验证过程里有没有增长，而不是某一帧的绝对值。
     imu_drops: int | None = None
+    #: 累计采样数。验证脚本用它算真机采样率（Δsamples/Δt 应为 100 Hz）——
+    #: "IMU 跑在 100 Hz"这句话必须是量出来的，不能只在实验记录里写着。
+    imu_samples: int | None = None
     schema_version: int = SCHEMA_VERSION
     #: 越界或无法解释的字段说明。空表示这一帧通过了全部校验。
     problems: tuple[str, ...] = ()
@@ -313,6 +316,7 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
     raw_imu_motion = payload.get("imu_motion")
     imu_motion = raw_imu_motion if isinstance(raw_imu_motion, bool) else None
     imu_drops = _as_int(payload, "imu_drops")
+    imu_samples = _as_int(payload, "imu_samples")
 
     missing = [
         name
@@ -438,6 +442,7 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
             imu_ok=imu_ok,
             imu_motion=imu_motion,
             imu_drops=imu_drops,
+            imu_samples=imu_samples,
             schema_version=schema,
         ),
         json_line=True,

@@ -675,6 +675,7 @@ class HostState:
                 "imu_ok": frame.imu_ok,
                 "imu_motion": frame.imu_motion,
                 "imu_drops": frame.imu_drops,
+                "imu_samples": frame.imu_samples,
                 "context": frame.context,
                 "context_text": context_text(frame.context),
                 "context_score": frame.context_score,

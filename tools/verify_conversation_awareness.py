@@ -74,6 +74,7 @@ class Frame:
     imu_motion: bool | None
     imu_gravity: float | None
     imu_drops: int | None
+    imu_samples: int | None = None
     problems: tuple[str, ...] = ()
 
 
@@ -121,6 +122,15 @@ class Phase:
         return statistics.median(values) if values else None
 
     @property
+    def sample_rate_hz(self) -> float | None:
+        """这一相的 IMU 采样率。控制拍 100 ms、IMU 100 Hz，所以每相应当读到约 100 Hz。"""
+        first = next((f for f in self.frames if f.imu_samples is not None), None)
+        last = next((f for f in reversed(self.frames) if f.imu_samples is not None), None)
+        if first is None or last is None or last.t_ms <= first.t_ms:
+            return None
+        return (last.imu_samples - first.imu_samples) / ((last.t_ms - first.t_ms) / 1000.0)
+
+    @property
     def drops_last(self) -> int | None:
         return self.frames[-1].imu_drops if self.frames else None
 
@@ -150,6 +160,7 @@ class Phase:
             "motion_frames": self.motion_frames,
             "gravity_p50": None if self.gravity_p50 is None else round(self.gravity_p50, 3),
             "imu_drops": self.drops_last,
+            "imu_hz": None if self.sample_rate_hz is None else round(self.sample_rate_hz, 1),
             "imu_samples_dropped": (
                 None
                 if not self.frames or self.frames[0].imu_drops is None
@@ -209,6 +220,7 @@ def read_frames(port: str, phase: Phase, start_ms: float) -> None:
                     imu_motion=f.imu_motion,
                     imu_gravity=f.imu_gravity,
                     imu_drops=f.imu_drops,
+                    imu_samples=f.imu_samples,
                     problems=parsed.problems,
                 )
             )
@@ -274,6 +286,15 @@ def analyse(phases: list[Phase]) -> tuple[list[dict], list[str]]:
         record(f"C4 {phase.name} 帧率", ratio >= 0.8,
                f"{len(phase.frames)} 帧 / 预期 {expected:.0f}（{ratio * 100:.0f}%）")
 
+    # C4c IMU 采样率："跑在 100 Hz"必须是量出来的。允许 ±10%：给控制任务的抖动留余量，
+    # 但半速（队列/总线被拖住）会立刻现形。
+    for phase in phases:
+        rate = phase.sample_rate_hz
+        if rate is None or not phase.frames:
+            continue
+        record(f"C4c {phase.name} IMU 采样率", 90.0 <= rate <= 110.0,
+               f"{rate:.1f} Hz（期望 100 Hz）")
+
     # C4b IMU 丢采样：控制任务与分析/推理同跑时最容易出问题的地方。
     # 看的是**整个过程里的增量**，不是某一帧的绝对值。
     dropped = None
@@ -333,7 +354,7 @@ def analyse(phases: list[Phase]) -> tuple[list[dict], list[str]]:
 
 def make_phase(name: str, seconds: float, *, own_voice: float = 0.02, media: int = 100,
                duck_at_ms: float | None = None, duck_percent: int = 25, motion: bool = False,
-               imu_ok: bool = True, gravity: float = 9.81) -> Phase:
+               imu_ok: bool = True, gravity: float = 9.81, imu_hz: float = 100.0) -> Phase:
     """造一个相的合成帧序列。只用于 `--selftest`：验证**检查器本身**在已知好坏的数据上
     会不会给出正确结论。真机数据永远从串口来。"""
     frames = []
@@ -347,7 +368,8 @@ def make_phase(name: str, seconds: float, *, own_voice: float = 0.02, media: int
             own_voice_confidence=own_voice,
             own_voice_correlation=0.9 if own_voice > 0.3 else 0.02,
             own_voice_source="bone" if imu_ok else "none",
-            imu_ok=imu_ok, imu_motion=motion, imu_gravity=gravity, imu_drops=0))
+            imu_ok=imu_ok, imu_motion=motion, imu_gravity=gravity, imu_drops=0,
+            imu_samples=int(t / 1000.0 * imu_hz)))
     return Phase(name=name, prompt="", seconds=seconds, frames=frames)
 
 
@@ -368,6 +390,10 @@ def selftest() -> int:
         # 否则就是在拿一个现实中不存在的组合去测检查器。
         ("imu_dead", dict(imu_ok=False, gravity=0.0, self_speech=dict(own_voice=0.0)),
          ["C2", "C3", "C5", "C5b", "C6", "C7"]),
+        # IMU 半速（队列被拖住）：只有采样率这一条该挂。
+        ("imu_half_rate", dict(imu_hz=50.0,
+                               self_speech=dict(own_voice=0.85, duck_at_ms=300.0)),
+         ["C4c"]),  # 五个相各一条 C4c，断言名都归到这个前缀
     ]
     failures = 0
     for name, overrides, expected in scenarios:
@@ -375,12 +401,13 @@ def selftest() -> int:
                         motion=dict(motion=True), other_speech=dict(own_voice=0.05))
         global_imu = overrides.pop("imu_ok", True)
         global_gravity = overrides.pop("gravity", 9.81)
+        global_hz = overrides.pop("imu_hz", 100.0)
         phases = []
         for phase_name, prompt, seconds in PHASES:
             kwargs = dict(defaults.get(phase_name, {}))
             kwargs.update(overrides.get(phase_name, {}))
             phases.append(make_phase(phase_name, seconds, imu_ok=global_imu,
-                                     gravity=global_gravity, **kwargs))
+                                     gravity=global_gravity, imu_hz=global_hz, **kwargs))
         checks, failed = analyse(phases)
         failing = sorted({c["check"].split()[0] for c in checks if not c["ok"]})
         ok = failing == sorted(expected)
@@ -440,7 +467,7 @@ def main() -> int:
                     confidence=f.confidence, own_voice_confidence=f.own_voice_confidence,
                     own_voice_correlation=f.own_voice_correlation, own_voice_source=f.own_voice_source,
                     imu_ok=f.imu_ok, imu_motion=f.imu_motion, imu_gravity=f.imu_gravity,
-                    imu_drops=None, problems=parsed.problems))
+                    imu_drops=None, imu_samples=f.imu_samples, problems=parsed.problems))
         phases = [phase]
     else:
         try:

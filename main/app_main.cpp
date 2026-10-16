@@ -102,6 +102,7 @@ void emit_command_json(const EarbudCommand& command) {
                 "\"own_voice_vibration\":%.4f,\"imu_gravity\":%.3f,"
                 "\"own_voice_source\":\"%s\","
                 "\"imu_ok\":%s,\"imu_motion\":%s,\"imu_drops\":%lu,"
+                "\"imu_samples\":%lu,"
                 "\"execution\":\"decision_only\",\"link\":\"simulated\","
                 "\"eq_gain_db\":[",
                 static_cast<unsigned long>(command.schema_version),
@@ -121,7 +122,8 @@ void emit_command_json(const EarbudCommand& command) {
                                        : (command.own_voice.proxy ? "near_field" : "none"),
                 command.own_voice.imu_ok ? "true" : "false",
                 command.own_voice.motion ? "true" : "false",
-                static_cast<unsigned long>(g_imu_drops));
+                static_cast<unsigned long>(g_imu_drops),
+                static_cast<unsigned long>(g_imu_samples));
     for (std::size_t band = 0; band < kBandCount; ++band) {
         std::printf("%s%.1f", band == 0 ? "" : ",", static_cast<double>(command.eq_gain_db[band]));
     }
@@ -785,17 +787,12 @@ void processing_task(void*) {
 }
 }  // namespace
 
-/// IMU 采样任务。只做三件事：初始化、按 100 Hz 读数、进队列。
-/// 它**不做判定** —— 判据在控制任务里，和音频包络配成对，这样 bone_voice 只需要单线程访问，
-/// 主机测试与固件跑的是同一份逻辑。
+/// IMU 采样任务：按 100 Hz 读数、进队列。
+///
+/// **它不初始化、也不做判定。** 初始化放在 app_main 里同步做完（见那里的注释：避免与
+/// 音频任务抢同一条 I2C 总线），判定在控制任务里与音频包络配对 —— 这样 bone_voice 只需要
+/// 单线程访问，主机测试与固件跑的是同一份逻辑。
 static void imu_task(void*) {
-    const bool ok = imu_init();
-    g_imu_ok = ok;
-    if (!ok) {
-        ESP_LOGW(kTag, "BMI270 未就绪：自身语音证据退回近场代理");
-        vTaskDelete(nullptr);
-        return;
-    }
     TickType_t last = xTaskGetTickCount();
     while (true) {
         ImuSample sample;
@@ -828,12 +825,26 @@ extern "C" void app_main(void) {
     //     the real cost and now lives on the heap with the window.
     // The `stack_high_water` field in the latency report is the live number; measure it again
     // after any addition to this task rather than trusting this comment.
+    // ---- IMU 同步初始化，先于音频任务 ----
+    //
+    // 为什么不在采样任务里初始化：BMI270 和音频编解码器**共用 BSP 的 I2C 总线**
+    // （bsp_i2c_init 是幂等的，共享本身没问题），但音频控制任务的优先级（6）高于 IMU 任务（4），
+    // 由 IMU 任务去初始化就会被音频任务抢占，两次 I2C 驱动安装/设备注册可能交错。
+    // ear-context 那个实验里两个任务是同级（5），不会互相抢占，所以照搬它的写法在这里并不等价。
+    // 在 app_main 里同步做完，既拿到了"IMU 先于音频"的已验证顺序，又完全没有并发。
+    g_imu_ok = imu_init();
+    if (!g_imu_ok) {
+        ESP_LOGW(kTag, "BMI270 未就绪：自身语音证据按 fail-closed 处理（不下压）");
+    }
+
     g_imu_queue = xQueueCreate(kImuQueueDepth, sizeof(ImuSample));
-    if (g_imu_queue != nullptr) {
+    if (g_imu_queue != nullptr && g_imu_ok) {
         // 优先级低于音频控制任务：IMU 是证据源，不能反过来抢音频的节拍。
-        xTaskCreatePinnedToCore(imu_task, "imu", 4096, nullptr, 4, nullptr, 1);
-    } else {
-        ESP_LOGW(kTag, "IMU 队列创建失败：自身语音证据退回近场代理");
+        // 栈取 6144：与 ear-context 里同一份 imu_read + 队列写法相同，那个尺寸是真机跑过的；
+        // 4 KB 没验过，而栈溢出在这里只会表现为"偶尔丢采样"，很难查。
+        xTaskCreatePinnedToCore(imu_task, "imu", 6144, nullptr, 4, nullptr, 1);
+    } else if (g_imu_queue == nullptr) {
+        ESP_LOGW(kTag, "IMU 队列创建失败：自身语音证据按 fail-closed 处理（不下压）");
     }
 
     xTaskCreatePinnedToCore(processing_task, "audio_control", 16384, nullptr, 6, nullptr, 1);

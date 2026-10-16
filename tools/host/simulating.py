@@ -210,6 +210,8 @@ class MockDevice:
                         "imu_ok": True,
                         "imu_motion": False,
                         "imu_drops": 0,
+                        # 10 Hz 帧、100 Hz IMU：每帧 10 个采样，与真机同一比例。
+                        "imu_samples": self._sequence * 10,
                         # 24 段环境谱：面板用它画趋势与"设备实测"的出处。
                         "ambient_band_dbfs": [round(-72.0 + 40.0 * (i / 23.0), 1)
                                               for i in range(24)],

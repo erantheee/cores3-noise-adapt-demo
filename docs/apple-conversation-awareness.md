@@ -260,11 +260,19 @@ silence        75      35      35      25     0.60   DUCKED
 ### 11.4 接线（固件）
 
 ```text
-imu_task（5 ms 轮询，100 Hz 采样，优先级 4，低于音频控制任务）
+app_main：imu_init()  ← **同步、先于音频任务**（见下面的总线理由）
    └─ 队列（深 64）→ 控制任务每拍全部取出 → bone_voice.push_imu(模长, t)
+imu_task（5 ms 轮询，100 Hz 采样，优先级 4，低于音频控制任务的 6）
 控制任务（100 ms 一拍）→ bone_voice.push_audio(语音带电平, t) → 置信度
-   └─ controller.set_own_voice_evidence(confidence, imu_ok)
+   └─ controller.set_own_voice_evidence(evidence)
 ```
+
+**为什么 IMU 初始化放在 app_main 而不是采样任务里**：BMI270 与音频编解码器**共用 BSP 的
+I2C 总线**（`bsp_i2c_init()` 是幂等的，有 `i2c_initialized` 守卫，共享本身没问题）。但音频控制
+任务的优先级是 6、IMU 任务是 4，若由 IMU 任务去初始化，音频任务会在初始化中途抢占它，
+两次 I2C 驱动安装/设备注册就可能交错。**ear-context 那个实验里两个任务是同级（5），不会互相抢占，
+所以照搬它的写法在优先级不同的主工程里并不等价。** 同步初始化同时拿到了"IMU 先于音频"这个
+已验证的顺序。IMU 任务栈取 6144（与 ear-context 相同尺寸），不用未验证过的 4 KB。
 
 配对是 1:1 的：控制拍 100 ms、IMU 100 Hz，一拍正好 10 个采样。
 
@@ -336,6 +344,7 @@ other_speech  旁人说话 12 s  → 不得下压（可用 --skip-other-speech �
 | C2 | 静止相 ≥90% 帧 `imu_ok=true` |
 | C3 | 静止相 `imu_gravity` p50 ∈ [9.0, 10.5] m/s²（±4g、单位是 m/s²） |
 | C4 / C4b | 每相帧率 ≥80%；整个验证过程 `imu_drops` 增量为 0 |
+| C4c | 每相 IMU 采样率 ∈ [90, 110] Hz —— "跑在 100 Hz"必须是量出来的 |
 | C5 / C5b | 说话相 own_voice 峰值 ≥0.30 且比静止相高 ≥0.15；来源是 `bone` |
 | C6 | 证据（≥0.5）到下压（<60%）≤ **650 ms**（确认 200 ms + 3τ） |
 | C7 | 停止说话相 media 回到 100% |
