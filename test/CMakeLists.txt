@@ -15,6 +15,7 @@ set(COMMON_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/mic_decimator.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/voiceprint_gate.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/conversation_awareness.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../main/bone_voice.cpp
 )
 
 enable_testing()
@@ -55,3 +56,9 @@ add_test(NAME context_window_test COMMAND context_window_test)
 add_executable(conversation_awareness_test conversation_awareness_test.cpp ${COMMON_SOURCES})
 target_include_directories(conversation_awareness_test PRIVATE ../main)
 add_test(NAME conversation_awareness_test COMMAND conversation_awareness_test)
+
+# 骨传导自身语音证据。只吃"加速度采样 + 音频包络"，不碰 I2C 与任务调度，
+# 所以包络同步/不同步、运动否决、窗未满这些分支都能在主机上判定。
+add_executable(bone_voice_test bone_voice_test.cpp ${COMMON_SOURCES})
+target_include_directories(bone_voice_test PRIVATE ../main)
+add_test(NAME bone_voice_test COMMAND bone_voice_test)

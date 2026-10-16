@@ -83,6 +83,7 @@ AirPods Pro 播放最终输出；分别验证歌曲 EQ、现实人声增益意�
 | 38g | ⚠️ **教训保留：闸门被"数字静音"静默废掉** | 已记录 | 录制开头有 **1.23 秒纯数字静音**（ffmpeg/avfoundation 预热，23 帧读到 −120 dBFS 填充值）。底噪跟踪器若把 −120 当地板，之后真实音频就是 35 dB 超出量 → **闸门恒开且不报错**。**"无信号被当成信号"这类失效模式不会自己暴露，必须单独防。** |
 | 38h | 🔴 **根因：所有 38 系测量都用了非产品麦克风** | 未解决 | 38/38a–38h 全部基于 **Mac 麦克风**，而判据阈值是在设备 ES7210 上标定的。**这些数字不能用来判定设备，更不能用来改设备判据。** 设备端现状：`record_from_device.py` 只给 16 kHz（判据频段到 13.6 kHz，不够用）；**但 ear-context 固件本来就在推自己 24 个频段的电平**（`context` JSON 的 `bands[]`，10 Hz，`experiments/ear-context/main/app_main.cpp:43-45`）——那才是设备麦的判据输入，**不用改固件、不用刷机**。下一步只能从它取数 |
 | 39 | **Apple「对话感知」迁移**（分支 `feature/apple-conversation-awareness`） | ⚠️ **触发与时序已实现，时序参数待标定** | 新增 `main/conversation_awareness.*`（idle→confirming→engaged→releasing）+ `test/conversation_awareness_test.cpp` 30 条断言；删除旧轮次启发式（它检的是"像不像对话"，不是"我是不是在说话"）。**macOS 侧两轮实测没测到下压**，所以参数是待标定值，不是 Apple 实测值。详见 [apple-conversation-awareness.md](apple-conversation-awareness.md) |
+| 40 | **骨传导自身语音证据（IMU 进主工程）**（同分支） | ⚠️ **已实现并编译通过，待真机验证** | `components/bmi270` + `main/imu.*` 从 ear-context 搬入主工程；新增 `main/bone_voice.*`（包络相关性判据，18 条断言）。证据优先级：骨传导 > 近场代理。测试抓到两个真 bug（重力基线吸收调制、RMS 丢符号）。真机要看的四项见 [apple-conversation-awareness.md](apple-conversation-awareness.md) 第 11.6 节 |
 
 
 **断言计数（2026-10-16 实测，第 1、6、7、15、29、31 项共用）**：主机 C++ 单测 **7 套件合计 251 条**

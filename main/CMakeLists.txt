@@ -3,6 +3,8 @@ idf_component_register(
         "app_main.cpp"
         "controller.cpp"
         "conversation_awareness.cpp"
+        "bone_voice.cpp"
+        "imu.cpp"
         "latency_profiler.cpp"
         "mic_capture.cpp"
         "mic_decimator.cpp"

@@ -376,7 +376,12 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
         evidence.speech_active = speech_active;
         evidence.voice_likelihood = voice;
         evidence.level_dbfs = frame.broadband_dbfs;
-        evidence.own_voice = conversation::near_field_own_voice(frame.broadband_dbfs, voice);
+        // 证据优先级：骨传导（装了 IMU 且这一拍有数）> 近场代理（占位）。
+        // 近场代理在真机静音素材上会把 35/75 拍判成语音（见 docs/apple-conversation-awareness.md
+        // 第 10.4 节），所以有骨传导时它必须退出主路径，而不是两条相加。
+        evidence.own_voice = own_voice_available_
+                                 ? own_voice_evidence_
+                                 : conversation::near_field_own_voice(frame.broadband_dbfs, voice);
         awareness_out_ = awareness_.update(evidence, dt_ms);
         const conversation::Output& awareness_out = awareness_out_;
 

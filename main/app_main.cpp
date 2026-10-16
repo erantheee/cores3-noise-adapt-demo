@@ -3,6 +3,7 @@
 #include <cstring>
 #include <new>
 
+#include "bone_voice.hpp"
 #include "bsp/esp-bsp.h"
 #include "context_window.hpp"
 #include "controller.hpp"
@@ -14,13 +15,27 @@
 #include "esp_timer.h"
 #include "latency_profiler.hpp"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
+#include "imu.hpp"
 #include "mic_capture.hpp"
 #include "mic_decimator.hpp"
 #include "sdkconfig.h"
 
 namespace {
 constexpr uint32_t kSampleRate = 48000;
+
+/// IMU 采样。BMI270 配成 100 Hz，任务每 5 ms 轮询一次数据就绪位（与 ear-context 实测一致）。
+/// 100 Hz 下 Nyquist 是 50 Hz：看不到骨传导语音振动的频带本身，但**包络**（音节率 2–8 Hz）
+/// 完整可观测，而判据用的就是包络相关性（见 main/bone_voice.hpp）。
+constexpr uint32_t kImuPollMs = 5;
+/// 队列深度。60 拍（6 秒）的缓冲：控制任务偶尔被分析/推理拖慢时，IMU 采样不丢。
+constexpr UBaseType_t kImuQueueDepth = 64;
+
+QueueHandle_t g_imu_queue = nullptr;
+volatile bool g_imu_ok = false;
+volatile uint32_t g_imu_samples = 0;
+volatile uint32_t g_imu_drops = 0;
 /// Samples per analysis frame. 2048 at 48 kHz is 42.7 ms and is what the 24-band
 /// analysis was calibrated on.
 constexpr std::size_t kFrameSamples = 2048;
@@ -262,6 +277,8 @@ void emit_capture_chunk(const int16_t* samples, std::size_t count, uint32_t sequ
 }
 
 void processing_task(void*) {
+    /// 只被控制任务访问：主机测试与固件跑的是同一份判据，不需要加锁。
+    static bone::BoneVoice bone_voice;
     i2s_std_config_t audio_config = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(kSampleRate),
         .slot_cfg = I2S_STD_PHILIP_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
@@ -624,6 +641,26 @@ void processing_task(void*) {
         const int64_t analyse_done_us = esp_timer_get_time();
 
         const float elapsed_ms = static_cast<float>(now_us - last_control_us) / 1000.0f;
+
+        // ---- 自身语音证据（骨传导）----
+        // 把这一拍之前攒下的 IMU 采样全部灌进 bone_voice，再用这一拍的语音带电平配对。
+        // 配对是 1:1 的：控制拍 100 ms、IMU 100 Hz，一拍正好 10 个采样。
+        ImuSample imu_sample;
+        while (g_imu_queue != nullptr && xQueueReceive(g_imu_queue, &imu_sample, 0) == pdTRUE) {
+            const float magnitude = std::sqrt(imu_sample.accel[0] * imu_sample.accel[0] +
+                                              imu_sample.accel[1] * imu_sample.accel[1] +
+                                              imu_sample.accel[2] * imu_sample.accel[2]);
+            bone_voice.push_imu(magnitude, static_cast<float>(imu_sample.t_us) / 1000.0f);
+        }
+        // 语音带（第 8–16 段，300–4000 Hz）的平均电平，作为骨传导判据的音频侧包络。
+        float speech_band_dbfs = 0.0f;
+        for (std::size_t band = 8; band <= 16; ++band) {
+            speech_band_dbfs += frame.band_dbfs[band] / 9.0f;
+        }
+        const bone::Output bone_out =
+            bone_voice.push_audio(speech_band_dbfs, static_cast<float>(now_us) / 1000.0f);
+        controller.set_own_voice_evidence(bone_out.confidence, g_imu_ok);
+
         EarbudCommand command = controller.update(frame, elapsed_ms);
         const int64_t decide_done_us = esp_timer_get_time();
 
@@ -722,6 +759,28 @@ void processing_task(void*) {
 }
 }  // namespace
 
+/// IMU 采样任务。只做三件事：初始化、按 100 Hz 读数、进队列。
+/// 它**不做判定** —— 判据在控制任务里，和音频包络配成对，这样 bone_voice 只需要单线程访问，
+/// 主机测试与固件跑的是同一份逻辑。
+static void imu_task(void*) {
+    const bool ok = imu_init();
+    g_imu_ok = ok;
+    if (!ok) {
+        ESP_LOGW(kTag, "BMI270 未就绪：自身语音证据退回近场代理");
+        vTaskDelete(nullptr);
+        return;
+    }
+    TickType_t last = xTaskGetTickCount();
+    while (true) {
+        ImuSample sample;
+        if (imu_read(sample)) {
+            if (xQueueSend(g_imu_queue, &sample, 0) != pdTRUE) ++g_imu_drops;
+            else ++g_imu_samples;
+        }
+        vTaskDelayUntil(&last, pdMS_TO_TICKS(kImuPollMs));
+    }
+}
+
 extern "C" void app_main(void) {
     ESP_LOGI(kTag, "Starting earbud-case-shaped edge audio controller");
     ESP_LOGI(kTag, "No autoplay. Built-in speaker remains silent.");
@@ -743,5 +802,13 @@ extern "C" void app_main(void) {
     //     the real cost and now lives on the heap with the window.
     // The `stack_high_water` field in the latency report is the live number; measure it again
     // after any addition to this task rather than trusting this comment.
+    g_imu_queue = xQueueCreate(kImuQueueDepth, sizeof(ImuSample));
+    if (g_imu_queue != nullptr) {
+        // 优先级低于音频控制任务：IMU 是证据源，不能反过来抢音频的节拍。
+        xTaskCreatePinnedToCore(imu_task, "imu", 4096, nullptr, 4, nullptr, 1);
+    } else {
+        ESP_LOGW(kTag, "IMU 队列创建失败：自身语音证据退回近场代理");
+    }
+
     xTaskCreatePinnedToCore(processing_task, "audio_control", 16384, nullptr, 6, nullptr, 1);
 }

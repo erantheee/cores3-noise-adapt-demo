@@ -185,6 +185,16 @@ public:
     /// 不必为了遥测往协议里加字段。
     const conversation::Output& awareness() const { return awareness_out_; }
 
+    /// 由 app_main 每拍填入的**自身语音证据**（骨传导，来自 main/bone_voice.hpp）。
+    ///
+    /// `available=false` 时控制器退回 conversation::near_field_own_voice() 的近场代理。
+    /// 两条路都保留：设备没装/没读到 IMU 时不能因为缺证据就完全不动作，而装上 IMU 之后
+    /// 代理那条（已被真机证明会在静音上误触发）就退出主路径。
+    void set_own_voice_evidence(float confidence, bool available) {
+        own_voice_evidence_ = confidence;
+        own_voice_available_ = available;
+    }
+
 private:
     uint32_t sequence_ = 0;
     float speech_gain_db_ = 0.0f;
@@ -196,6 +206,8 @@ private:
     /// 旧实现的轮次启发式（语音→停顿→再语音）已删除，理由见 docs/apple-conversation-awareness.md。
     conversation::Awareness awareness_;
     conversation::Output awareness_out_{};
+    float own_voice_evidence_ = 0.0f;
+    bool own_voice_available_ = false;
 };
 
 const char* adapt_state_name(AdaptState state);
