@@ -579,3 +579,50 @@ constexpr EvidencePolicy kEvidencePolicy = EvidencePolicy::near_field_demo;  // 
 演示模式解决的是"演示时看不看得见行为"，**不是**"这条功能在真机上成立"。
 它成立与否仍然取决于：真入耳的形态（第 13.5 节），或声纹门控通过止损门（第 14 节）。
 文档不把这两件事混在一起写，是因为下一轮真机验证时会照着这里读结论。
+
+---
+
+## 16. 状态交接（2026-10-16 22:10）
+
+给下一个接手的人（也可能是几天后的我们）。**先读这一节，再决定动哪一块。**
+
+### 16.1 已交付
+
+| 内容 | 位置 |
+|---|---|
+| 状态机（Apple 式触发→下压→保持→恢复） | `main/conversation_awareness.{hpp,cpp}` |
+| 骨传导证据（判据本体，纯逻辑可主机测） | `main/bone_voice.{hpp,cpp}` |
+| IMU 驱动与采样任务 | `components/bmi270/`、`main/imu.{hpp,cpp}`、`app_main.cpp` 的 `imu_task` |
+| 证据策略三态 + 遥测（v3） | `main/controller.{hpp,cpp}`、`app_main.cpp`、`tools/host/protocol.py`、面板「自身语音证据」卡 |
+| 设备端素材采集 | `tools/collect_conversation_evidence.py` |
+| 真机验证脚本（五相 + C0–C9） | `tools/verify_conversation_awareness.py`（`--selftest` 八个场景） |
+| 真机数据回放（骨传导判据） | `tools/bone_real_replay.cpp`、`tools/export_bone_real.py` |
+| Apple 侧实测工具 | `airpods-control/bin/awareness-measure`（含 `--passive`、`--replay`） |
+
+### 16.2 已验证的数字
+
+| 项 | 结果 |
+|---|---|
+| C++ 主机套件 | 9/9（`controller_test` 59 条、`bone_voice_test` 18 条、`conversation_awareness_test` 30 条） |
+| 上位机自测 | 48 组 4218 条 |
+| 渲染校验 | 49 条 |
+| 检查器自测 | 8/8 场景 |
+| 固件 | 编译 0 错误；`build/cores3_noise_adapt_demo.bin` SHA256 `ee79baf6…`，分区剩 80% |
+
+### 16.3 没做完的四件事（各自的确切下一步）
+
+| # | 事项 | 卡在哪 | 下一步（可直接复制） |
+|---|---|---|---|
+| 1 | **Apple 时序参数实测** | Mac 麦克风当前 0 帧（设备在、mute=0、旧探针也 0 帧） | 先在「系统设置 → 隐私与安全性 → 麦克风」确认宿主 App 有权限，然后 `airpods-control/bin/awareness-measure --passive 300`——不需要任何配合 |
+| 2 | **真机五相验证** | 未烧固件（不需要 Mac 麦克风） | `CORES3_PORT=/dev/cu.usbmodem101 sh tools/free_port.sh --kill` → `CORES3_PORT=… sh tools/flash.sh build` → `./.venv/bin/python tools/verify_conversation_awareness.py --port /dev/cu.usbmodem101`。**C5（骨传导证据）预期会失败**，见第 13 节 |
+| 3 | 声纹止损门（状态总表第 12 项） | 素材为零 | 同一人分次换条件 2–3 条 + 另一人 2–3 条（`tools/record_voiceprints.py`），再跑 `tools/voice_separability.py`；工具链已核实可用 |
+| 4 | 设备端触发素材 | 需要人在设备旁 | `tools/collect_conversation_evidence.py --port … --speaker 甲 --verify` |
+
+### 16.4 三件必须记住的结论（免得重复劳动）
+
+1. **骨传导判据在本设备上不成立**（第 13 节）：用自己的真机数据 + 同一份 `bone_voice` 代码回放，
+   置信度中位全段为 0，且与仓库既有的 AUC 0.0508「基本不可分」一致。边界：设备是贴耳开发板，不是入耳耳机。
+2. **近场代理只知道"有人说话"**（第 14 节），演示模式（`near_field_demo`）是**刻意的选择**，
+   代价是 C9 预期失败；`own_voice_source` 与 `own_voice_policy` 必须一致显示。
+3. **16 kHz 素材判不了高频段**（第 10.2/10.4 节）：设备端录音的上限是 16 kHz，
+   任何涉及 8 kHz 以上频段的结论都不能从这类素材得出——第 10.4 节那条更正就是为此写的。
