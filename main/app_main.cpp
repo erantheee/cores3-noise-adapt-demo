@@ -76,7 +76,12 @@ constexpr int64_t kLatencyReportPeriodUs = 10 * 1000 * 1000;
 const char* kTag = "cores3_noise_adapt";
 MacAudioRoute g_mac_route;
 
-/// Emit one frame of EarbudCommand v2.
+/// Emit one frame of EarbudCommand v3.
+///
+/// v3 adds the own-voice evidence (`own_voice_confidence` / `own_voice_correlation` /
+/// `own_voice_source`) plus `imu_ok`. Without it a device-side verification cannot tell
+/// "bone evidence never arrived" apart from "evidence arrived and the state machine still
+/// did not duck" -- and those two have completely different fixes.
 ///
 /// Two deliberate changes from the previous revision:
 ///   * `noise_reduction_db` is gone. This product's actions are gain and tuning; the field
@@ -93,6 +98,9 @@ void emit_command_json(const EarbudCommand& command) {
                 "\"external_voice_gain_db\":%.2f,\"media_percent\":%u,"
                 "\"state\":\"%s\",\"environment\":\"%s\",\"mode\":\"%s\","
                 "\"conversation\":\"%s\",\"confidence\":%.2f,"
+                "\"own_voice_confidence\":%.3f,\"own_voice_correlation\":%.3f,"
+                "\"own_voice_vibration\":%.4f,\"own_voice_source\":\"%s\","
+                "\"imu_ok\":%s,\"imu_motion\":%s,\"imu_drops\":%lu,"
                 "\"execution\":\"decision_only\",\"link\":\"simulated\","
                 "\"eq_gain_db\":[",
                 static_cast<unsigned long>(command.schema_version),
@@ -103,7 +111,14 @@ void emit_command_json(const EarbudCommand& command) {
                 adapt_state_name(command.state), environment_name(command.environment),
                 tuning_mode_name(command.tuning_mode),
                 conversation_state_name(command.conversation),
-                command.confidence);
+                command.confidence,
+                static_cast<double>(command.own_voice.confidence),
+                static_cast<double>(command.own_voice.correlation),
+                static_cast<double>(command.own_voice.vibration_rms),
+                command.own_voice.bone ? "bone" : "near_field",
+                command.own_voice.imu_ok ? "true" : "false",
+                command.own_voice.motion ? "true" : "false",
+                static_cast<unsigned long>(g_imu_drops));
     for (std::size_t band = 0; band < kBandCount; ++band) {
         std::printf("%s%.1f", band == 0 ? "" : ",", static_cast<double>(command.eq_gain_db[band]));
     }
@@ -659,7 +674,14 @@ void processing_task(void*) {
         }
         const bone::Output bone_out =
             bone_voice.push_audio(speech_band_dbfs, static_cast<float>(now_us) / 1000.0f);
-        controller.set_own_voice_evidence(bone_out.confidence, g_imu_ok);
+        OwnVoiceEvidence own_voice;
+        own_voice.confidence = bone_out.confidence;
+        own_voice.correlation = bone_out.correlation;
+        own_voice.vibration_rms = bone_out.vibration_rms;
+        own_voice.motion = bone_out.motion;
+        own_voice.bone = g_imu_ok;
+        own_voice.imu_ok = g_imu_ok;
+        controller.set_own_voice_evidence(own_voice);
 
         EarbudCommand command = controller.update(frame, elapsed_ms);
         const int64_t decide_done_us = esp_timer_get_time();

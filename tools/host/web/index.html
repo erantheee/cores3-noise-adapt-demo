@@ -144,6 +144,18 @@
       <div class="sub" id="ctx-raw">—</div>
       <div class="sub" id="ctx-note">9 分类 · 只显示，不参与决策</div>
     </div>
+    <!--
+      自身语音证据 = 这一拍"谁在说话"的依据。source 必须显示出来：
+      骨传导（IMU）与近场代理是两条完全不同的路，代理那条在真机静音素材上误触发过
+      （docs/apple-conversation-awareness.md 第 10.4 节），混着显示就是在上位机上撒谎。
+    -->
+    <div class="card" id="ov-card">
+      <h2>自身语音证据</h2>
+      <div class="value small" id="ov">—</div>
+      <div class="meter"><span id="ov-bar"></span></div>
+      <div class="sub" id="ov-raw">—</div>
+      <div class="sub" id="ov-note">骨传导优先 · 无 IMU 时退回近场代理</div>
+    </div>
     <div class="card">
       <h2>当前动作</h2>
       <div class="value small" id="state">—</div>
@@ -355,6 +367,34 @@ function renderAlerts(s) {
 //   * 四个字段一个都没有：这台固件还没上模型（融合第二轮之前的版本）
 //   * 报了但 valid=false：窗口还没攒满 2 秒，或输入刚被打断
 //   * valid=true：真正的判断，分数与一次前向的耗时都是设备实报的
+// 自身语音证据卡：和情境卡同一条纪律——没报 / 近场代理 / 骨传导三种状态必须分开。
+// 代理只有电平信息，分不开"自己说"和"旁边人说"；把两者画成一样，看的人会以为
+// 判据已经换掉了。
+function renderOwnVoice(f) {
+  const has = f.own_voice_confidence !== null && f.own_voice_confidence !== undefined;
+  const bar = $("ov-bar");
+  if (!has) {
+    $("ov").textContent = "—";
+    bar.style.width = "0%";
+    $("ov-raw").textContent = "这一帧没有自身语音字段";
+    $("ov-note").textContent = "固件未上报（v3 之前的版本）";
+    return;
+  }
+  const confidence = f.own_voice_confidence || 0;
+  bar.style.width = Math.max(0, Math.min(100, confidence * 100)) + "%";
+  const bone = f.own_voice_source === "bone";
+  $("ov").textContent = (confidence * 100).toFixed(0) + "%";
+  if (bone) {
+    const correlation = f.own_voice_correlation;
+    $("ov-raw").textContent =
+      "骨传导 · 相关 " + (correlation === null || correlation === undefined ? "—" : correlation.toFixed(2));
+    $("ov-note").textContent = f.imu_motion ? "骨传导 · 检测到整体运动（已否决）" : "骨传导优先 · 无 IMU 时退回近场代理";
+  } else {
+    $("ov-raw").textContent = "近场代理（无 IMU）：只有电平，分不开自己与旁人";
+    $("ov-note").textContent = f.imu_ok === false ? "IMU 未就绪" : "近场代理";
+  }
+}
+
 function renderContext(f) {
   const bar = $("ctx-bar");
   const unknown = f.context_valid === null || f.context_valid === undefined;
@@ -403,6 +443,7 @@ function render(s) {
     $("env").textContent = f.environment_text;
     $("env").className = "value env-" + f.environment;
     $("env-raw").textContent = f.environment;
+    renderOwnVoice(f);
     renderContext(f);
     $("state").textContent = f.state_text;
     $("state-raw").textContent = `${f.state} · ${f.conversation || "NONE"}`;

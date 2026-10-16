@@ -9,7 +9,9 @@
 生成的行为刻意贴住固件的真实数字，而不是随便造几个数：
 
     控制节拍        100 ms（main/app_main.cpp: kControlPeriodMs）
-    协议            schema 2：mode / conversation / external_voice_gain_db / 24 段 eq_gain_db。
+    协议            schema 3：mode / conversation / external_voice_gain_db / 24 段 eq_gain_db
+                    / 自身语音证据（own_voice_confidence、own_voice_correlation、
+                    own_voice_source、imu_ok、imu_motion）。
                     **不发 noise_reduction_db**——那个字段已从固件删除（main/controller.hpp）
     状态机          从安静 → 噪声 → 人声 → 高噪声，中间有斜坡而不是跳变，
                     因为固件本身是"建议值逐步逼近目标"（controller.cpp）
@@ -196,6 +198,16 @@ class MockDevice:
                         "context_score": round(context_score, 3) if context_valid else 0.0,
                         "context_valid": context_valid,
                         "context_us": context_us,
+                        # 自身语音证据（v3）。字段名与 main/app_main.cpp 的实发内容一致：
+                        # source 只有 "bone" / "near_field" 两种，面板据此区分"骨传导证据"
+                        # 与"近场代理占位"——代理那条路在真机静音素材上误触发过，不能混着显示。
+                        # 模拟源固定报 bone（模拟一个 IMU 正常的设备）。
+                        "own_voice_confidence": 0.82 if target["conversation"] == "LIKELY" else 0.05,
+                        "own_voice_correlation": 0.90 if target["conversation"] == "LIKELY" else 0.03,
+                        "own_voice_source": "bone",
+                        "imu_ok": True,
+                        "imu_motion": False,
+                        "imu_drops": 0,
                         # 24 段环境谱：面板用它画趋势与"设备实测"的出处。
                         "ambient_band_dbfs": [round(-72.0 + 40.0 * (i / 23.0), 1)
                                               for i in range(24)],

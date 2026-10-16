@@ -30,8 +30,8 @@ from typing import Any, Iterable
 
 #: 本上位机实现的协议版本。设备侧 schema_version 不是这个值时必须显式报告不兼容，
 #: 而不是按 v1 去解读——字段含义变了却继续显示，比显示不出来更糟。
-SCHEMA_VERSION = 2
-SUPPORTED_SCHEMA_VERSIONS = (1, 2)
+SCHEMA_VERSION = 3
+SUPPORTED_SCHEMA_VERSIONS = (1, 2, 3)
 
 #: 固件侧的**产品策略**上限（main/controller.hpp 的 kMaxSpeechGainDb）。
 #: 注意：固件实际下发的值被钳到 demo 上限，不是这一个——见下面那个常量。
@@ -141,6 +141,14 @@ class CommandFrame:
     context_valid: bool | None = None
     #: 一次前向的耗时，微秒。设备逐帧实报，不是估算。
     context_us: int | None = None
+    #: 自身语音证据（v3）。None 表示这一帧没报——v3 之前的固件不发这几个字段。
+    #: source 是 "bone"（骨传导 IMU）或 "near_field"（近场代理占位）。
+    own_voice_confidence: float | None = None
+    own_voice_correlation: float | None = None
+    own_voice_source: str | None = None
+    #: IMU 这一拍是否有数，以及运动否决是否生效。None = 这一帧没报。
+    imu_ok: bool | None = None
+    imu_motion: bool | None = None
     schema_version: int = SCHEMA_VERSION
     #: 越界或无法解释的字段说明。空表示这一帧通过了全部校验。
     problems: tuple[str, ...] = ()
@@ -287,6 +295,15 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
     # 只在字段存在时认它：融合第二轮之前的固件根本不发这四个字段，把它们当成"缺字段"
     # 会把每一帧历史日志都标成异常。
     context_valid: bool | None = raw_valid if isinstance(raw_valid, bool) else None
+    # v3：自身语音证据。缺字段一律给 None（旧固件不发），而不是 0.0——
+    # "没报"和"报了 0"在这个项目里是两件必须分开的事（同 v2 的 external_voice_gain_db）。
+    own_voice_confidence = _as_float(payload, "own_voice_confidence")
+    own_voice_correlation = _as_float(payload, "own_voice_correlation")
+    own_voice_source = _as_str(payload, "own_voice_source")
+    raw_imu_ok = payload.get("imu_ok")
+    imu_ok = raw_imu_ok if isinstance(raw_imu_ok, bool) else None
+    raw_imu_motion = payload.get("imu_motion")
+    imu_motion = raw_imu_motion if isinstance(raw_imu_motion, bool) else None
 
     missing = [
         name
@@ -347,6 +364,8 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
     ambient = _parse_float_array(payload, "ambient_band_dbfs")
     if schema >= 2 and external_voice_gain is None:
         problems.append("v2 帧缺 external_voice_gain_db")
+    if schema >= 3 and own_voice_confidence is None:
+        problems.append("v3 帧缺 own_voice_confidence")
     if external_voice_gain is not None and not 0.0 <= external_voice_gain <= DEMO_SPEECH_GAIN_DB:
         problems.append(f"现实人声增益 {external_voice_gain:+.2f} dB 越界（合法 0…{DEMO_SPEECH_GAIN_DB}）")
     if not 0 <= media_percent <= 100:
@@ -401,6 +420,13 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
             context_score=None if context_score is None else d2(context_score),
             context_valid=context_valid,
             context_us=context_us,
+            own_voice_confidence=None if own_voice_confidence is None else d2(own_voice_confidence),
+            own_voice_correlation=(
+                None if own_voice_correlation is None else d2(own_voice_correlation)
+            ),
+            own_voice_source=own_voice_source,
+            imu_ok=imu_ok,
+            imu_motion=imu_motion,
             schema_version=schema,
         ),
         json_line=True,

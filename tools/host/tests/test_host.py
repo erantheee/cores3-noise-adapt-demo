@@ -226,6 +226,63 @@ def test_context_model_frame() -> None:
     eq(legacy.value.context_valid, None, "旧帧的 context_valid 为 None：区分没报与报了假")
 
 
+def test_own_voice_frame() -> None:
+    """v3（2026-10-16）起，帧里多了自身语音证据。
+
+    为什么必须有这几个字段：真机验证时要能分开回答"骨传导有没有给出证据"与"证据来了但
+    状态机没下压"——这两件事的修法完全不同。所以 source 一并上报，别让上位机去猜
+    confidence 是高还是低。
+    """
+    line = (
+        '{"type":"earbud_command","schema":3,"sequence":9,"timestamp_ms":900,'
+        '"speech_gain_db":0.00,"external_voice_gain_db":0.00,"media_percent":25,'
+        '"state":"ADJUSTING","environment":"VOICE","confidence":0.90,'
+        '"conversation":"LIKELY","link":"simulated",'
+        '"own_voice_confidence":0.812,"own_voice_correlation":0.934,'
+        '"own_voice_source":"bone","imu_ok":true,"imu_motion":false,'
+        '"eq_gain_db":[0.0],"ambient_band_dbfs":[-60.0]}'
+    )
+    parsed = parse_line(line)
+    check(not parsed.problems, f"有效 v3 帧不应有异常（实得 {parsed.problems}）")
+    frame = parsed.value
+    close(frame.own_voice_confidence, 0.81, "自身语音置信度按两位小数读入")
+    close(frame.own_voice_correlation, 0.93, "相关系数读入")
+    eq(frame.own_voice_source, "bone", "来源原样读出，不让上位机猜")
+    eq(frame.imu_ok, True, "imu_ok 读为布尔真")
+    eq(frame.imu_motion, False, "imu_motion 读为布尔假")
+
+    # 近场代理：source 必须区分开。代理那条路已经在真机静音素材上误触发过，
+    # 把它显示成"骨传导证据"就是在上位机上撒谎。
+    fallback = parse_line(
+        '{"type":"earbud_command","schema":3,"sequence":10,"timestamp_ms":1000,'
+        '"speech_gain_db":0.00,"external_voice_gain_db":0.00,"media_percent":100,'
+        '"state":"HOLDING","environment":"QUIET","confidence":0.50,'
+        '"link":"simulated","own_voice_confidence":0.400,'
+        '"own_voice_correlation":0.000,"own_voice_source":"near_field",'
+        '"imu_ok":false,"imu_motion":false}'
+    )
+    check(not fallback.problems, f"代理帧不应有异常（实得 {fallback.problems}）")
+    eq(fallback.value.own_voice_source, "near_field", "代理来源要能读出来")
+
+    # 旧固件（v2）：不发这几个字段，读成 None，而不是 0.0。
+    older = parse_line(
+        '{"type":"earbud_command","schema":2,"sequence":1,"timestamp_ms":0,'
+        '"speech_gain_db":0.00,"external_voice_gain_db":0.00,"media_percent":100,'
+        '"state":"OBSERVING","environment":"QUIET","confidence":0.80,"link":"simulated"}'
+    )
+    check(not older.problems, f"v2 帧不应有异常（实得 {older.problems}）")
+    eq(older.value.own_voice_confidence, None, "v2 帧的自身语音证据是 None：区分没报与报了 0")
+
+    # v3 却缺字段：必须显式报出来，不能按 0.0 解读。
+    broken = parse_line(
+        '{"type":"earbud_command","schema":3,"sequence":11,"timestamp_ms":1100,'
+        '"speech_gain_db":0.00,"external_voice_gain_db":0.00,"media_percent":100,'
+        '"state":"OBSERVING","environment":"QUIET","confidence":0.80,"link":"simulated"}'
+    )
+    check(any("own_voice_confidence" in p for p in broken.problems),
+          f"v3 缺自身语音字段要报异常（实得 {broken.problems}）")
+
+
 def test_context_model_is_not_guessed() -> None:
     """设备报了自相矛盾的情境字段时要能被发现，不能静默当正常帧。
 
@@ -1549,6 +1606,7 @@ def main() -> int:
         test_command_frame_full,
         test_new_firmware_frame_carries_tuning,
         test_context_model_frame,
+        test_own_voice_frame,
         test_context_model_is_not_guessed,
         test_old_firmware_frame_still_reads,
         test_command_frame_noise_reduction_sign,

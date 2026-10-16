@@ -379,9 +379,14 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
         // 证据优先级：骨传导（装了 IMU 且这一拍有数）> 近场代理（占位）。
         // 近场代理在真机静音素材上会把 35/75 拍判成语音（见 docs/apple-conversation-awareness.md
         // 第 10.4 节），所以有骨传导时它必须退出主路径，而不是两条相加。
-        evidence.own_voice = own_voice_available_
-                                 ? own_voice_evidence_
-                                 : conversation::near_field_own_voice(frame.broadband_dbfs, voice);
+        OwnVoiceEvidence effective = own_voice_evidence_;
+        if (!effective.bone) {
+            effective.confidence = conversation::near_field_own_voice(frame.broadband_dbfs, voice);
+            effective.correlation = 0.0f;
+            effective.vibration_rms = 0.0f;
+            effective.motion = false;
+        }
+        evidence.own_voice = effective.confidence;
         awareness_out_ = awareness_.update(evidence, dt_ms);
         const conversation::Output& awareness_out = awareness_out_;
 
@@ -389,6 +394,9 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
                                    ? ConversationState::likely
                                    : (speech_active ? ConversationState::speech_nearby
                                                     : ConversationState::none);
+
+        // 遥测：报"实际生效的那一份"证据（骨传导或代理），而不是原始输入。
+        command.own_voice = effective;
 
         // The actions are deliberately distinct:
         //   * SONG_EQ asks the Mac renderer to adapt one of the three local songs.

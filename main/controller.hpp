@@ -122,8 +122,26 @@ struct ContextResult {
     const char* class_name = "unknown";
 };
 
+/// 自身语音证据。控制器只负责搬运与使用，判定在 main/bone_voice.hpp（骨传导）或
+/// conversation::near_field_own_voice()（近场代理）。
+///
+/// 为什么要进遥测：真机验证时要能分别回答"骨传导有没有给出证据""给错的时候长什么样"，
+/// 只看 media_percent 无法区分"证据没来"和"证据来了但状态机没动"。
+struct OwnVoiceEvidence {
+    float confidence = 0.0f;
+    float correlation = 0.0f;
+    float vibration_rms = 0.0f;
+    /// 整体运动否决是否生效。
+    bool motion = false;
+    /// true=骨传导证据，false=近场代理。
+    bool bone = false;
+    /// 这一拍 IMU 是否有数（false 时 bone 必然也是 false）。
+    bool imu_ok = false;
+};
+
 struct EarbudCommand {
-    uint32_t schema_version = 2;
+    /// v3 加了自身语音证据（own_voice）。v2 及以前没有这几个字段。
+    uint32_t schema_version = 3;
     uint32_t sequence = 0;
     uint32_t timestamp_ms = 0;
     float speech_gain_db = 0.0f;
@@ -137,6 +155,8 @@ struct EarbudCommand {
     bool earbud_link_connected = false;
     TuningMode tuning_mode = TuningMode::flat;
     ConversationState conversation = ConversationState::none;
+    /// 自身语音证据（这一拍实际生效的那一份，含来源）。
+    OwnVoiceEvidence own_voice;
     /// Model telemetry. `AdaptController` never touches this field.
     ContextResult context;
 };
@@ -190,10 +210,7 @@ public:
     /// `available=false` 时控制器退回 conversation::near_field_own_voice() 的近场代理。
     /// 两条路都保留：设备没装/没读到 IMU 时不能因为缺证据就完全不动作，而装上 IMU 之后
     /// 代理那条（已被真机证明会在静音上误触发）就退出主路径。
-    void set_own_voice_evidence(float confidence, bool available) {
-        own_voice_evidence_ = confidence;
-        own_voice_available_ = available;
-    }
+    void set_own_voice_evidence(const OwnVoiceEvidence& evidence) { own_voice_evidence_ = evidence; }
 
 private:
     uint32_t sequence_ = 0;
@@ -206,8 +223,7 @@ private:
     /// 旧实现的轮次启发式（语音→停顿→再语音）已删除，理由见 docs/apple-conversation-awareness.md。
     conversation::Awareness awareness_;
     conversation::Output awareness_out_{};
-    float own_voice_evidence_ = 0.0f;
-    bool own_voice_available_ = false;
+    OwnVoiceEvidence own_voice_evidence_{};
 };
 
 const char* adapt_state_name(AdaptState state);
