@@ -1,6 +1,7 @@
 #include "demo_ui.hpp"
 
 #include <cstdio>
+#include "esp_log.h"
 #include "lvgl.h"
 
 extern "C" {
@@ -8,12 +9,37 @@ extern const lv_font_t lv_font_ui_16;
 }
 
 namespace {
+const char* kTag = "demo_ui";
+
+/// Boot self-check for a generated font.
+///
+/// The fonts are built with `--no-compress --no-prefilter`, so their glyphs are stored as
+/// plain bitmaps (`bitmap_format == LV_FONT_FMT_TXT_PLAIN`). Regenerating one without
+/// `--no-compress` stores RLE bitmaps instead, and because `LV_USE_FONT_COMPRESSED` is off
+/// in this project `lv_font_get_bitmap_fmt_txt()` then returns NULL for *every* glyph:
+/// panels and bars still draw, no text appears anywhere, and nothing is reported
+/// (`LV_USE_LOG=0`). This has already happened once on this project with the ear-context
+/// font, which is why the check exists. Ported from `experiments/ear-context/main/ui.cpp`.
+void check_font(const lv_font_t* font, const char* name) {
+    const auto* dsc = static_cast<const lv_font_fmt_txt_dsc_t*>(font->dsc);
+    if (!LV_USE_FONT_COMPRESSED && dsc != nullptr &&
+        dsc->bitmap_format != LV_FONT_FMT_TXT_PLAIN) {
+        ESP_LOGE(kTag,
+                 "%s has compressed glyph bitmaps but LV_USE_FONT_COMPRESSED=0: no text will "
+                 "be drawn. Regenerate it with --no-compress --no-prefilter.",
+                 name);
+    }
+}
+
 lv_obj_t* env_value;
 lv_obj_t* action_value;
 lv_obj_t* voice_value;
 lv_obj_t* tune_value;
 lv_obj_t* media_value;
 lv_obj_t* link_value;
+/// 「感知」卡片的标题行。分数写在这一行，因为值行被最长的类别名（"near_voice"）占满。
+lv_obj_t* context_title;
+lv_obj_t* context_value;
 lv_obj_t* detail_value;
 lv_obj_t* performance_value;
 lv_obj_t* confidence_bar;
@@ -73,8 +99,11 @@ void gesture_cb(lv_event_t* event) {
     lv_event_stop_bubbling(event);
 }
 
+/// `title_out`, when given, receives the title label. The 感知 card needs it because its
+/// score has to be written there: the value line is already filled by the longest class name
+/// (`near_voice`), and a 60 px-tall card only has room for one value line.
 lv_obj_t* make_card(lv_obj_t* parent, int x, int y, int w, int h,
-                    const char* title, lv_obj_t** value) {
+                    const char* title, lv_obj_t** value, lv_obj_t** title_out = nullptr) {
     lv_obj_t* card = lv_obj_create(parent);
     lv_obj_set_pos(card, x, y);
     lv_obj_set_size(card, w, h);
@@ -89,6 +118,7 @@ lv_obj_t* make_card(lv_obj_t* parent, int x, int y, int w, int h,
     lv_label_set_text(label, title);
     lv_obj_set_style_text_color(label, lv_color_hex(0x8E99A8), 0);
     lv_obj_set_style_text_font(label, &lv_font_ui_16, 0);
+    if (title_out != nullptr) *title_out = label;
     *value = lv_label_create(card);
     lv_obj_set_pos(*value, 0, 25);
     lv_obj_set_width(*value, w - 14);
@@ -100,6 +130,7 @@ lv_obj_t* make_card(lv_obj_t* parent, int x, int y, int w, int h,
 }  // namespace
 
 void demo_ui_create() {
+    check_font(&lv_font_ui_16, "lv_font_ui_16");
     lv_obj_t* screen = lv_screen_active();
     lv_obj_set_style_bg_color(screen, lv_color_hex(0x0B0D11), 0);
     lv_obj_set_style_text_color(screen, lv_color_hex(0xFFFFFF), 0);
@@ -134,8 +165,19 @@ void demo_ui_create() {
     lv_obj_set_style_text_color(badge, lv_color_hex(0x5FF2A7), 0);
     lv_obj_set_style_text_font(badge, &lv_font_ui_16, 0);
 
-    make_card(page_main, 10, 31, 92, 60, "环境", &env_value);
-    make_card(page_main, 108, 31, 202, 60, "当前动作", &action_value);
+    // Row 1 is three cards now. 环境 and 当前动作 gave up exactly the width their longest
+    // strings do not need ("人声嘈杂" is 4 glyphs = 64 px of the 66 px box; "保持当前设置" is 6
+    // = 96 px of 98), and 感知 takes the rest. Nothing moved rows and no card was removed:
+    // this is the "add a cell" the integration plan asks for, not a redesign.
+    //
+    // Why「感知」and not「情境」: lv_font_ui_16.c is a fixed 115-glyph subset and 情 is not in
+    // it. The first draft of this card used 情境 and would have drawn "境 0.87" with a hole
+    // where 情 belongs -- silently, with no log line, exactly like the compressed-font defect
+    // recorded in the README. tools/render_demo_ui.py caught it before flashing. Check any new
+    // label against that font (or run that tool) instead of assuming a common character exists.
+    make_card(page_main, 10, 31, 80, 60, "环境", &env_value);
+    make_card(page_main, 96, 31, 112, 60, "当前动作", &action_value);
+    make_card(page_main, 214, 31, 96, 60, "感知", &context_value, &context_title);
     make_card(page_main, 10, 97, 96, 60, "人声状态", &voice_value);
     make_card(page_main, 112, 97, 96, 60, "调音", &tune_value);
     make_card(page_main, 214, 97, 96, 60, "人声增益", &media_value);
@@ -144,6 +186,13 @@ void demo_ui_create() {
     lv_obj_set_style_text_font(voice_value, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_font(tune_value, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_font(media_value, &lv_font_montserrat_20, 0);
+    // The class names are the model's own nine labels ("near_voice", "babble", …). They are
+    // ASCII only on purpose: this is a status string that must never be blank, and
+    // montserrat_14 has no CJK at all, so a class name cannot hit a missing glyph.
+    // 96 px of card - 14 px of padding = 82 px; "near_voice" measures 78 px at this size.
+    // tools/render_demo_ui.py prints that width for every card, worst case included — run it
+    // after touching any of these strings.
+    lv_obj_set_style_text_font(context_value, &lv_font_montserrat_14, 0);
 
     detail_value = lv_label_create(page_main);
     lv_obj_set_pos(detail_value, 112, 158);
@@ -194,6 +243,26 @@ void demo_ui_update(const AnalysisFrame& frame, const EarbudCommand& command,
     char text[96];
     lv_label_set_text(env_value, environment_text(command.environment));
     lv_label_set_text(action_value, action_text(command));
+
+    // 感知 = 端侧小模型（v0.2-s3，92 维窗）的判断。它与上面「环境」那条**不是一回事**：
+    // 环境是本机自己的四分类，感知是模型的九分类，并排显示正是为了看清两者的分歧。
+    // 这一轮模型只显示、不参与决策（见 integration-plan.md 第二轮）。
+    if (command.context.valid) {
+        lv_label_set_text(context_value, command.context.class_name);
+        // 分数写在标题行：值行已经被最长的类别名（near_voice）占满。
+        std::snprintf(text, sizeof(text), "感知 %.2f",
+                      static_cast<double>(command.context.score));
+        lv_label_set_text(context_title, text);
+        // 低分不做装饰：界面不应该把 0.31 的猜测显示得和 0.95 一样像结论。
+        lv_obj_set_style_text_color(
+            context_value,
+            command.context.score >= 0.65f ? lv_color_hex(0x5FF2A7) : lv_color_hex(0xFFFFFF), 0);
+    } else {
+        // 窗口还没攒够 2 秒，或麦克风输入刚被打断。
+        lv_label_set_text(context_value, "--");
+        lv_label_set_text(context_title, "感知");
+        lv_obj_set_style_text_color(context_value, lv_color_hex(0x697384), 0);
+    }
 
     lv_label_set_text(voice_value, conversation_text(command.conversation));
     // Tuning, not noise reduction: this is how much the speech band is lifted.

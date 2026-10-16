@@ -1,8 +1,10 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <new>
 
 #include "bsp/esp-bsp.h"
+#include "context_window.hpp"
 #include "controller.hpp"
 #include "demo_ui.hpp"
 #include "esp_codec_dev.h"
@@ -95,21 +97,49 @@ void emit_command_json(const EarbudCommand& command) {
         std::printf("%s%.1f", band == 0 ? "" : ",",
                     static_cast<double>(command.ambient_band_dbfs[band]));
     }
-    std::printf("]}\n");
+    // 情境模型只上报，不参与任何决策。`"context_valid":false` 就是"窗口还没攒够 2 秒"，
+    // 上位机要能把它与"模型说 unknown"分开。类别名与训练那 9 个字符串逐字相同：
+    // 屏幕、串口、模型头文件共用 listening_model.h 的 kClassNames 这一份。
+    std::printf("],\"context\":\"%s\",\"context_score\":%.3f,\"context_valid\":%s,"
+                "\"context_us\":%ld}\n",
+                command.context.class_name, static_cast<double>(command.context.score),
+                command.context.valid ? "true" : "false",
+                static_cast<long>(command.context.inference_us));
 }
 
 /// Report the per-stage breakdown, then clear the window so the next report covers the
 /// next interval. A rolling window that never resets would blend the whole session and
 /// hide a regression that started an hour in.
+///
+/// The model's own percentiles ride along as top-level fields rather than as an eighth
+/// `stages[]` entry. The stage list is the energy path ("capture → analyse → embed → decide
+/// → transport → apply → render"), it is named in the host's `LOCAL_STAGES`, and it is
+/// asserted in two host tests; a model forward pass is not a stage of that path. Adding a
+/// field to a known message type is invisible to the host parser (it reads keys by name),
+/// while adding a stage would have dragged the panel, the protocol layer and their tests in.
+///
+/// `stack_high_water` is this task's minimum free stack, in bytes, since boot (this port
+/// declares `portSTACK_TYPE` as uint8_t, so FreeRTOS' "words" are bytes here). It is in the
+/// report because this round's first build overflowed that stack and rebooted the device in a
+/// loop, and nothing in the log said how thin the margin had been beforehand. A number that
+/// only ever decreases is the cheapest way to keep the next addition honest.
 void emit_latency_report(latency::LatencyProfiler& profiler,
-                         const latency::ProfilerOverhead& overhead, uint32_t frames) {
+                         const latency::ProfilerOverhead& overhead,
+                         const context::ContextTiming& context_timing, uint32_t frames) {
     std::printf("{\"type\":\"latency\",\"frames\":%lu,\"total_p50_ms\":%.2f,"
                 "\"total_p95_ms\":%.2f,\"overhead_mean_us\":%.2f,\"overhead_max_us\":%.2f,"
-                "\"overhead_samples\":%lu,\"stages\":[",
+                "\"overhead_samples\":%lu,\"context_n\":%lu,\"context_p50_us\":%.0f,"
+                "\"context_p95_us\":%.0f,\"context_max_us\":%.0f,\"stack_high_water\":%lu,"
+                "\"stages\":[",
                 static_cast<unsigned long>(frames), profiler.total_p50_ms(),
                 profiler.total_p95_ms(), static_cast<double>(overhead.mean_us()),
                 static_cast<double>(overhead.max_us()),
-                static_cast<unsigned long>(overhead.samples()));
+                static_cast<unsigned long>(overhead.samples()),
+                static_cast<unsigned long>(context_timing.samples()),
+                static_cast<double>(context_timing.percentile(0.5f)),
+                static_cast<double>(context_timing.percentile(0.95f)),
+                static_cast<double>(context_timing.max_us()),
+                static_cast<unsigned long>(uxTaskGetStackHighWaterMark(nullptr)));
     for (std::size_t i = 0; i < latency::kStageCount; ++i) {
         const auto stage = static_cast<latency::Stage>(i);
         const latency::StageStats stats = profiler.stats(stage);
@@ -303,10 +333,28 @@ void processing_task(void*) {
                          MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     auto* encode_buffer =
         static_cast<char*>(heap_caps_malloc(mic_capture::kMaxEncodedChars, MALLOC_CAP_8BIT));
-    if (decimated == nullptr || pending == nullptr || encode_buffer == nullptr) {
+    // The 2 s model window is ~2.6 KB, and the model's percentile accumulator another ~2 KB
+    // (two 256-float arrays: the sample ring and the sort copy). Both go on the heap for the
+    // same reason as the buffers above -- this task has a 12 KB stack, and a module-level array
+    // would hide that cost (see the note on `emit_capture_chunk`'s buffer).
+    //
+    // This is not hypothetical: the first build of this round put `ContextTiming` on the stack
+    // and the audio task overflowed its stack within seconds of boot ("***ERROR*** A stack
+    // overflow in task audio_control has been detected"), rebooting the device in a loop. The
+    // `stack_high_water` field in the latency report is what makes the remaining margin
+    // visible rather than a matter of hope; it is reported in bytes (this port defines
+    // `portSTACK_TYPE` as uint8_t, so FreeRTOS' "words" are bytes here).
+    auto* context_window = static_cast<context::ContextWindow*>(
+        heap_caps_malloc(sizeof(context::ContextWindow), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    auto* context_timing = static_cast<context::ContextTiming*>(
+        heap_caps_malloc(sizeof(context::ContextTiming), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (decimated == nullptr || pending == nullptr || encode_buffer == nullptr ||
+        context_window == nullptr || context_timing == nullptr) {
         ESP_LOGE(kTag, "Capture buffer allocation failed");
         vTaskDelete(nullptr);
     }
+    new (context_window) context::ContextWindow();
+    new (context_timing) context::ContextTiming();
 
     NoiseAnalyzer analyzer;
     AdaptController controller;
@@ -579,6 +627,56 @@ void processing_task(void*) {
         EarbudCommand command = controller.update(frame, elapsed_ms);
         const int64_t decide_done_us = esp_timer_get_time();
 
+        // ---- 听音情境模型（融合第二轮：只上报，不改任何决策）----
+        //
+        // 窗口输入按**训练口径**构造，两处刻意与 ear-context 那套不同，理由与实测都在
+        // context_window.hpp 的文件头：
+        //   * 语音那一维用未过时域闸门的逐帧乘积（features.py 的 voice_likelihood 就是它），
+        //     不是 frame.voice_likelihood——后者 2026-10-16 起乘了 modulation_term()；
+        //   * 时间五维用 when=None 的默认基线，不是硬编码的"周一 00:00"。
+        // 运动两维保持 0（v0.2 是 motion=None 训的）。
+        const VoiceFeatures frame_features = extract_voice_features(frame);
+        context::ContextFrame wide_frame;
+        wide_frame.band_dbfs = frame.band_dbfs;
+        wide_frame.broadband_dbfs = frame.broadband_dbfs;
+        wide_frame.voice_product = voice_likelihood_from_features(frame_features);
+        wide_frame.spectral_flatness = frame_features.spectral_flatness;
+        wide_frame.vocal_peakiness = frame_features.vocal_peakiness;
+        wide_frame.vocal_ratio = frame_features.vocal_ratio;
+        wide_frame.excited_vocal_bands =
+            static_cast<float>(frame_features.excited_vocal_bands);
+        wide_frame.t_s = static_cast<double>(now_us) / 1.0e6;
+        if (frame.mic_valid) {
+            context_window->push(wide_frame);
+        } else {
+            // An interrupted input is not a continuous sound: keeping the window would let the
+            // frames before the gap form a slope and a modulation statistic together with the
+            // frames after it. The analyser has the same rule for its own history.
+            context_window->reset();
+        }
+
+        ContextResult context_result;
+        if (context_window->full()) {
+            float window_vector[context::kFeatureCount];
+            context_window->build_vector(window_vector);
+            float logits[listening_model::kClassCount];
+            const int64_t inference_started_us = esp_timer_get_time();
+            listening_model::classify(window_vector, logits);
+            const int64_t inference_us = esp_timer_get_time() - inference_started_us;
+            std::size_t class_index = 0;
+            float class_score = 0.0f;
+            context::top_class(logits, listening_model::kClassCount, &class_index, &class_score);
+            context_result.valid = true;
+            context_result.class_index = static_cast<uint8_t>(class_index);
+            context_result.score = class_score;
+            context_result.inference_us = static_cast<int32_t>(inference_us);
+            context_result.class_name = listening_model::kClassNames[class_index];
+            context_timing->record(static_cast<float>(inference_us));
+        }
+        // Assigned after `controller.update()`, and the controller never reads it back: that
+        // separation is what makes this a no-behaviour-change round.
+        command.context = context_result;
+
         const float analyse_ms = static_cast<float>(analyse_done_us - analyse_started_us) / 1000.0f;
         const float decide_ms = static_cast<float>(decide_done_us - analyse_done_us) / 1000.0f;
         const float processing_ms = static_cast<float>(decide_done_us - analyse_started_us) / 1000.0f;
@@ -612,8 +710,9 @@ void processing_task(void*) {
         }
 
         if (esp_timer_get_time() >= next_latency_report_us) {
-            emit_latency_report(profiler, overhead, analysed_frames);
+            emit_latency_report(profiler, overhead, *context_timing, analysed_frames);
             profiler.reset();
+            context_timing->reset();
             next_latency_report_us = esp_timer_get_time() + kLatencyReportPeriodUs;
         }
 
@@ -632,5 +731,17 @@ extern "C" void app_main(void) {
     demo_ui_create();
     bsp_display_unlock();
     bsp_display_backlight_on();
-    xTaskCreatePinnedToCore(processing_task, "audio_control", 12288, nullptr, 6, nullptr, 1);
+    // 16 KB, up from 12 KB. Two measured reasons, both from the round that put the model on
+    // this task:
+    //   * `latency::LatencyProfiler profiler` lives on this stack and is 7 KB on its own
+    //     (7 stages × 256 float samples), and `LatencyProfiler::stats()` sorts into another
+    //     1 KB local array. The 10-second latency report is therefore the deepest path here.
+    //   * With the model wired in at 12 KB the task overflowed its stack within seconds of
+    //     boot ("***ERROR*** A stack overflow in task audio_control has been detected") and
+    //     rebooted in a loop. The model's own working set is only ~500 bytes on the stack
+    //     (92-float window vector, one context frame); the 2 KB percentile accumulator was
+    //     the real cost and now lives on the heap with the window.
+    // The `stack_high_water` field in the latency report is the live number; measure it again
+    // after any addition to this task rather than trusting this comment.
+    xTaskCreatePinnedToCore(processing_task, "audio_control", 16384, nullptr, 6, nullptr, 1);
 }

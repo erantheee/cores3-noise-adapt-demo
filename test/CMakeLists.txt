@@ -41,3 +41,10 @@ add_test(NAME mic_decimator_test COMMAND mic_decimator_test)
 add_executable(voiceprint_gate_test voiceprint_gate_test.cpp ${COMMON_SOURCES})
 target_include_directories(voiceprint_gate_test PRIVATE ../main)
 add_test(NAME voiceprint_gate_test COMMAND voiceprint_gate_test)
+
+# The 92-dim model input window. It needs no COMMON_SOURCES: context_window.hpp is header-only
+# and deliberately free of ESP-IDF dependencies so this port can be checked against the
+# training-side implementation on the host (see test/context_window_golden.h).
+add_executable(context_window_test context_window_test.cpp)
+target_include_directories(context_window_test PRIVATE ../main)
+add_test(NAME context_window_test COMMAND context_window_test)

@@ -99,6 +99,27 @@ VoiceFeatures extract_voice_features(const AnalysisFrame& frame);
 /// against real recordings.
 float voice_likelihood_from_features(const VoiceFeatures& features);
 
+/// On-device listening-context model output (v0.2-s3, 92-dim window).
+///
+/// Written by the audio task right after `AdaptController::update()`, never by the controller
+/// itself: Round 2 of `docs/integration-plan.md` brings the model on device as **telemetry**
+/// (screen + serial JSON) and deliberately changes no decision. Round 3 is the round that may
+/// wire `horn` into `safety_hold`, and it has to extend this contract on purpose.
+///
+/// Declared here rather than in `context_window.hpp` so `EarbudCommand` carries the model
+/// result without the controller depending on the model header.
+struct ContextResult {
+    /// False until the 2 s window is full, and false again after an input interruption.
+    bool valid = false;
+    uint8_t class_index = 0;
+    /// Softmax confidence of `class_index`, in (0, 1].
+    float score = 0.0f;
+    /// One forward pass, microseconds.
+    int32_t inference_us = 0;
+    /// Points at a string literal from `listening_model.h`: static storage, never freed.
+    const char* class_name = "unknown";
+};
+
 struct EarbudCommand {
     uint32_t schema_version = 2;
     uint32_t sequence = 0;
@@ -114,6 +135,8 @@ struct EarbudCommand {
     bool earbud_link_connected = false;
     TuningMode tuning_mode = TuningMode::flat;
     ConversationState conversation = ConversationState::none;
+    /// Model telemetry. `AdaptController` never touches this field.
+    ContextResult context;
 };
 
 /// Turns one analysis frame into an `AnalysisFrame`, including the voice decision.
