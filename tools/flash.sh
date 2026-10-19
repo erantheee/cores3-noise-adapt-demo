@@ -88,7 +88,18 @@ echo "SHA256: $HASH"
 for pair in "0x0 $BOOT" "0x8000 $TABLE" "0x10000 $APP"; do
     # shellcheck disable=SC2086
     set -- $pair
-    "$ESPTOOL" --chip esp32s3 --port "$PORT" --baud 921600 write-flash \
+    "$ESPTOOL" --chip esp32s3 --port "$PORT" --baud 921600 --after no-reset write-flash \
         --flash-mode dio --flash-freq 80m --flash-size 16MB "$1" "$2"
 done
+
+# 刷完**主动把 app 跑起来**。实测 `Hard resetting via RTS pin` 在 USB-JTAG 上不一定生效：
+# 设备会停在下载模式（端口在、0 字节），启动日志第一行是
+# "E boot: No bootable app partitions" 或干脆没日志。watchdog-reset 能可靠复位进 app。
+# 再不行就提示拔插 USB，不让脚本假装成功。
+echo "复位并启动 app..."
+if ! "$ESPTOOL" --chip esp32s3 --port "$PORT" --before default-reset --after watchdog-reset run; then
+    echo "!! 自动启动失败。请拔插 USB（或按 CoreS3 的 RST），然后 sh tools/monitor.sh 确认有启动日志。" >&2
+    exit 1
+fi
+sleep 1
 echo "完成。日志：sh tools/monitor.sh"

@@ -397,7 +397,7 @@ g++ -std=c++17 -O2 -I main -o /tmp/voicsweep tools/voice_decision_sweep.cpp main
 | 24 段 Goertzel + 四判据 | **7.07 ms**（p50，真机） | 7% |
 | 决策 | 0.31 ms（D16 版真机） | 0.3% |
 | 9 类情境模型 3,657 参数前向 | **0.18 ms**（p50，真机） | 0.2% |
-| 声音事件判断（15 维规则） | 估算 0.02–0.05 ms（**未单独打点**） | <0.1% |
+| 声音事件判断（15 维规则） | **0.269 ms**（p50，真机实测 2026-10-19） | 0.27% |
 | YAMNet INT8（社区数据，非本机实测） | ~500 ms / 0.96 s patch | 10 Hz 下不可行；1 Hz 约单核 50% |
 
 资源：ESP32-S3 双核 240 MHz、无 NPU、16 MB flash、8 MB PSRAM（quad，32 KB data cache）。

@@ -221,7 +221,9 @@ v4 还带判据遥测：`broadband_dbfs` / `voice_likelihood` / `vocal_ratio` / 
 [`experiments/sound-events/README.md`](experiments/sound-events/README.md)：
 
 - 输入仍是固件已有的 24 段 dBFS + 宽带电平，**不新增 DSP**；15 维特征（质心、斜率、
-  语音带峰值集中度、低频能量占比、包络起伏……）全部是它们的初等函数。
+  语音带峰值集中度、低频能量占比、包络起伏……）全部是它们的初等函数。真机实测一次判断
+  **p50 269 µs / p95 276 µs / max 319 µs**（`latency` 报文的 `event_p50_us`，2026-10-19），
+  占 100 ms 节拍的 0.27%。
 - 输出 `event`：`quiet / speech / keyboard / wind / artifact`，随串口帧下发，面板新增
   「事件（端侧规则）」卡。`event_valid=false` 表示 1 s 窗没攒满或刚被撞击清空——界面必须把它
   与"判断为安静"分开，否则就是在把"还没判断"说成"判断为安静"。

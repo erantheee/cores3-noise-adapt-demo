@@ -190,11 +190,14 @@ void emit_command_json(const EarbudCommand& command) {
 /// only ever decreases is the cheapest way to keep the next addition honest.
 void emit_latency_report(latency::LatencyProfiler& profiler,
                          const latency::ProfilerOverhead& overhead,
-                         const context::ContextTiming& context_timing, uint32_t frames) {
+                         const context::ContextTiming& context_timing,
+                         const context::ContextTiming& event_timing, uint32_t frames) {
     std::printf("{\"type\":\"latency\",\"frames\":%lu,\"total_p50_ms\":%.2f,"
                 "\"total_p95_ms\":%.2f,\"overhead_mean_us\":%.2f,\"overhead_max_us\":%.2f,"
                 "\"overhead_samples\":%lu,\"context_n\":%lu,\"context_p50_us\":%.0f,"
-                "\"context_p95_us\":%.0f,\"context_max_us\":%.0f,\"stack_high_water\":%lu,"
+                "\"context_p95_us\":%.0f,\"context_max_us\":%.0f,"
+                "\"event_n\":%lu,\"event_p50_us\":%.0f,\"event_p95_us\":%.0f,"
+                "\"event_max_us\":%.0f,\"stack_high_water\":%lu,"
                 "\"stages\":[",
                 static_cast<unsigned long>(frames), profiler.total_p50_ms(),
                 profiler.total_p95_ms(), static_cast<double>(overhead.mean_us()),
@@ -204,6 +207,10 @@ void emit_latency_report(latency::LatencyProfiler& profiler,
                 static_cast<double>(context_timing.percentile(0.5f)),
                 static_cast<double>(context_timing.percentile(0.95f)),
                 static_cast<double>(context_timing.max_us()),
+                static_cast<unsigned long>(event_timing.samples()),
+                static_cast<double>(event_timing.percentile(0.5f)),
+                static_cast<double>(event_timing.percentile(0.95f)),
+                static_cast<double>(event_timing.max_us()),
                 static_cast<unsigned long>(uxTaskGetStackHighWaterMark(nullptr)));
     for (std::size_t i = 0; i < latency::kStageCount; ++i) {
         const auto stage = static_cast<latency::Stage>(i);
@@ -419,14 +426,18 @@ void processing_task(void*) {
     static_assert(sound_event::kBandCount == kBandCount, "事件判断与控制器频段数不一致");
     auto* sound_event_detector = static_cast<sound_event::Detector*>(
         heap_caps_malloc(sizeof(sound_event::Detector), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    auto* event_timing = static_cast<context::ContextTiming*>(
+        heap_caps_malloc(sizeof(context::ContextTiming), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     if (decimated == nullptr || pending == nullptr || encode_buffer == nullptr ||
-        context_window == nullptr || context_timing == nullptr || sound_event_detector == nullptr) {
+        context_window == nullptr || context_timing == nullptr || sound_event_detector == nullptr ||
+        event_timing == nullptr) {
         ESP_LOGE(kTag, "Capture buffer allocation failed");
         vTaskDelete(nullptr);
     }
     new (context_window) context::ContextWindow();
     new (context_timing) context::ContextTiming();
     new (sound_event_detector) sound_event::Detector();
+    new (event_timing) context::ContextTiming();
 
     NoiseAnalyzer analyzer;
     AdaptController controller;
@@ -793,9 +804,11 @@ void processing_task(void*) {
         // 撞击（削波）帧不进入 1 s 事件窗：Detector 内部会清窗并报 artifact。这样"撞桌子"
         // 不会因为瞬态形状像键盘而被判成键盘。窗长 1 s，比 9 类模型的 2 s 窗短——
         // 键盘/阵风是短事件，2 s 会把它们平均掉。
+        const int64_t event_started_us = esp_timer_get_time();
         const sound_event::Output sound_event_out = sound_event_detector->push(
             frame.band_dbfs, frame.broadband_dbfs, frame.mic_valid,
             static_cast<float>(now_us) / 1.0e6f);
+        event_timing->record(static_cast<float>(esp_timer_get_time() - event_started_us));
         command.event.valid = sound_event_out.valid;
         command.event.class_name = sound_event::class_name(sound_event_out.cls);
 
@@ -832,9 +845,11 @@ void processing_task(void*) {
         }
 
         if (esp_timer_get_time() >= next_latency_report_us) {
-            emit_latency_report(profiler, overhead, *context_timing, analysed_frames);
+            emit_latency_report(profiler, overhead, *context_timing, *event_timing,
+                                analysed_frames);
             profiler.reset();
             context_timing->reset();
+            event_timing->reset();
             next_latency_report_us = esp_timer_get_time() + kLatencyReportPeriodUs;
         }
 

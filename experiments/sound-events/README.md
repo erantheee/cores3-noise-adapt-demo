@@ -193,6 +193,8 @@ ctest --test-dir build-host-tests --output-on-failure
 
 实测多条件会话（183 s，quiet/keyboard/wind/knock/speech/再键盘/再风）：
 **1716 帧（9.37 Hz）、182.7 s 音频、9136 块、0 丢块、0 坏行**。
+端侧规则判断实测 **p50 269 µs / p95 276 µs**（占 100 ms 节拍 0.27%）。该会话的音频与
+10 Hz 频段已作为数据快照提交在 `data/teacher-20261019-multi/`。
 
 ### 教师实测
 

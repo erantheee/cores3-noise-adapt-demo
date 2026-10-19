@@ -6,3 +6,7 @@
 **/data/
 **/dataset_*.npz
 
+
+# 例外：声音事件/蒸馏实验的数据快照要入库（只含频段与标签，不含原始音频）
+!sound-events/data/
+!sound-events/data/**

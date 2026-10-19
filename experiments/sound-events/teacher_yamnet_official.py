@@ -72,6 +72,13 @@ def main() -> int:
     args = parser.parse_args()
 
     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+    # 这个隔离 venv 里 distutils-precedence.pth 有时不执行（Python 3.12 已移除 distutils，
+    # TensorFlow 2.16 仍会 import 它）。显式装回 setuptools 的 shim，别让教师依赖启动脚本的运气。
+    try:
+        import distutils  # noqa: F401
+    except ModuleNotFoundError:
+        import _distutils_hack
+        _distutils_hack.add_shim()
     import tensorflow_hub as hub
     import tensorflow as tf
 
