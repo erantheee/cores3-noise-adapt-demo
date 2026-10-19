@@ -652,3 +652,8 @@ constexpr EvidencePolicy kEvidencePolicy = EvidencePolicy::near_field_demo;  // 
 **不能继续在文档里写"100 Hz"**，所以在这里更正。
 
 `C5b` 的两种策略并存同样待查（可能是同一次轮询跨越了设备重启/重烧的时刻）。
+
+**同日复测（20 秒窗口）**：7/8 通过——`C5b` 恢复一致（`policy=['near_field_demo']`、
+`source=['near_field']`），C2 809/809 帧就绪、C3 重力 p50 9.87、C4b 丢采样 0；
+`C4c` 稳定在 **29.2 Hz**，即 30 Hz 附近不是偶发，是稳定值。另观察到演示模式确实在动作：
+809 帧里 324 帧下压、最低 `media=60%`——**行为链路在真机上是通的**，问题只在证据与采样率。
