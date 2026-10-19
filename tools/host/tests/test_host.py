@@ -524,6 +524,8 @@ def test_latency_report() -> None:
     check(bool(latency_lines), "真机日志里应当有 latency 汇总")
     parsed = parse_line(latency_lines[0])
     check(isinstance(parsed.value, LatencyReport), "latency 解析为 LatencyReport")
+    check(parsed.value.event_p50_us >= 0.0, "latency 带出事件判断耗时（缺字段按 0）")
+    check(parsed.value.context_p50_us >= 0.0, "latency 带出感知模型耗时（缺字段按 0）")
     report = parsed.value
     eq(report.frames, 7047, "汇总的帧数（真机原文）")
     close(report.overhead_mean_us, 1.53, "打点自身开销均值")

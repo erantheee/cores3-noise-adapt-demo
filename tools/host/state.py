@@ -773,6 +773,9 @@ class HostState:
                 "total_p95_ms": latency.total_p95_ms,
                 "overhead_mean_us": latency.overhead_mean_us,
                 "overhead_max_us": latency.overhead_max_us,
+                # 两个端侧小模型的耗时也带出来：它们在 stages 之外，但同样是实时成本。
+                "context_p50_us": latency.context_p50_us,
+                "event_p50_us": latency.event_p50_us,
                 "age_s": round(now - (self.latency_at or now), 1),
                 "stages": [
                     {

@@ -228,6 +228,10 @@ class LatencyReport:
     overhead_mean_us: float
     overhead_max_us: float
     overhead_samples: int
+    #: 一次感知模型（92 维窗）推理的 p50，微秒；0 = 该版固件没发这个字段。
+    context_p50_us: float = 0.0
+    #: 一次声音事件判断的 p50，微秒；0 = 该版固件没发这个字段。
+    event_p50_us: float = 0.0
     stages: tuple[StageStat, ...] = ()
 
     def stage(self, name: str) -> StageStat | None:
@@ -599,6 +603,8 @@ def _parse_latency(payload: dict[str, Any]) -> ParsedLine:
             overhead_mean_us=d2(_as_float(payload, "overhead_mean_us") or 0.0),
             overhead_max_us=d2(_as_float(payload, "overhead_max_us") or 0.0),
             overhead_samples=_as_int(payload, "overhead_samples") or 0,
+            context_p50_us=d2(_as_float(payload, "context_p50_us") or 0.0),
+            event_p50_us=d2(_as_float(payload, "event_p50_us") or 0.0),
             stages=tuple(stages),
         ),
         json_line=True,

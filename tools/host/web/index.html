@@ -770,7 +770,8 @@ function renderLatency(s) {
     })
     .join("");
   $("latency-note").textContent =
-    `最近一次汇总：${s.latency.frames} 帧前累计 · ${s.latency.age_s} 秒前收到 · 打点自身开销 ${s.latency.overhead_mean_us} µs（max ${s.latency.overhead_max_us} µs）。` +
+    `最近一次汇总：${s.latency.frames} 帧前累计 · ${s.latency.age_s} 秒前收到 · 打点自身开销 ${s.latency.overhead_mean_us} µs（max ${s.latency.overhead_max_us} µs）· `
+    + `事件判断 ${s.latency.event_p50_us ?? 0} µs · 感知模型 ${s.latency.context_p50_us ?? 0} µs。` +
     "「未实现」＝端侧阶段测得的值为 0（声纹推理还没接进来），不是因为它免费；" +
     "「无样本」＝该阶段要由对端上报，而当前没有接通的对端。";
 }
