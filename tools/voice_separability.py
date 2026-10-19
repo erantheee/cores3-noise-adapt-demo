@@ -29,7 +29,12 @@
 
 依赖与运行
 ----------
-后端是 ECAPA-TDNN（speechbrain 的 `spkrec-ecapa-voxceleb`，192 维，与
+后端可选 ECAPA-TDNN（speechbrain 的 `spkrec-ecapa-voxceleb`，192 维）或
+WavLM speaker verification（`microsoft/wavlm-base-plus-sv`，512 维）。后者在
+2026-10-19 的同一批素材上把间距/抖动从 1.59 提升到 5.27，是本项目声纹门控的
+候选后端；模型约 360 MB，只在 Mac/PC 上跑，不进端侧。
+
+ECAPA 仍是默认后端（192 维，与
 `main/voiceprint_gate.hpp` 里 `kEmbeddingSize` 的假设一致）。第一次跑会从 HuggingFace
 下模型（约 80 MB），缓存在 `~/.cache/voice_separability/`，不进仓库。
 
@@ -149,6 +154,20 @@ def _ecapa_classifier():
     return _EMBED_CACHE["ecapa"]
 
 
+def _wavlm_sv():
+    """WavLM speaker-verification 后端。比 ECAPA 对通道/内容变化更稳。"""
+    if "wavlm" not in _EMBED_CACHE:
+        _require("torch", "pip install torch")
+        _require("numpy", "pip install numpy")
+        transformers = _require("transformers", "pip install transformers")
+        model_name = "microsoft/wavlm-base-plus-sv"
+        feature_extractor = transformers.AutoFeatureExtractor.from_pretrained(model_name)
+        model = transformers.WavLMForXVector.from_pretrained(model_name)
+        model.eval()
+        _EMBED_CACHE["wavlm"] = (feature_extractor, model)
+    return _EMBED_CACHE["wavlm"]
+
+
 def embed(samples, rate: int, backend: str):
     """产出一条单位长度的 speaker embedding。"""
     if backend == "speechbrain":
@@ -164,12 +183,28 @@ def embed(samples, rate: int, backend: str):
         if norm == 0.0:
             raise MissingDependency("embedding 全零，模型没有正常工作。")
         return vector / norm
+    if backend == "wavlm":
+        torch = _require("torch", "pip install torch")
+        import numpy as np  # noqa: PLC0415
+
+        feature_extractor, model = _wavlm_sv()
+        if rate != 16000:
+            raise MissingDependency("WavLM 后端要求 16 kHz 输入（load_audio 会重采样）")
+        with torch.no_grad():
+            inputs = feature_extractor(np.asarray(samples, dtype=np.float32),
+                                       sampling_rate=16000, return_tensors="pt")
+            vector = model(**inputs).embeddings.squeeze().cpu().numpy()
+        vector = np.asarray(vector, dtype=np.float64).ravel()
+        norm = float(np.linalg.norm(vector))
+        if norm == 0.0:
+            raise MissingDependency("WavLM embedding 全零，模型没有正常工作。")
+        return vector / norm
     if backend == "esp-sr":
         raise MissingDependency(
             "esp-sr 的声纹模型只跑在 ESP 芯片上，不能用于本机测量。\n"
             "本工具的作用正是**先于**端侧实现判断可分性，所以请用 PC 侧模型（--backend speechbrain）。"
         )
-    raise MissingDependency(f"未知后端 {backend!r}。可用：speechbrain。")
+    raise MissingDependency(f"未知后端 {backend!r}。可用：speechbrain / wavlm。")
 
 
 def cosine(a, b) -> float:
