@@ -10,6 +10,7 @@
 |---|---|
 | `teacher-20261019-multi/` | 一次 183 s 多条件采集的 **16 kHz 音频**（`audio.wav`）、**10 Hz 24 段**（`frames.jsonl`）、分段边界（`phases.json`）、采集元信息（`meta.json`），以及两个教师的逐窗标签（`teacher_yamnet.jsonl`、`teacher_ast.jsonl`） |
 | `teacher-20261019-tts/` | 2026-10-19 用 4 个 TTS 音色（Tingting/Meijia/Daniel/Samantha）经 Mac 扬声器播 183 s 的**说话正样本**：16 kHz 音频、10 Hz 24 段、教师 YAMNet 标签 |
+| `gateeval-20261019/` | 120 s 受控代理场景（Mac 外放：静音/大声/小声/风/键盘/说话+风）：音频 + 10 Hz 24 段 + 阶段边界 + 教师标签 |
 | `ambient-20261019-gatefix/` | 12 s 安静环境（无说话）采集：16 kHz 音频 + 10 Hz 24 段 + 设备端 gate 值，用于排查"训练侧电平口径 vs 设备 broadband"不一致 |
 | `captures/*.csv` | 规则/学生评估用的逐帧 24 段采集（安静/键盘/风/说话/敲桌），由 `tools/live_band_capture.py` 记录 |
 | `SHA256SUMS` | 全部文件的校验和 |

@@ -288,3 +288,17 @@ TFHUB_CACHE_DIR=$PWD/.tfhub-cache experiments/sound-events/.venv-teacher/bin/pyt
 .venv/bin/python experiments/sound-events/export_speech_gate.py
 cd build-host-tests && cmake --build . && ctest
 ```
+
+
+### 受控代理评估（2026-10-19）
+
+`tools/collect_teacher_data.py --script quiet:15,speech_loud:20,quiet2:8,speech_soft:20,wind_only:15,keyboard_only:15,speech_wind:20,quiet3:8 --no-cue`
+同时用 Mac 外放 TTS / 键盘录音 / 风录音，设备采 120.7 s（1135 帧、0 丢块）。
+评估：
+
+```sh
+.venv/bin/python experiments/sound-events/evaluate_speech_gate.py 记录/教师数据/20261019-163120-gateeval
+```
+
+结果：大声 95%、小声 74%、说话+风 100%，但风 54%、键盘 79%、安静 0–40% 被判 speech
+（综合误报 44%）。**扬声器回放的风/键盘与真实声学不同，只能做机制验证，不能当 D19 验收**。

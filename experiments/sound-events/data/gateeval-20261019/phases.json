@@ -1,0 +1,36 @@
+{
+  "phases": [
+    {
+      "phase": "quiet",
+      "host_ms": 0
+    },
+    {
+      "phase": "speech_loud",
+      "host_ms": 15000
+    },
+    {
+      "phase": "quiet2",
+      "host_ms": 35000
+    },
+    {
+      "phase": "speech_soft",
+      "host_ms": 43000
+    },
+    {
+      "phase": "wind_only",
+      "host_ms": 63000
+    },
+    {
+      "phase": "keyboard_only",
+      "host_ms": 78000
+    },
+    {
+      "phase": "speech_wind",
+      "host_ms": 93000
+    },
+    {
+      "phase": "quiet3",
+      "host_ms": 113000
+    }
+  ]
+}
