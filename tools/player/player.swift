@@ -247,6 +247,11 @@ final class Player {
         lock.lock()
         for index in 0..<bandCenters.count {
             currentBands[index] += (targetBands[index] - currentBands[index]) * rampFraction
+            // 指数斜坡永远到不了 0，会一直衰减到 denormal（面板上曾显示 1e-278 这种数）。
+            // 足够接近目标就吸附，显示和听感都不会有区别。
+            if abs(currentBands[index] - targetBands[index]) < 1e-6 {
+                currentBands[index] = targetBands[index]
+            }
         }
         let gains = currentBands
         let shouldBypass = bypass

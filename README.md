@@ -136,7 +136,8 @@ v4 = `ambient_open`（环境声开放意图）。`event` / `event_valid`（端�
 **`ambient_open` 是意图，不是执行回执。** S3 决定"对话成立，应该让现实声音进来"，执行端
 由 Mac 选：当前 demo 是 `--ambient-executor relay`（S3 麦克风中继，S3 说开才放行音频包）；
 后续是 `--ambient-executor airpods`（兄弟工程 `airpods-control` 切通透模式，关闭切回原模式）。
-执行结果、失败原因、放行/丢弃包数在面板「环境声」卡上单独显示；没有执行端时意图仍然可见，
+`host_up.sh` 真机模式默认 `--ambient-executor airpods`（D24）；也可显式传
+`--ambient-executor relay` 或 `off`。执行结果、失败原因、放行/丢弃包数在面板「环境声」卡上单独显示；没有执行端时意图仍然可见，
 不允许把意图写成已执行。
 
 没有 Mac 执行回执前，`execution` 必须保持 `decision_only`。现实人声模式下 `eq_gain_db` 必须平直；

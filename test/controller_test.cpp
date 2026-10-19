@@ -28,6 +28,8 @@ bool all_bands_flat(const EarbudCommand& command) {
     }
     return true;
 }
+
+
 }  // namespace
 
 int main() {
@@ -66,10 +68,21 @@ int main() {
               "sustained nearby voice confirms the conversation");
         check(engaged.ambient_open, "confirmed conversation asks for the environment to open");
         check(engaged.media_percent <= 61, "confirmed conversation ducks to the floor");
-        check(engaged.tuning_mode == TuningMode::flat, "a conversation never lifts the song EQ");
+        check(engaged.tuning_mode == TuningMode::flat,
+              "a conversation never lifts the song EQ");
         check(all_bands_flat(engaged), "every EQ band stays flat during a conversation");
         check(engaged.external_voice_gain_db == 0,
               "no fake 'real-voice gain' is reported during a conversation");
+    }
+
+    // ---- 人声消失后：对话保持期不能再把中频抬着 ----
+    {
+        AdaptController holder;
+        for (int i = 0; i < 12; ++i) holder.update(frame(-50, 0.8f), 150);
+        EarbudCommand silent = holder.update(frame(-70, 0.0f), 150);
+        check(silent.conversation != ConversationState::none,
+              "人声刚消失时对话仍在保持期");
+        check(all_bands_flat(silent), "对话保持期（没人声）EQ 回到全平直");
     }
 
     // ---- 对话预测不依赖自身语音证据（旧实现"反应太慢"的根因）----
@@ -153,8 +166,8 @@ int main() {
         song.conversation = ConversationState::none;
         for (std::size_t band = 0; band < kBandCount; ++band) song.eq_gain_db[band] = 6.0f;
         apply_wind_eq(song);
-        check(song.eq_gain_db[0] == 2.0f && song.eq_gain_db[4] == 2.0f,
-              "wind EQ caps the five low bands at +2 dB");
+        check(song.eq_gain_db[0] == 1.5f && song.eq_gain_db[4] == 1.5f,
+              "wind EQ scales the five low bands down to 1/4");
         check(song.eq_gain_db[5] == 6.0f && song.eq_gain_db[23] == 6.0f,
               "wind EQ leaves mid/high band lifts untouched");
 
@@ -175,7 +188,7 @@ int main() {
         already_low.tuning_mode = TuningMode::song_eq;
         already_low.eq_gain_db[0] = 1.0f;
         apply_wind_eq(already_low);
-        check(already_low.eq_gain_db[0] == 1.0f, "wind EQ never raises a low band");
+        check(already_low.eq_gain_db[0] == 0.25f, "wind EQ reduces, never raises, a low band");
     }
 
     check(std::string(adapt_state_name(AdaptState::adjusting)) == "ADJUSTING",

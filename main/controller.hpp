@@ -231,8 +231,10 @@ struct EarbudCommand {
 //   * 低频段 = 前 5 个频段（70.7–451.7 Hz），因为它们装的是风噪/轰鸣的主要能量。
 // 真机听感验证需要真实风环境，见 docs/decisions.md D21 的待办。
 namespace wind_eq {
-/// 风时低频段允许的最大抬升（dB）。控制器给 0 增益时不动，只压"抬得过高"的频段。
-constexpr float kLowBandCapDb = 2.0f;
+/// 风时低频段抬升的保留比例。控制器对低频段的建议最大只有 1.8 dB（4 dB × 0.45），
+/// 用"+2 dB 上限"根本碰不到——2026-10-19 实测听不出变化。风噪本身已经占满低频，
+/// 所以直接把低频抬升压到原来的 1/4；配合播放器深度 4，约等于低频少抬 5 dB。
+constexpr float kLowBandScale = 0.25f;
 /// 低频段数量：0..4（70.7 / 141.4 / 244.9 / 346.4 / 451.7 Hz）。
 constexpr std::size_t kLowBandCount = 5;
 }  // namespace wind_eq
@@ -242,9 +244,7 @@ inline void apply_wind_eq(EarbudCommand& command) {
     if (command.tuning_mode != TuningMode::song_eq) return;
     if (command.conversation != ConversationState::none) return;
     for (std::size_t band = 0; band < wind_eq::kLowBandCount; ++band) {
-        if (command.eq_gain_db[band] > wind_eq::kLowBandCapDb) {
-            command.eq_gain_db[band] = wind_eq::kLowBandCapDb;
-        }
+        command.eq_gain_db[band] *= wind_eq::kLowBandScale;
     }
 }
 

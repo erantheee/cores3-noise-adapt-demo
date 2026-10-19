@@ -59,6 +59,12 @@ if [ "${1:-}" = "--detach" ]; then
 fi
 
 set -- --web-port "$WEB_PORT" "$@"
+# 环境声执行端默认 airpods：S3 说"对话成立"就切通透。没有 CLI / AX 权限 / 耳机时，
+# 执行端会在面板上如实报不可用；传 --ambient-executor off/relay 可覆盖。
+case " $* " in
+    *" --ambient-executor "*|*" --mock "*|*" --replay "*) : ;;
+    *) set -- --ambient-executor airpods "$@" ;;
+esac
 if [ -n "${CORES3_PORT:-}" ]; then
     case " $* " in
         *" --mock "*|*" --replay "*) : ;;

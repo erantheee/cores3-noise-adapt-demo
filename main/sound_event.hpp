@@ -299,7 +299,16 @@ public:
     void set_config(const Config& config) { config_ = config; }
 
     /// now_s：单调时钟（秒）。返回值同时更新内部状态。
+    ///
+    /// `artifact` 不是声音类别，只是"输入中断/窗已清空"的标记。它**不能**被保持到
+    /// 有效帧上：Detector 复窗后的第一帧 valid=true 如果还报 artifact，就与协议
+    /// "artifact 只能出现在 valid=false" 自相矛盾（上位机 2026-10-19 实测抓到
+    /// 585 s 处连续刷 `event_valid=true 却报了 'artifact'`）。所以一旦有有效帧恢复，
+    /// 立即退出 artifact，按本轮 raw 类别重新开始保持。
     Class update(Class raw, float now_s) {
+        if (state_ == Class::artifact && raw != Class::artifact) {
+            hold_until_s_ = -1.0f;
+        }
         switch (raw) {
             case Class::keyboard:
                 state_ = Class::keyboard;

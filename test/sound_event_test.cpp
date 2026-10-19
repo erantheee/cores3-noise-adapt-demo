@@ -153,10 +153,8 @@ void test_state_machine() {
           "状态机：说话保持到期退回 quiet");
 
     machine.update(sound_event::Class::artifact, 6.0f);
-    check(machine.update(sound_event::Class::quiet, 7.0f) == sound_event::Class::artifact,
-          "状态机：撞击保持期内报 artifact");
-    check(machine.update(sound_event::Class::quiet, 8.1f) == sound_event::Class::quiet,
-          "状态机：撞击保持到期退回 quiet");
+    check(machine.update(sound_event::Class::quiet, 7.0f) == sound_event::Class::quiet,
+          "状态机：有效帧恢复后立即退出 artifact（artifact 不是声音类别，不能保持）");
 }
 
 void test_artifact_clears_window() {
@@ -179,15 +177,11 @@ void test_artifact_clears_window() {
     }
     check(!out.valid, "撞击测试：清窗后 9 帧仍无效");
     out = detector.push(flat_bands(-70.0f), -50.0f, true, 4.2f);
-    check(out.valid, "撞击测试：清窗后第 10 帧恢复有效（状态机仍在撞击保持期）");
-    check(out.cls == sound_event::Class::artifact,
-          "撞击测试：撞击保持期内即使窗重新有效也报 artifact");
-
-    // 保持期（2 s）过后回到 quiet。
-    for (int i = 0; i < 25; ++i) {
-        out = detector.push(flat_bands(-70.0f), -50.0f, true, 4.3f + 0.1f * static_cast<float>(i));
-    }
-    check(out.cls == sound_event::Class::quiet, "撞击测试：保持期过后回到 quiet");
+    check(out.valid, "撞击测试：清窗后第 10 帧恢复有效");
+    // 关键回归：valid=true 的那一帧绝不能再报 artifact（协议规定 artifact 只在 valid=false）。
+    check(out.cls != sound_event::Class::artifact,
+          "撞击测试：恢复有效的帧不再报 artifact（上位机协议一致）");
+    check(out.cls == sound_event::Class::quiet, "撞击测试：恢复后按本轮输入判为 quiet");
 }
 
 void test_invalid_frame_does_not_move_floor() {
