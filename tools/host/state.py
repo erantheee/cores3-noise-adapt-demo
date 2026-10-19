@@ -726,6 +726,7 @@ class HostState:
                 "state_text": state_text(frame.state),
                 "environment": frame.environment,
                 "environment_text": environment_text(frame.environment),
+                "noise_spectrum": frame.noise_spectrum,
                 # 端侧情境模型。四个字段整体为 None 表示这一帧没报（融合第二轮之前的固件），
                 # `valid=false` 表示报了、但窗口还没攒够——界面必须把这两件事分开显示。
                 "own_voice_confidence": frame.own_voice_confidence,

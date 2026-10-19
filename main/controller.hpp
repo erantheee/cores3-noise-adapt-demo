@@ -59,6 +59,16 @@ enum class EnvironmentKind : uint8_t {
     loud,
 };
 
+/// 当前遮蔽噪声主要落在哪个频段。它来自 24 段实测谱，不把“风/键盘”等事件类别
+/// 硬猜成频率；事件模型回答是什么声音，频谱分类回答歌曲该补哪里。
+enum class NoiseSpectrum : uint8_t {
+    none,
+    low,
+    mid,
+    high,
+    mixed,
+};
+
 struct AnalysisFrame {
     uint32_t timestamp_ms = 0;
     float broadband_dbfs = -120.0f;
@@ -200,6 +210,7 @@ struct EarbudCommand {
     std::array<float, kBandCount> ambient_band_dbfs{};
     AdaptState state = AdaptState::observing;
     EnvironmentKind environment = EnvironmentKind::quiet;
+    NoiseSpectrum noise_spectrum = NoiseSpectrum::none;
     float confidence = 0.0f;
     bool earbud_link_connected = false;
     TuningMode tuning_mode = TuningMode::flat;
@@ -286,7 +297,9 @@ private:
 class AdaptController {
 public:
     EarbudCommand update(const AnalysisFrame& frame, float dt_ms,
-                         bool non_voice_event = false);
+                         bool non_voice_event = false,
+                         bool external_self_voice = false,
+                         bool conversation_authorized = true);
     void reset();
 
     /// 最近一次对话感知输出。工具与测试用它读 own_voice / 状态 / 已下压时长，
@@ -308,6 +321,9 @@ private:
     uint32_t sequence_ = 0;
     float speech_gain_db_ = 0.0f;
     float media_percent_ = 100.0f;
+    /// 实际发给播放器的 24 段曲线。目标值每 100 ms 更新，但输出必须慢慢靠近，
+    /// 否则环境谱和 LOW/MIXED 分型的轻微变化会听成音量抽动。
+    std::array<float, kBandCount> eq_gain_db_{};
     float valid_ms_ = 0.0f;
     float invalid_ms_ = 0.0f;
     /// Apple 式对话感知：自身语音触发 → 下压媒体 → 保持 → 恢复。
@@ -321,6 +337,7 @@ private:
 
 const char* adapt_state_name(AdaptState state);
 const char* environment_name(EnvironmentKind environment);
+const char* noise_spectrum_name(NoiseSpectrum spectrum);
 const char* tuning_mode_name(TuningMode mode);
 const char* conversation_state_name(ConversationState state);
 const char* evidence_policy_name(EvidencePolicy policy);

@@ -1,11 +1,10 @@
-"""Mac 侧 WavLM 声纹影子门控。
+"""Mac 侧 WavLM self/other 声纹门控。
 
 WavLM-SV 模型约 360 MB，只能跑在 Mac/PC 上；上位机本身不依赖 torch/transformers，
 所以这里把重依赖放进子进程 `tools/voiceprint_worker.py`（用仓库 `.venv/bin/python`），
 上位机只负责把 S3 中继的 16 kHz PCM 喂过去、读回判定。
 
-**当前是影子遥测**：判定只进快照/面板，不参与 conversation/ambient 决策。
-下一步（未实现）才是把 self/other 回传 S3 做 own-voice veto。
+判定会回传 S3；S3 只有观察到 self/other 双方轮次后才确认对话。
 """
 
 from __future__ import annotations
@@ -34,12 +33,15 @@ class VoiceprintService:
         enroll_dir: str | Path = ROOT / "记录" / "声纹" / "self-device",
         threshold: float = 0.80,
         enabled: bool = True,
+        on_verdict=None,
     ) -> None:
         self.python = str(python)
         self.worker = str(worker)
         self.enroll_dir = str(enroll_dir)
         self.threshold = float(threshold)
         self.enabled = enabled
+        #: 判定回调：host 用它把 self/other 回传 S3。
+        self.on_verdict = on_verdict
         self._lock = threading.RLock()
         self._process: subprocess.Popen[str] | None = None
         self._threads: list[threading.Thread] = []
@@ -58,6 +60,8 @@ class VoiceprintService:
         self._updated_at: float | None = None
         self._fed_chunks = 0
         self._dropped_chunks = 0
+        self._sent_verdicts = 0
+        self._last_sent_verdict: str | None = None
         self._stderr_tail: list[str] = []
 
     # ------------------------------------------------------------------ 生命周期
@@ -155,9 +159,14 @@ class VoiceprintService:
                 with self._lock:
                     self._stderr_tail = (self._stderr_tail + [text])[-20:]
 
+    def note_sent(self) -> None:
+        with self._lock:
+            self._sent_verdicts += 1
+
     def _apply(self, message: dict) -> None:
         kind = message.get("type")
         now = time.monotonic()
+        callback = None
         with self._lock:
             self._updated_at = now
             if kind == "loading":
@@ -174,11 +183,19 @@ class VoiceprintService:
                 self._smoothed = message.get("smoothed")
                 self._windows = int(message.get("windows", self._windows))
                 self._latency_ms = message.get("latency_ms")
+                self._last_sent_verdict = self._verdict
+                callback = self.on_verdict
             elif kind == "dropped":
                 self._dropped_chunks += 1
             elif kind == "error":
                 self._error = str(message.get("error"))
                 self._ready = False
+
+        if callback is not None:
+            try:
+                callback(self._verdict, float(self._score or 0.0))
+            except Exception:  # noqa: BLE001 - 回调失败不能拖垮 worker 读取线程
+                pass
 
     # ------------------------------------------------------------------ 读出
 
@@ -201,7 +218,9 @@ class VoiceprintService:
                 "latency_ms": self._latency_ms,
                 "fed_chunks": self._fed_chunks,
                 "dropped_windows": self._dropped_chunks,
+                "sent_verdicts": self._sent_verdicts,
+                "last_sent_verdict": self._last_sent_verdict,
                 "age_s": age,
                 "stderr_tail": list(self._stderr_tail),
-                "mode": "mirror-only",
+                "mode": "conversation-gate",
             }

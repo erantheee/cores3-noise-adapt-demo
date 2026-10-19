@@ -11,8 +11,8 @@ stdout 回 JSON 行（ready / verdict / error）。使用仓库 `.venv`（需要
                  {"type":"verdict","verdict":"self"|"other","score":0.93,"windows":7,"lag_ms":321}
                  {"type":"error","error":"..."}
 
-判定：1.5 s 窗、0.75 s 步进；embedding 与注册原型（`记录/声纹/self/` 设备录音的均值）
-做 cosine；EMA 平滑后大于阈值判 self，否则 other。**只做影子遥测，不参与决策。**
+判定：1.5 s 窗、0.75 s 步进；embedding 与佩戴者注册原型（设备录音的均值）
+做 cosine；EMA 平滑后大于阈值判 self，否则 other。结果回传 S3，用双方轮次判断对话。
 """
 
 from __future__ import annotations

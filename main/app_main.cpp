@@ -116,7 +116,7 @@ void emit_command_json(const EarbudCommand& command) {
                 "\"broadband_dbfs\":%.1f,\"voice_likelihood\":%.3f,"
                 "\"vocal_ratio\":%.3f,\"spectral_flatness\":%.4f,"
                 "\"vocal_peakiness\":%.3f,\"excited_vocal_bands\":%u,"
-                "\"state\":\"%s\",\"environment\":\"%s\",\"mode\":\"%s\","
+                "\"state\":\"%s\",\"environment\":\"%s\",\"noise_spectrum\":\"%s\",\"mode\":\"%s\","
                 "\"conversation\":\"%s\",\"confidence\":%.2f,"
                 "\"own_voice_confidence\":%.3f,\"own_voice_correlation\":%.3f,"
                 "\"own_voice_vibration\":%.4f,\"imu_gravity\":%.3f,"
@@ -138,6 +138,7 @@ void emit_command_json(const EarbudCommand& command) {
                 static_cast<double>(command.vocal_peakiness),
                 static_cast<unsigned>(command.excited_vocal_bands),
                 adapt_state_name(command.state), environment_name(command.environment),
+                noise_spectrum_name(command.noise_spectrum),
                 tuning_mode_name(command.tuning_mode),
                 conversation_state_name(command.conversation),
                 command.confidence,
@@ -250,6 +251,18 @@ void emit_latency_report(latency::LatencyProfiler& profiler,
 /// Written by the console poll and read by the audio task.
 volatile int32_t g_record_seconds = -1;
 
+// ---- Mac 侧 WavLM 声纹判定（串口回传）----
+// self/other 不是目标人分类，而是对话轮次证据：双方在短窗口内都说过才算对话。
+bool g_voiceprint_valid = false;
+bool g_voiceprint_self = false;
+float g_voiceprint_score = 0.0f;
+int64_t g_voiceprint_us = 0;
+int64_t g_voiceprint_last_self_us = 0;
+int64_t g_voiceprint_last_other_us = 0;
+bool g_voiceprint_pending_reset = false;
+constexpr int64_t kVoiceprintHoldUs = 3000000;  // 3 s 内没有新判定就当作不可用
+constexpr int64_t kConversationTurnWindowUs = 5000000;  // 双方轮次最多相隔 5 s
+
 constexpr std::size_t kConsoleLineMax = 96;
 char g_console_line[kConsoleLineMax];
 std::size_t g_console_fill = 0;
@@ -317,6 +330,42 @@ bool poll_console_command() {
                     std::printf("{\"type\":\"route\",\"state\":\"inactive\","
                                 "\"device\":\"%s\"}\n", g_mac_route.device_name);
                     handled = true;
+                } else if (std::strncmp(g_console_line, "voiceprint ", 11) == 0) {
+                    const char* value = g_console_line + 11;
+                    float score = 0.0f;
+                    bool pending = false;
+                    if (std::strncmp(value, "self", 4) == 0) {
+                        g_voiceprint_self = true;
+                    } else if (std::strncmp(value, "other", 5) == 0) {
+                        g_voiceprint_self = false;
+                    } else if (std::strncmp(value, "pending", 7) == 0) {
+                        // Host 已启用声纹，但首个 embedding 尚未完成。先锁住对话动作，
+                        // 不能用这 1.5 s 空窗按旧逻辑误开环境声。
+                        pending = true;
+                        g_voiceprint_self = false;
+                    } else {
+                        goto voiceprint_done;
+                    }
+                    std::sscanf(value + (pending ? 7 : (g_voiceprint_self ? 4 : 5)), "%f", &score);
+                    g_voiceprint_valid = true;
+                    g_voiceprint_score = score;
+                    g_voiceprint_us = esp_timer_get_time();
+                    if (pending) {
+                        // pending 不是一个说话人轮次。
+                        g_voiceprint_last_self_us = 0;
+                        g_voiceprint_last_other_us = 0;
+                        g_voiceprint_pending_reset = true;
+                    } else if (g_voiceprint_self) {
+                        g_voiceprint_last_self_us = g_voiceprint_us;
+                    } else {
+                        g_voiceprint_last_other_us = g_voiceprint_us;
+                    }
+                    // 非 JSON 行：host 的协议解析器会忽略它，monitor 能看到。
+                    std::printf("voiceprint ack %s %.2f\n",
+                                pending ? "pending" : (g_voiceprint_self ? "self" : "other"),
+                                static_cast<double>(score));
+                    handled = true;
+                voiceprint_done:;
                 } else if (std::strcmp(g_console_line, "route offline") == 0) {
                     g_mac_route.mac_connected = false;
                     g_mac_route.audio_output_active = false;
@@ -790,7 +839,25 @@ void processing_task(void*) {
              sound_event_out.cls == sound_event::Class::wind ||
              sound_event_out.cls == sound_event::Class::artifact);
 
-        EarbudCommand command = controller.update(frame, elapsed_ms, non_voice_event);
+        // 双方轮次才是对话。other 单独出现仍可做背景人声 EQ，但不开环境声；
+        // self 单独出现（哼唱/自言自语）连人声 EQ 也不触发。
+        const bool voiceprint_fresh =
+            g_voiceprint_valid && (now_us - g_voiceprint_us) <= kVoiceprintHoldUs;
+        const bool voiceprint_conversation =
+            g_voiceprint_last_self_us > 0 && g_voiceprint_last_other_us > 0 &&
+            (now_us - g_voiceprint_last_self_us) <= kConversationTurnWindowUs &&
+            (now_us - g_voiceprint_last_other_us) <= kConversationTurnWindowUs;
+        const bool external_self_voice =
+            voiceprint_fresh && g_voiceprint_self && !voiceprint_conversation;
+        const bool conversation_authorized =
+            !g_voiceprint_valid || voiceprint_conversation;
+        if (g_voiceprint_pending_reset) {
+            controller.reset();
+            g_voiceprint_pending_reset = false;
+        }
+        EarbudCommand command =
+            controller.update(frame, elapsed_ms, non_voice_event, external_self_voice,
+                              conversation_authorized);
         command.event.valid = sound_event_out.valid;
         command.event.class_name = sound_event::class_name(sound_event_out.cls);
         const int64_t decide_done_us = esp_timer_get_time();

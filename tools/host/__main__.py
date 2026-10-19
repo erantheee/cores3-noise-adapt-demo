@@ -88,6 +88,10 @@ class DeviceWriter:
             self._connection.write(data)
             self._connection.flush()
 
+    def send_voiceprint(self, verdict: str, score: float) -> None:
+        """把 WavLM 的 self/other 判定回传给 S3（纯文本控制行）。"""
+        self(f"voiceprint {verdict} {float(score):.2f}\n".encode("ascii"))
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -183,20 +187,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--voiceprint",
         action="store_true",
         help=(
-            "启用 WavLM 声纹影子门控：用中继的 S3 麦克风音频判断说话人是 self 还是 other。"
-            "只进面板/快照，**不参与决策**；需要仓库 .venv 里的 torch/transformers。"
+            "启用 WavLM self/other 声纹门控：用双方轮次区分对话与自己哼唱。"
+            "判定回传 S3 参与对话决策；需要仓库 .venv 里的 torch/transformers。"
         ),
     )
     parser.add_argument(
         "--voiceprint-enroll-dir",
         default=None,
-        help="声纹注册录音目录（默认 记录/声纹/self-device）",
+        help="佩戴者声纹注册录音目录（默认 记录/声纹/self-device）",
     )
     parser.add_argument(
         "--voiceprint-threshold",
         type=float,
         default=0.80,
-        help="cosine 判定阈值（默认 0.80；当前影子模式只显示）",
+        help="self cosine 判定阈值（默认 0.80；结果参与双方轮次门控）",
     )
     parser.add_argument(
         "--voiceprint-python",
@@ -296,6 +300,16 @@ def main(argv: list[str] | None = None) -> int:
         state.attach_voiceprint(voiceprint)
     broadcaster = Broadcaster(state)
     writer = DeviceWriter()
+    if voiceprint is not None:
+        def _send_voiceprint(verdict: str, score: float) -> None:
+            try:
+                writer.send_voiceprint(verdict, score)
+                voiceprint.note_sent()
+            except RuntimeError:
+                # 串口没打开/刚断开：影子遥测继续，判定不硬塞。
+                pass
+
+        voiceprint.on_verdict = _send_voiceprint
 
     stop = threading.Event()
 
@@ -308,7 +322,13 @@ def main(argv: list[str] | None = None) -> int:
     # 只有串口源可回控。模拟源与回放都没有设备可写，界面会据此禁用按钮。
     can_control = isinstance(source, SerialSource)
     if can_control:
-        source.on_open = writer.attach
+        def _attach_writer(connection) -> None:
+            writer.attach(connection)
+            if voiceprint is not None:
+                # 首个 1.5 s embedding 产生前先让 S3 锁住对话动作，避免启动即误开环境声。
+                writer.send_voiceprint("pending", 0.0)
+
+        source.on_open = _attach_writer
         source.on_close = writer.detach
 
     def release_port() -> bool:
@@ -522,6 +542,16 @@ def main(argv: list[str] | None = None) -> int:
             want_open = False
             if latest is not None and latest.ambient_open is not None:
                 want_open = bool(latest.ambient_open)
+            # 串口刚打开可能还残留刷机前的旧命令帧。首个 embedding 判定出来前，
+            # 不执行任何开放意图；否则 pending 已锁住 S3，新上位机却会执行旧帧。
+            if voiceprint is not None:
+                voiceprint_state = voiceprint.snapshot()
+                if voiceprint_state.get("verdict") is None:
+                    want_open = False
+                elif voiceprint_state.get("verdict") == "self":
+                    # 对话可以继续保持，但佩戴者这一轮不能送进耳机。等 other 再开，
+                    # 形成按说话人轮流开放的中继，而不是整段对话一直开麦。
+                    want_open = False
             if state.is_stale() or state.is_silent() or not state.connected:
                 want_open = False
             ambient.set_open(want_open)

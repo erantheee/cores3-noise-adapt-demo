@@ -141,6 +141,7 @@ class CommandFrame:
     conversation: str = "NONE"
     execution: str = "decision_only"
     ambient_band_dbfs: tuple[float, ...] = ()
+    noise_spectrum: str = "NONE"
     #: v4：环境声开放**意图**。None 表示这一帧没报（v4 之前的固件）。
     #: 它是意图，不是执行回执——执行端的结果另外报。
     ambient_open: bool | None = None
@@ -505,6 +506,7 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
             excited_vocal_bands=excited_vocal_bands,
             state=state,
             environment=environment,
+            noise_spectrum=str(payload.get("noise_spectrum", "NONE")),
             confidence=d2(confidence),
             link=link,
             external_voice_gain_db=d2(external_voice_gain or 0.0),

@@ -14,6 +14,28 @@ constexpr std::array<float, kBandCount> kBandCenter = {
 
 float clamp01(float value) { return std::clamp(value, 0.0f, 1.0f); }
 
+NoiseSpectrum classify_noise_spectrum(const AnalysisFrame& frame) {
+    if (!frame.mic_valid || frame.broadband_dbfs < -56.0f) return NoiseSpectrum::none;
+    auto mean_power = [&](std::size_t first, std::size_t last) {
+        float total = 0.0f;
+        for (std::size_t i = first; i < last; ++i) {
+            total += std::pow(10.0f, frame.band_dbfs[i] / 10.0f);
+        }
+        return total / static_cast<float>(last - first);
+    };
+    // 低：70–567 Hz；中：697 Hz–3.4 kHz；高：4–13.6 kHz。
+    const std::array<float, 3> power = {
+        mean_power(0, 6), mean_power(6, 17), mean_power(17, kBandCount)};
+    std::size_t winner = 0;
+    if (power[1] > power[winner]) winner = 1;
+    if (power[2] > power[winner]) winner = 2;
+    const float other = std::max(power[(winner + 1) % 3], power[(winner + 2) % 3]);
+    // 不到 1.8 倍就按混合处理，避免相邻频段在门槛附近来回跳。
+    if (power[winner] < other * 1.8f) return NoiseSpectrum::mixed;
+    return winner == 0 ? NoiseSpectrum::low
+                       : (winner == 1 ? NoiseSpectrum::mid : NoiseSpectrum::high);
+}
+
 bool in_speech_band(float hz) { return hz >= 300.0f && hz <= 4000.0f; }
 
 /// Voice-decision thresholds. Grouped and named so they can be re-calibrated against
@@ -348,12 +370,15 @@ float voice_likelihood_from_features(const VoiceFeatures& features) {
 }
 
 EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms,
-                                    bool non_voice_event) {
+                                    bool non_voice_event,
+                                    bool external_self_voice,
+                                    bool conversation_authorized) {
     EarbudCommand command;
     command.sequence = ++sequence_;
     command.timestamp_ms = frame.timestamp_ms;
     command.eq_gain_db.fill(0.0f);
     command.ambient_band_dbfs = frame.band_dbfs;
+    command.noise_spectrum = classify_noise_spectrum(frame);
     // 判据遥测：训练集与误触发排查都要这些量，决策逻辑一行都不用它们。
     command.broadband_dbfs = frame.broadband_dbfs;
     command.voice_likelihood = frame.voice_likelihood;
@@ -384,11 +409,13 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms,
         // 若和 EQ 用同一个门槛，键盘/风扇/远处人声都会反复把对话顶起来（2026-10-19 实测
         // 环境声一直开着）。对话是更重的动作，门槛必须更高。
         constexpr float kConversationVoiceThreshold = 0.65f;
+        // self 且尚未观察到 other 轮次时，视为哼唱/自言自语：不触发人声 EQ 或对话。
         const bool speech_active =
-            !non_voice_event && voice > 0.55f && frame.broadband_dbfs > -58.0f;
+            !non_voice_event && !external_self_voice &&
+            voice > 0.55f && frame.broadband_dbfs > -58.0f;
         const bool conversation_voice =
-            !non_voice_event && voice > kConversationVoiceThreshold &&
-            frame.broadband_dbfs > -58.0f;
+            conversation_authorized && !non_voice_event && !external_self_voice &&
+            voice > kConversationVoiceThreshold && frame.broadband_dbfs > -58.0f;
 
         // **预判输入**：附近有人开口 = 对话正在开始。这是提前量的唯一来源——"我开口"只能
         // 在事后被检测到，把它当触发输入（旧实现）就永远只能"说过之后才压"，方向与目标相反。
@@ -466,7 +493,8 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms,
         // 1–4 kHz 曲线加到歌曲上就是"用歌曲中频假装人声增强"——D0 明确禁止，README 也写着
         // 该模式下 eq_gain_db 必须平直。之前为了让面板动起来写进去过，那是演示便利，
         // 不是产品行为；这里按契约改回平直。
-        if (conversation_active) {
+        if (conversation_active || external_self_voice) {
+            // 自己说话不算对话：环境声不开、外部人声 EQ 不动；模式保持平直。
             command.environment = EnvironmentKind::voice_likely;
             command.tuning_mode = TuningMode::flat;
         } else if (frame.broadband_dbfs < -56.0f) {
@@ -495,14 +523,14 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms,
         if (command.tuning_mode == TuningMode::external_voice_intent) {
             const float drive = clamp01(0.25f + 1.35f * voice);
             voice_target = std::min(kDemoSpeechGainDb, noise * kDemoSpeechGainDb * drive + 0.4f);
-            media_target = awareness_out.media_percent;
+            media_target = external_self_voice ? 100.0f : awareness_out.media_percent;
         } else if (command.tuning_mode == TuningMode::safety_hold) {
             voice_target = 0.0f;
         }
         // 对话感知一旦成立，媒体就下压，与选哪种调音模式无关：Apple 这条功能不挑模式，
         // 而且"我在说话"本身不依赖环境判据。旧实现把下压挂在 external_voice_intent 分支里，
         // 结果是安静环境下说话（环境判据 quiet → flat）根本不会下压。
-        media_target = awareness_out.media_percent;
+        media_target = external_self_voice ? 100.0f : awareness_out.media_percent;
         const float speech_target = voice_target;
         // Ramps are chosen to be seen and heard. `slew` uses attack_ms when the value rises and
         // release_ms when it falls, so the media ducking -- a fall -- was running on the 800 ms
@@ -534,8 +562,28 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms,
             } else if (command.tuning_mode == TuningMode::song_eq) {
                 const float band_noise = clamp01((frame.band_dbfs[band] + 62.0f) / 32.0f);
                 const float importance = speech_band ? 1.0f : (band < 5 ? 0.45f : 0.70f);
-                command.eq_gain_db[band] = std::min(4.0f, 4.0f * band_noise * importance);
+                const bool low_band = band < 6;
+                const bool mid_band = band >= 6 && band < 17;
+                const bool high_band = band >= 17;
+                const bool dominant =
+                    (command.noise_spectrum == NoiseSpectrum::low && low_band) ||
+                    (command.noise_spectrum == NoiseSpectrum::mid && mid_band) ||
+                    (command.noise_spectrum == NoiseSpectrum::high && high_band);
+                const float focus = command.noise_spectrum == NoiseSpectrum::mixed
+                                        ? 0.75f
+                                        : (dominant ? 1.0f : 0.30f);
+                command.eq_gain_db[band] =
+                    std::min(4.0f, 4.0f * band_noise * importance * focus);
             }
+        }
+
+        // 频谱每拍都会抖，分类边界也可能在 LOW/MIXED/MID 间切换。对每段独立做时间平滑：
+        // 上升 650 ms、回落 850 ms，约 1.5–2 s 完成主要变化；对话/自身语音仍由环境声门控
+        // 单独即时处理，不靠 EQ 曲线承担“关麦”职责。
+        for (std::size_t band = 0; band < kBandCount; ++band) {
+            eq_gain_db_[band] = slew(eq_gain_db_[band], command.eq_gain_db[band], dt_ms,
+                                     650.0f, 850.0f);
+            command.eq_gain_db[band] = eq_gain_db_[band];
         }
     }
 
@@ -555,6 +603,7 @@ void AdaptController::reset() {
     sequence_ = 0;
     speech_gain_db_ = 0.0f;
     media_percent_ = 100.0f;
+    eq_gain_db_.fill(0.0f);
     valid_ms_ = 0.0f;
     invalid_ms_ = 0.0f;
     // 下压地板只有一处定义：kDemoMediaFloorPercent。把它推进状态机的参数里，
@@ -582,6 +631,17 @@ const char* environment_name(EnvironmentKind environment) {
         case EnvironmentKind::steady_noise: return "NOISY";
         case EnvironmentKind::voice_likely: return "VOICE";
         case EnvironmentKind::loud: return "LOUD";
+    }
+    return "UNKNOWN";
+}
+
+const char* noise_spectrum_name(NoiseSpectrum spectrum) {
+    switch (spectrum) {
+        case NoiseSpectrum::none: return "NONE";
+        case NoiseSpectrum::low: return "LOW";
+        case NoiseSpectrum::mid: return "MID";
+        case NoiseSpectrum::high: return "HIGH";
+        case NoiseSpectrum::mixed: return "MIXED";
     }
     return "UNKNOWN";
 }

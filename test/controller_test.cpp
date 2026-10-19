@@ -22,6 +22,14 @@ AnalysisFrame frame(float dbfs, float voice, bool valid = true) {
     return value;
 }
 
+AnalysisFrame spectral_frame(float base_dbfs, std::size_t first, std::size_t last,
+                             float dominant_dbfs) {
+    AnalysisFrame value = frame(base_dbfs, 0.0f);
+    value.band_dbfs.fill(base_dbfs);
+    for (std::size_t band = first; band < last; ++band) value.band_dbfs[band] = dominant_dbfs;
+    return value;
+}
+
 bool all_bands_flat(const EarbudCommand& command) {
     for (float gain : command.eq_gain_db) {
         if (std::fabs(gain) > 0.001f) return false;
@@ -46,6 +54,36 @@ int main() {
     bool song_eq_has_gain = false;
     for (float gain : steady.eq_gain_db) song_eq_has_gain = song_eq_has_gain || gain > 0.05f;
     check(song_eq_has_gain, "steady environmental masking produces a song EQ suggestion");
+    float previous_low = 0.0f;
+    AdaptController smooth_controller;
+    for (int i = 0; i < 8; ++i) {
+        const EarbudCommand smoothed = smooth_controller.update(
+            spectral_frame(-55.0f, 0, 6, (i % 2 == 0) ? -28.0f : -48.0f), 100);
+        check(std::fabs(smoothed.eq_gain_db[2] - previous_low) < 1.0f,
+              "per-band EQ does not jump between adjacent 100 ms frames");
+        previous_low = smoothed.eq_gain_db[2];
+    }
+
+    // ---- 频谱分型：只重点补当前被遮蔽的低/中/高频 ----
+    {
+        AdaptController low_controller;
+        EarbudCommand low;
+        for (int i = 0; i < 12; ++i) {
+            low = low_controller.update(spectral_frame(-55.0f, 0, 6, -32.0f), 150);
+        }
+        check(low.noise_spectrum == NoiseSpectrum::low, "low-frequency noise is classified LOW");
+        check(low.eq_gain_db[2] > low.eq_gain_db[20] * 2.0f,
+              "LOW noise focuses compensation on low bands");
+
+        AdaptController high_controller;
+        EarbudCommand high;
+        for (int i = 0; i < 12; ++i) {
+            high = high_controller.update(spectral_frame(-55.0f, 17, 24, -32.0f), 150);
+        }
+        check(high.noise_spectrum == NoiseSpectrum::high, "high-frequency noise is classified HIGH");
+        check(high.eq_gain_db[20] > high.eq_gain_db[2] * 2.0f,
+              "HIGH noise focuses compensation on high bands");
+    }
 
     // ---- 预判：第一帧就压，环境声等到确认后才开 ----
     {
@@ -135,6 +173,56 @@ int main() {
             if (out.eq_gain_db[band] > 0.05f) mid = true;
         }
         check(mid, "voice 0.6 仍按背景人声抬中频 EQ");
+    }
+
+    // ---- 声纹判定 self：自己说话不抬 EQ、不压媒体、不开环境声 ----
+    {
+        AdaptController self_voice;
+        EarbudCommand out;
+        for (int i = 0; i < 12; ++i) {
+            out = self_voice.update(frame(-45, 0.9f), 150, /*non_voice_event=*/false,
+                                    /*external_self_voice=*/true);
+        }
+        check(out.conversation == ConversationState::none,
+              "self 声纹不进入对话");
+        check(!out.ambient_open, "self 声纹不开环境声");
+        check(out.media_percent == 100, "self 声纹不压媒体");
+        check(out.tuning_mode == TuningMode::flat, "self 声纹不进入外部人声 EQ");
+        bool any_eq = false;
+        for (std::size_t band = 0; band < 24; ++band) {
+            if (out.eq_gain_db[band] > 0.01f) any_eq = true;
+        }
+        check(!any_eq, "self 声纹不得产生正增益");
+    }
+
+    // ---- 只有 other、没有 self 轮次：可做背景人声 EQ，但不能当成正在对话 ----
+    {
+        AdaptController other_only;
+        EarbudCommand out;
+        for (int i = 0; i < 12; ++i) {
+            out = other_only.update(frame(-45, 0.9f), 150, false, false,
+                                    /*conversation_authorized=*/false);
+        }
+        check(out.conversation == ConversationState::speech_nearby,
+              "other-only speech remains background speech");
+        check(!out.ambient_open && out.media_percent == 100,
+              "other-only speech does not open ambient or duck media");
+        check(out.tuning_mode == TuningMode::external_voice_intent,
+              "other-only speech may still receive background voice EQ");
+    }
+
+    // ---- self 与 other 都出现：允许对话状态机开放环境声并让媒体 EQ 让位 ----
+    {
+        AdaptController turn_taking;
+        EarbudCommand out;
+        for (int i = 0; i < 12; ++i) {
+            out = turn_taking.update(frame(-45, 0.9f), 150, false, false,
+                                     /*conversation_authorized=*/true);
+        }
+        check(out.conversation == ConversationState::likely && out.ambient_open,
+              "self/other turn taking authorizes conversation");
+        check(out.media_percent <= 61 && all_bands_flat(out),
+              "authorized conversation ducks media and yields the song EQ");
     }
 
     // ---- 键盘/风/撞击事件不参与对话证据 ----

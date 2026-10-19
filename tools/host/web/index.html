@@ -1046,7 +1046,18 @@ function playerToast(result) {
   }
 }
 
-$("btn-play").addEventListener("click", async () => playerToast(await sendPlayer({ cmd: "toggle" })));
+$("btn-play").addEventListener("click", async () => {
+  // 发明确动作，不发 toggle。SSE 状态与点击之间可能刚好跨过一次播放器更新，toggle 在
+  // 连续 EQ 命令期间会把“我要暂停”变成一次依赖时序的翻转，按钮看起来就像按不动。
+  const player = (lastSnapshot && lastSnapshot.player) || {};
+  const command = player.playing ? "pause" : "play";
+  const button = $("btn-play");
+  button.disabled = true;
+  const result = await sendPlayer({ cmd: command });
+  playerToast(result);
+  // 请求失败时恢复按钮；成功时下一帧 SSE 会按真实回执刷新状态。
+  if (!result.ok) button.disabled = false;
+});
 $("btn-prev").addEventListener("click", async () => playerToast(await sendPlayer({ cmd: "prev" })));
 $("btn-next").addEventListener("click", async () => playerToast(await sendPlayer({ cmd: "next" })));
 $("player-vol").addEventListener("change", async (event) =>
