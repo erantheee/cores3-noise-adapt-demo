@@ -35,8 +35,14 @@ struct Params {
     float own_voice_threshold = 0.5f;
     /// 需要持续多久才算真的开始说话。低于它的短促声音（咳嗽、桌椅、键盘）不触发。
     float onset_confirm_ms = 200.0f;
+    /// 首帧已像“自己开口”、但还在确认时，先做一次有界的预下压。这样用户在第一个
+    /// 100 ms 控制拍就能感到功能开始工作；第二拍确认失败时会立即恢复，不会把一次
+    /// 短促声音当成完整对话。
+    float preview_floor_percent = 70.0f;
+    /// 预下压时间常数。它只在 confirming 状态使用，不改变正式下压与恢复的时序。
+    float preview_duck_ms = 60.0f;
     /// 下压到的音量（%）。与 main/controller.hpp 的 kDemoMediaFloorPercent 同源，改要一起改。
-    float duck_floor_percent = 25.0f;
+    float duck_floor_percent = 60.0f;
     /// 下压的时间常数（下降沿）。
     float duck_ms = 150.0f;
     /// 语音停止后保持低谷的时长。Apple 的描述是"说话期间保持低"，所以它必须长于句间
@@ -48,7 +54,7 @@ struct Params {
 
 enum class State : std::uint8_t {
     idle,
-    /// 已经听到自己开口，但还没持续够 onset_confirm_ms。
+    /// 已经听到自己开口，但还没持续够 onset_confirm_ms；媒体只做有界预下压。
     confirming,
     /// 对话进行中：媒体应当处于下压状态。
     engaged,

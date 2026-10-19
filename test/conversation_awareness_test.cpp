@@ -49,12 +49,13 @@ int main() {
         check(!out.engaged, "quiet is not engaged");
     }
 
-    // 2. 短促声音不触发：onset_confirm_ms 是 200 ms，单帧 100 ms 不够，而且它不累积。
+    // 2. 短促声音不触发完整对话：首帧允许有界预下压，但不会进入 engaged，也不累积。
     {
         conversation::Awareness awareness;
         auto blip = feed(awareness, 0.9f, 1);
         check(blip.state == conversation::State::confirming, "one frame only confirms");
-        check(blip.media_percent > 95.0f, "one frame does not duck");
+        check(blip.media_percent >= 69.0f, "one frame preview stays above its bounded floor");
+        check(blip.media_percent < 90.0f, "one frame gives immediate preview feedback");
         auto after = feed(awareness, 0.0f, 1, false);
         check(after.state == conversation::State::idle, "a blip falls back to idle");
         // 隔一会儿再来一下，仍然不该攒成对话。
@@ -64,7 +65,7 @@ int main() {
         }
         auto repeated = feed(awareness, 0.0f, 1, false);
         check(repeated.state == conversation::State::idle, "repeated blips never accumulate");
-        check(repeated.media_percent > 95.0f, "repeated blips never duck");
+        check(repeated.media_percent > 90.0f, "repeated blips recover instead of accumulating");
     }
 
     // 3. 佩戴者自己开口：确认 200 ms 之后开始下压，并压到地板。
@@ -73,21 +74,23 @@ int main() {
         auto out = feed(awareness, 0.9f, 12);  // 1.2 s
         check(out.engaged, "own voice engages");
         check(out.state == conversation::State::engaged, "own voice reaches engaged");
-        check(out.media_percent < 60.0f, "own voice ducks the media bed");
-        check(out.media_percent >= 24.0f, "ducking respects the 25% floor");
+        check(out.media_percent < 65.0f, "own voice ducks the media bed");
+        check(out.media_percent >= 59.0f, "ducking respects the 60% floor");
         check(out.engaged_ms >= 900, "engaged_ms counts the conversation");
     }
 
-    // 4. 触发延迟：从开口到下压到 60% 以内，不能超过 确认(200) + 3τ(450) = 650 ms。
+    // 4. 触发延迟：第一个 100 ms 拍必须已有响应，接近 60% 地板不超过 300 ms。
     {
         conversation::Awareness awareness;
+        auto first = awareness.update(evidence(0.9f), kDt);
+        check(first.media_percent < 90.0f, "preview starts on the first control tick");
         int frames_to_duck = 0;
-        for (int i = 1; i <= 20; ++i) {
+        for (int i = 2; i <= 20; ++i) {
             auto out = awareness.update(evidence(0.9f), kDt);
-            if (out.media_percent < 60.0f) { frames_to_duck = i; break; }
+            if (out.media_percent < 65.0f) { frames_to_duck = i; break; }
         }
-        check(frames_to_duck > 0 && frames_to_duck * 100 <= 650,
-              "duck starts within confirm + 3 tau");
+        check(frames_to_duck > 0 && frames_to_duck * 100 <= 300,
+              "full duck approaches the 60 percent floor within 300 ms");
     }
 
     // 5. 换气停顿不抬起媒体：停 2 s（< hold 2.5 s）后仍是 engaged。
@@ -96,7 +99,7 @@ int main() {
         feed(awareness, 0.9f, 10);
         auto during = feed(awareness, 0.0f, 20, false);  // 2 s
         check(during.engaged, "a breath inside a turn keeps the conversation");
-        check(during.media_percent < 40.0f, "media stays down through the breath");
+        check(during.media_percent < 65.0f, "media stays down through the breath");
     }
 
     // 6. 对话结束后恢复：停够 hold + 恢复常数之后回到 100%，并且回到 idle。

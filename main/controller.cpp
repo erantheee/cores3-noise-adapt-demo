@@ -409,8 +409,11 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
         evidence.own_voice = effective.confidence;
         awareness_out_ = awareness_.update(evidence, dt_ms);
         const conversation::Output& awareness_out = awareness_out_;
+        const bool own_voice_active =
+            awareness_out.state == conversation::State::confirming ||
+            awareness_out.state == conversation::State::engaged;
 
-        command.conversation = awareness_out.engaged
+        command.conversation = own_voice_active
                                    ? ConversationState::likely
                                    : (speech_active ? ConversationState::speech_nearby
                                                     : ConversationState::none);
@@ -427,7 +430,13 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
         //   * SAFETY_HOLD forbids positive gain in a very loud non-speech environment. It is a
         //     conservative proxy, not a car-sound classifier; crossing-road recognition remains
         //     a later model/calibration task.
-        if (frame.broadband_dbfs < -56.0f) {
+        // 自己开口与“外部人声增强”必须互斥。同一帧同时满足语音频谱和自身语音证据时，
+        // 自身语音优先：只让对话状态机下压媒体，不给自己的声音加 300–4000 Hz EQ。
+        // 之前这里仅看 speech_active，导致自己的声纹也进入 EXTERNAL_VOICE_INTENT。
+        if (own_voice_active) {
+            command.environment = EnvironmentKind::voice_likely;
+            command.tuning_mode = TuningMode::flat;
+        } else if (frame.broadband_dbfs < -56.0f) {
             command.environment = EnvironmentKind::quiet;
             command.tuning_mode = TuningMode::flat;
         } else if (speech_active || command.conversation == ConversationState::likely) {
@@ -459,7 +468,7 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
             // Depth is driven by `speech_run_ms_` -- how long speech has been continuously
             // detected -- not by the per-frame `voice` value. Per-frame confidence oscillates, and
             // gating the duck on it produced a target that wandered between 40% and 100% frame to
-            // frame, so the slew never settled and the media only reached 46% instead of the 25%
+            // frame, so the slew never settled instead of reaching the configured floor
             // the policy asks for. Sustained speech is also the honest trigger: a one-frame blip
             // should not slam the bed to the floor.
             // 深度斜坡：从"刚听到人声"到"压到底"用 250 ms。原来是 600 ms，叠加 slew 的
@@ -525,7 +534,7 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
 
     // The ceilings live here, at the boundary, so there is exactly one place to reason about.
     // Both were product-policy values and both silenced the demo: the gain clamp cut the 8 dB
-    // target back to 6.5, and the media floor of 65% undid the duck to 25% on the way out. The
+    // target back to 6.5, and a second media floor could undo the chosen duck on the way out. The
     // internal targets and the emitted values have to agree, or the device screen and the host
     // panel report a smaller action than the one the loop decided on.
     command.speech_gain_db = std::clamp(speech_gain_db_, 0.0f, kDemoSpeechGainDb);

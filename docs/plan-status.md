@@ -88,6 +88,7 @@ AirPods Pro 播放最终输出；分别验证歌曲 EQ、现实人声增益意�
 | 42 | **声纹路线工具链已核实**（同分支） | ✅ 前提就绪，❌ **素材为零** | torch 2.14.1 + speechbrain 1.1.2 在 `.venv` 里、ECAPA 模型已缓存，止损门工具可跑；空跑（同一人两段当两类，**非测量**）给出 间距/抖动 0.33、EER 33% → 提示止损门大概率不过。另更正第 10.4 节：设备静音 35/75 拍那条是 16 kHz 素材口径，不能当设备结论，真机由 C5/C9 回答。见 [apple-conversation-awareness.md](apple-conversation-awareness.md) 第 14 节 |
 | 43 | **演示模式证据策略**（同分支） | ✅ 已实现并进遥测 | 三态 `bone_only` / `near_field_demo` / `disabled`（用户决定：演示用近场代理）；帧里带 `own_voice_policy`，面板与串口都能看到，避免把代理说成自身语音。**已知代价**：C9（旁人说话不触发）在演示模式下预期失败，检查器自测有 `demo_policy` 与 `source_mismatch` 两个场景覆盖。见 [apple-conversation-awareness.md](apple-conversation-awareness.md) 第 15 节 |
 | 44 | **对话感知迁移·状态交接** | ✅ 已写 | 交付清单 / 已验证数字 / 未完成四件事（各自可复制命令）/ 三条必须记住的结论，见 [apple-conversation-awareness.md](apple-conversation-awareness.md) 第 16 节 |
+| 45 | **真机被动检查（新增工具）** | ⚠️ 6/8 通过，抓到 C4c | `tools/check_device_passive.py` 从面板 `/api/snapshot` 轮询，不独占串口、不需人配合；实测 C1✅ C2✅ C3✅（重力 p50 9.88）C4b✅，**C4c ❌ 30.1 Hz（设计 100 Hz）**、C5b 策略并存待查。见 [apple-conversation-awareness.md](apple-conversation-awareness.md) 第 16.5 节 |
 
 
 **断言计数（2026-10-16 实测，第 1、6、7、15、29、31 项共用）**：主机 C++ 单测 **7 套件合计 251 条**

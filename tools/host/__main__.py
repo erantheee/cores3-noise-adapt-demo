@@ -118,7 +118,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--player-volume",
         type=float,
         default=DEFAULT_VOLUME_PERCENT,
-        help=f"播放器音量百分比，默认 {DEFAULT_VOLUME_PERCENT:.0f}（刻意调低：第一次出声不该吓人）",
+        help=f"播放器音量百分比，默认 {DEFAULT_VOLUME_PERCENT:.0f}，可在面板上调节",
     )
     parser.add_argument(
         "--relay-audio",

@@ -22,10 +22,10 @@ constexpr float kMaxSpeechGainDb = 6.5f;
 ///   * gain swing 0 → kDemoSpeechGainDb (8.0 dB, inside the measured/verified range, 2 dB margin)
 ///   * the same value is written into the speech bands of eq_gain_db, so the 24-band curve moves
 ///     instead of staying flat -- previously the speech-likely branch left eq_gain_db at zero
-///   * media ducks to kDemoMediaFloorPercent (25%), which is the ducking depth the sibling demo's
-///     Beat 1 shipped with and is plainly audible
+///   * media ducks to kDemoMediaFloorPercent (60%): enough to expose dialogue while keeping the
+///     programme present. The previous 25% floor was a strong demo value, not a model result.
 constexpr float kDemoSpeechGainDb = 8.0f;
-constexpr uint8_t kDemoMediaFloorPercent = 25;
+constexpr uint8_t kDemoMediaFloorPercent = 60;
 
 enum class TuningMode : uint8_t {
     flat,

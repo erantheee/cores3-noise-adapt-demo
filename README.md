@@ -139,8 +139,8 @@ EQ 前的歌曲内容生成最终处方。`external_voice_gain_db` 是现实人�
 
 **实际下发的是 8.0**：`main/controller.cpp` 末尾是
 `command.speech_gain_db = std::clamp(speech_gain_db_, 0.0f, kDemoSpeechGainDb);`，媒体音量地板同理用
-`kDemoMediaFloorPercent = 25`。同处注释写明了原因：这两个值原本都是产品值，把 8.0 dB 的目标钳回
-6.5、把 25% 的地板抬回 65%，等于让设备屏幕与面板报出一个比实际决策更小的动作。8.0 也不是随手挑
+`kDemoMediaFloorPercent = 60`。60% 是当前温和对话下压值；此前的 25% 是强调演示效果的强下压，
+并非模型推理结果。8.0 dB 也不是随手挑
 的——它落在姊妹 OWS 项目实测的语音带 +7.8 dB 之内并留有余量，且单测要求任何一帧都不得超过项目
 既定的 +10 dB 天花板（`test/controller_test.cpp`）。
 
@@ -417,7 +417,7 @@ sh tools/host_up.sh               # 起上位机时会自动带起播放器（--
 
 - 曲库：`tools/player/tracks.json`。**先按两首做**（《渡口》与 Sweet Child），加第三首只需往
   `tracks` 里加一项，播放器与面板都不用改。
-- **默认音量 30%**：这是演示桌上第一次出声，100% 会把人吓一跳；要更响在面板上调。
+- **默认音量 100%**：播放器不再预设 30% 限制；仍可在面板上随时调节。
 - 为什么是独立的 Swift 进程：macOS 上能做实时多段 EQ 的只有 `AVAudioEngine + AVAudioUnitEQ`，
   而 Python 这边没有 PyObjC。协议是 stdin/stdout 上的 JSON 行，见
   `tools/player/player.swift` 顶部注释。

@@ -79,8 +79,18 @@ Output Awareness::update(const Evidence& evidence, float dt_ms) {
             break;
     }
 
-    const float target = state_ == State::engaged ? params_.duck_floor_percent : 100.0f;
-    const float tau = target < media_percent_ ? params_.duck_ms : params_.restore_ms;
+    float target = 100.0f;
+    float tau = params_.restore_ms;
+    if (state_ == State::engaged) {
+        target = params_.duck_floor_percent;
+        tau = params_.duck_ms;
+    } else if (state_ == State::confirming) {
+        // 快速入口：先给用户一个可感知但有界的响应，完整下压仍需通过 onset_confirm_ms。
+        // 这比缩短 2 秒情境模型窗口安全：后者会把训练时从未见过的半窗统计量喂给模型。
+        target = std::clamp(params_.preview_floor_percent,
+                            params_.duck_floor_percent, 100.0f);
+        tau = params_.preview_duck_ms;
+    }
     media_percent_ = approach(media_percent_, target, dt, tau);
 
     Output out;

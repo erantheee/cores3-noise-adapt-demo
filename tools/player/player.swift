@@ -579,9 +579,8 @@ final class Player {
 
 // ---------------------------------------------------------------- 入口
 
-/// 默认音量。**刻意调到 30%**：这是演示桌上第一次出声，100% 会把人吓一跳（用户明确要求
-/// "默认不要放 100%"）。要更响在面板上调，或 `--volume` 覆盖。
-var defaultVolumePercent: Double = 30
+/// 默认不限制播放器音量；仍可在面板上调节，或用 `--volume` 覆盖。
+var defaultVolumePercent: Double = 100
 
 let arguments = CommandLine.arguments
 var tracksPath = URL(fileURLWithPath: arguments[0]).deletingLastPathComponent()

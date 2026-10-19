@@ -29,17 +29,6 @@ constexpr std::size_t kSpeechBandLast = 16;
 
 int main() {
     AdaptController controller;
-    // 下压现在需要证据。这个套件测的是"有证据时状态机与调压怎么走"，所以显式给骨传导证据；
-    // "没有证据就不下压"（fail-closed）由本文件末尾那条独立断言覆盖。
-    const auto give_bone_evidence = [&controller](float confidence) {
-        OwnVoiceEvidence evidence;
-        evidence.bone = true;
-        evidence.imu_ok = true;
-        evidence.gravity = 9.81f;
-        evidence.confidence = confidence;
-        evidence.correlation = 0.9f;
-        controller.set_own_voice_evidence(evidence);
-    };
     auto quiet = controller.update(frame(-65, 0), 150);
     check(quiet.speech_gain_db == 0, "quiet stays flat");
     check(quiet.media_percent == 100, "quiet preserves media");
@@ -49,7 +38,6 @@ int main() {
     check(steady.tuning_mode == TuningMode::song_eq, "steady noise selects song EQ");
     check(steady.media_percent == 100, "song EQ does not silently duck media");
 
-    give_bone_evidence(0.9f);
     EarbudCommand voice;
     for (int i = 0; i < 12; ++i) voice = controller.update(frame(-28, 0.8f), 150);
     check(voice.tuning_mode == TuningMode::external_voice_intent,
@@ -59,14 +47,10 @@ int main() {
     check(voice.external_voice_gain_db == voice.speech_gain_db,
           "external voice gain is the voice lift, not something else");
 
-    // Media ducking and voice lift are two separate fields and must not be conflated: the
-    // external-voice number is the lift only. Ducking is its own deliberate action, and for the
-    // demo it is what makes the lift noticeable -- raising a band over an unmoving bed is easy to
-    // miss. The sibling OWS demo's Beat 1 ships with the same 25% floor.
+    // 外部人声增强与“我自己开口”是两条互斥路径：这里没有自身语音证据，所以只抬外部人声
+    // EQ，不应触发对话感知的媒体下压。
     check(steady.media_percent == 100, "song EQ does not duck media");
-    check(voice.media_percent < 60, "external voice intent ducks the media bed");
-    check(voice.media_percent >= static_cast<int>(kDemoMediaFloorPercent) - 1,
-          "media ducking respects the floor");
+    check(voice.media_percent == 100, "external voice alone does not impersonate own voice");
 
     // The demo has to be visible: the swing from a quiet frame to clear speech must be wide
     // enough to see on the panel and hear in the room. This is the assertion that would have
@@ -109,8 +93,8 @@ int main() {
     for (int i = 0; i < 3; ++i) failed_frame = controller.update(frame(-20, 0, false), 100);
     check(failed_frame.state == AdaptState::mic_fault, "persistent invalid mic enters fault");
     check(failed_frame.speech_gain_db < voice.speech_gain_db, "fault fails toward zero gain");
-    check(failed_frame.media_percent > voice.media_percent,
-          "fault restores the media bed it had ducked");
+    check(failed_frame.media_percent == 100,
+          "fault keeps the media bed restored when no own voice was present");
     check(failed_frame.eq_gain_db[kSpeechBandFirst] <
               steady.eq_gain_db[kSpeechBandFirst],
           "fault flattens the tuning");
@@ -161,9 +145,14 @@ int main() {
         demo.set_evidence_policy(EvidencePolicy::near_field_demo);
         EarbudCommand with_demo;
         for (int i = 0; i < 20; ++i) with_demo = demo.update(frame(-28, 0.8f), 150);
-        check(with_demo.media_percent < 60, "near_field_demo ducks on nearby speech");
+        check(with_demo.media_percent <= 61, "near_field_demo ducks to the moderate floor");
         check(with_demo.own_voice.proxy && !with_demo.own_voice.bone,
               "near_field_demo never claims bone evidence");
+        check(with_demo.tuning_mode == TuningMode::flat,
+              "own voice does not enter external voice EQ mode");
+        bool own_voice_eq_is_flat = true;
+        for (float gain : with_demo.eq_gain_db) own_voice_eq_is_flat &= std::abs(gain) < 0.001f;
+        check(own_voice_eq_is_flat, "own voice leaves every EQ band flat");
 
         AdaptController off;
         off.set_evidence_policy(EvidencePolicy::disabled);
@@ -181,7 +170,9 @@ int main() {
         bone.set_own_voice_evidence(evidence);
         EarbudCommand with_bone;
         for (int i = 0; i < 20; ++i) with_bone = bone.update(frame(-28, 0.8f), 150);
-        check(with_bone.media_percent < 60, "bone_only ducks when bone evidence is present");
+        check(with_bone.media_percent <= 61, "bone_only ducks when bone evidence is present");
+        check(with_bone.tuning_mode == TuningMode::flat,
+              "bone-confirmed own voice does not trigger external voice EQ");
     }
 
     check(std::string(adapt_state_name(AdaptState::adjusting)) == "ADJUSTING",

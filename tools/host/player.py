@@ -46,7 +46,7 @@ INTERNAL_COMMANDS = {"eq"}
 NUMERIC_FIELDS = {"index", "seconds", "percent", "depth"}
 BOOLEAN_FIELDS = {"on", "autoplay"}
 
-DEFAULT_VOLUME_PERCENT = 30.0
+DEFAULT_VOLUME_PERCENT = 100.0
 #: 决策下发的节流：设备 10 Hz、播放器 20 ms 一次斜坡，按帧发没有意义，只会刷屏。
 DECISION_MIN_INTERVAL_S = 0.2
 DECISION_MIN_DELTA_DB = 0.05

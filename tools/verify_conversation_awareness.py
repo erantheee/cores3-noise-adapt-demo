@@ -45,8 +45,9 @@ from host.protocol import parse_line  # noqa: E402
 
 BAUD = 921600
 TICK_MS = 100.0
-#: 状态机规格：确认 200 ms + 3τ(duck 150 ms) = 650 ms 之内应当压到 60% 以下。
+#: 状态机规格：确认 200 ms + 3τ(duck 150 ms) = 650 ms 之内应当接近 60% 地板。
 DUCK_LATENCY_BUDGET_MS = 650.0
+DUCK_REACHED_PERCENT = 65
 #: 判定"自己说话"的证据门限。低于它说明骨传导判据没成立，不是状态机的问题。
 EVIDENCE_FLOOR = 0.30
 #: 重力基线（±4g，m/s²）。静止时偏离这个区间说明量程/单位/装配有问题。
@@ -145,7 +146,7 @@ class Phase:
     @property
     def first_duck_ms(self) -> float | None:
         for f in self.frames:
-            if f.media_percent < 60:
+            if f.media_percent < DUCK_REACHED_PERCENT:
                 return f.t_ms
         return None
 
@@ -329,7 +330,7 @@ def analyse(phases: list[Phase]) -> tuple[list[dict], list[str]]:
         else:
             record("C5b 证据来源与策略一致", False, f"帧里没有 own_voice_policy（source={sorted(sources)}）")
 
-    # C6 触发时序：证据 ≥0.5 到下压 <60% 的间隔
+    # C6 触发时序：证据 ≥0.5 到接近 60% 地板（<65%）的间隔
     if self_speech is not None:
         latency = self_speech.duck_latency_ms()
         if latency is None:
@@ -369,7 +370,7 @@ def analyse(phases: list[Phase]) -> tuple[list[dict], list[str]]:
 
 
 def make_phase(name: str, seconds: float, *, own_voice: float = 0.02, media: int = 100,
-               duck_at_ms: float | None = None, duck_percent: int = 25, motion: bool = False,
+               duck_at_ms: float | None = None, duck_percent: int = 60, motion: bool = False,
                imu_ok: bool = True, gravity: float = 9.81, imu_hz: float = 100.0,
                policy: str = "bone_only", source: str | None = None) -> Phase:
     """造一个相的合成帧序列。只用于 `--selftest`：验证**检查器本身**在已知好坏的数据上
@@ -403,7 +404,7 @@ def selftest() -> int:
         ("no_evidence", dict(self_speech=dict(own_voice=0.02)), ["C5", "C6", "C7"]),
         ("evidence_no_duck", dict(self_speech=dict(own_voice=0.85)), ["C6", "C7"]),
         ("ducks_on_others", dict(self_speech=dict(own_voice=0.85, duck_at_ms=300.0),
-                                 other_speech=dict(own_voice=0.05, media=25)), ["C9"]),
+                                 other_speech=dict(own_voice=0.05, media=60)), ["C9"]),
         # IMU 挂掉 → 控制器 fail-closed：置信度 0、来源 none、不下压。合成数据必须按这个来，
         # 否则就是在拿一个现实中不存在的组合去测检查器。
         ("imu_dead", dict(imu_ok=False, gravity=0.0, self_speech=dict(own_voice=0.0)),

@@ -810,7 +810,11 @@ static void imu_task(void*) {
             if (xQueueSend(g_imu_queue, &sample, 0) != pdTRUE) ++g_imu_drops;
             else ++g_imu_samples;
         }
-        vTaskDelayUntil(&last, pdMS_TO_TICKS(kImuPollMs));
+        // 当前 sdkconfig 的 FreeRTOS tick 是 10 ms；5 ms 会被 pdMS_TO_TICKS 截成 0，
+        // xTaskDelayUntil 会直接断言并让设备重启。轮询间隔至少保持 1 tick。
+        const TickType_t delay_ticks =
+            std::max<TickType_t>(1, pdMS_TO_TICKS(kImuPollMs));
+        vTaskDelayUntil(&last, delay_ticks);
     }
 }
 
