@@ -32,6 +32,7 @@ from .audio_relay import (
 from .mac_audio import EXPECTED_TARGET, default_output, route_command
 from .player import DEFAULT_VOLUME_PERCENT, PlayerService
 from .server import Broadcaster, make_server, pick_port
+from .voiceprint import VoiceprintService
 from .sources import (
     MissingDependency,
     MockSource,
@@ -179,6 +180,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="airpods-control 的 CLI 路径；默认取兄弟工程 ../airpods-control/bin/airpods",
     )
     parser.add_argument(
+        "--voiceprint",
+        action="store_true",
+        help=(
+            "启用 WavLM 声纹影子门控：用中继的 S3 麦克风音频判断说话人是 self 还是 other。"
+            "只进面板/快照，**不参与决策**；需要仓库 .venv 里的 torch/transformers。"
+        ),
+    )
+    parser.add_argument(
+        "--voiceprint-enroll-dir",
+        default=None,
+        help="声纹注册录音目录（默认 记录/声纹/self-device）",
+    )
+    parser.add_argument(
+        "--voiceprint-threshold",
+        type=float,
+        default=0.80,
+        help="cosine 判定阈值（默认 0.80；当前影子模式只显示）",
+    )
+    parser.add_argument(
+        "--voiceprint-python",
+        default=None,
+        help="跑 voiceprint_worker.py 的解释器（默认仓库 .venv/bin/python）",
+    )
+    parser.add_argument(
         "--ambient-mode",
         choices=("transparency", "adaptive", "anc"),
         default="transparency",
@@ -199,7 +224,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     source = build_source(args)
     # relay 执行端需要中继基础设施；--relay-audio 只表示"开机就常开中继"。
-    relay_needed = args.relay_audio or args.ambient_executor == "relay"
+    relay_needed = args.relay_audio or args.ambient_executor == "relay" or args.voiceprint
     relay = (
         AudioRelay(
             player=args.relay_player,
@@ -225,10 +250,29 @@ def main(argv: list[str] | None = None) -> int:
         # HostState 传的是 MicChunk（含 pcm/rate），RelayAmbient.feed 要两个参数。
         # 2026-10-19 实测这个签名错会让每个 mic_chunk 抛 TypeError，串口每秒重连一次，
         # 中继环境声音频根本进不来——"中继一直好好的"其实是这条回调从没跑通过。
-        on_mic_chunk = lambda chunk: relay_ambient.feed(chunk.pcm, chunk.rate)  # noqa: E731
-    elif relay is not None:
-        on_mic_chunk = lambda chunk: relay.feed(chunk.pcm, chunk.rate)  # noqa: E731
+        base_feed = lambda chunk: relay_ambient.feed(chunk.pcm, chunk.rate)  # noqa: E731
+    elif relay is not None and args.relay_audio:
+        base_feed = lambda chunk: relay.feed(chunk.pcm, chunk.rate)  # noqa: E731
     else:
+        base_feed = None
+
+    voiceprint = None
+    if args.voiceprint:
+        voiceprint_kwargs = {"threshold": args.voiceprint_threshold}
+        if args.voiceprint_python:
+            voiceprint_kwargs["python"] = args.voiceprint_python
+        if args.voiceprint_enroll_dir:
+            voiceprint_kwargs["enroll_dir"] = args.voiceprint_enroll_dir
+        voiceprint = VoiceprintService(**voiceprint_kwargs)
+        voiceprint.start()
+
+    def on_mic_chunk(chunk):
+        if base_feed is not None:
+            base_feed(chunk)
+        if voiceprint is not None:
+            voiceprint.feed(chunk)
+
+    if base_feed is None and voiceprint is None:
         on_mic_chunk = None
     state = HostState(
         source=source.name,
@@ -248,6 +292,8 @@ def main(argv: list[str] | None = None) -> int:
         ambient = None
     if ambient is not None:
         state.attach_ambient(ambient)
+    if voiceprint is not None:
+        state.attach_voiceprint(voiceprint)
     broadcaster = Broadcaster(state)
     writer = DeviceWriter()
 
@@ -488,6 +534,8 @@ def main(argv: list[str] | None = None) -> int:
     source_thread.join(timeout=3.0)
     if player_service is not None:
         player_service.stop()
+    if voiceprint is not None:
+        voiceprint.stop()
     if ambient is not None:
         # 退出时必须把人从通透模式切回去；stop() 内部会先做这一步再停线程。
         ambient.stop()

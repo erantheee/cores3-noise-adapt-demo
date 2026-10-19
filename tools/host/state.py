@@ -265,6 +265,8 @@ class HostState:
 
         self.latest: CommandFrame | None = None
         self.latency: LatencyReport | None = None
+        #: WavLM 声纹影子门控（tools/host/voiceprint.py）。None = 本次没启用。
+        self.voiceprint: object | None = None
         self.latency_at: float | None = None
 
         self.capture_state: str | None = None
@@ -347,6 +349,11 @@ class HostState:
         """
         with self.lock:
             self.player = player
+
+    def attach_voiceprint(self, voiceprint: object | None) -> None:
+        """挂上声纹影子门控。只进快照，不参与任何决策。"""
+        with self.lock:
+            self.voiceprint = voiceprint
 
     def attach_ambient(self, ambient: object | None) -> None:
         """挂上环境声执行端（tools/host/ambient.py）。
@@ -657,6 +664,7 @@ class HostState:
             #: 环境声执行端（AirPods 聆听模式）。None = 本次运行没启用执行端；
             #: 设备意图在 frame.ambient_open，两者必须分开读。
             "ambient": self.ambient.snapshot() if self.ambient is not None else None,
+            "voiceprint": self.voiceprint.snapshot() if self.voiceprint is not None else None,
             "control": {
                 "sent": self.control_sent,
                 "acknowledged": self.control_acknowledged,

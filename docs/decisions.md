@@ -735,3 +735,22 @@ WavLM 的类内范围 0.8935–0.9686 与类间范围 0.4402–0.6911 **不重�
 2. 通过串口把 `self / other` 判定回给 S3（加 hold，避免抖动）；
 3. S3 用该判定作为对话/环境声的 own-voice veto：self → 不开环境声、不抬 EQ；other → 按现有逻辑；
 4. 先做影子遥测（只显示判定）验证延迟/准确率，再决定是否接决策。
+
+
+---
+
+## D29 · 2026-10-19 WavLM 声纹影子门控接入上位机（只遥测，不改决策）
+
+**实现**：
+- `tools/voiceprint_worker.py`：子进程，用仓库 `.venv` 的 torch/transformers 加载
+  `microsoft/wavlm-base-plus-sv`；从 `记录/声纹/self-device/` 的 4 段设备自身录音算
+  prototype（512 维），对 16 kHz 流做 1.5 s 窗 / 0.75 s 步进 embedding，cosine 阈值 0.80，
+  EMA 平滑后输出 self/other。单窗推理实测约 45–90 ms。
+- `tools/host/voiceprint.py`：上位机把 S3 中继的 MicChunk 以 base64 JSON 行喂给 worker，
+  读回判定，写进快照的 `voiceprint` 段；worker 异常/缺依赖只显示，不影响串口主链路。
+- 面板「情境」卡片下新增一行：`声纹 · self/other 0.93 · 62 ms · 影子遥测`。
+- `python -m host --voiceprint` 启用；默认关闭，不加参数时行为与之前完全一致。
+
+**边界**：目前只遥测，**不参与** conversation/ambient/QE 决策。下一步才把 self/other
+通过串口回传 S3 做 own-voice veto；延迟约 1.5 s 窗 + 60 ms 推理 + 串口，需先影子验证
+自说/他人/噪声三类情况下的判定稳定性与延迟，再接决策。

@@ -42,6 +42,7 @@ from host.protocol import (  # noqa: E402
     parse_line,
 )
 from host.mac_audio import parse_default_output, route_command  # noqa: E402
+from host.voiceprint import VoiceprintService  # noqa: E402
 from host.server import (  # noqa: E402
     Broadcaster,
     CommandError,
@@ -1704,6 +1705,28 @@ def test_player_decision_path_is_not_silently_dropped() -> None:
     check("串口断了" in service.snapshot()["last_error"], "失败原因要进快照，面板才看得见")
 
 
+def test_voiceprint_shadow_snapshot_is_harmless() -> None:
+    """声纹影子门控：未启用/缺依赖时只能报状态，绝不能抛异常或影响主链路。"""
+    disabled = VoiceprintService(enabled=False)
+    snap = disabled.snapshot()
+    check(snap["mode"] == "mirror-only", "声纹只能是影子模式")
+    check(snap["enabled"] is False and snap["ready"] is False, "未启用时不得 ready")
+    check(snap["verdict"] is None and snap["windows"] == 0, "没有结果时不能编造判定")
+    check(snap["threshold"] == 0.80, "默认阈值")
+    # feed 在未 ready 时必须安全地丢弃，而不是把 None/属性错误抛进 mic 回调。
+    disabled.feed(MicChunk(sequence=0, sample_count=1, rate=16000, timestamp_ms=0, pcm=b"\x00\x00"))
+    check(disabled.snapshot()["fed_chunks"] == 0, "未 ready 时 feed 必须安全丢弃")
+
+    class Fake:
+        def snapshot(self):
+            return {"ready": True, "verdict": "self", "score": 0.93, "mode": "mirror-only"}
+
+    state = HostState(source="test", detail={}, on_mic_chunk=None)
+    state.attach_voiceprint(Fake())
+    section = state.snapshot()["voiceprint"]
+    check(section["verdict"] == "self" and section["mode"] == "mirror-only", "声纹进快照")
+
+
 def test_ambient_executor_and_intent_parsing() -> None:
     """环境声：设备只报意图，Mac 执行；意图与执行结果必须分开。
 
@@ -1921,6 +1944,7 @@ def main() -> int:
         test_server_endpoints,
         test_interval_stats_and_percentile,
         test_player_decision_path_is_not_silently_dropped,
+        test_voiceprint_shadow_snapshot_is_harmless,
         test_ambient_executor_and_intent_parsing,
         test_relay_ambient_gate,
         test_audio_relay_budget_caps_backlog,

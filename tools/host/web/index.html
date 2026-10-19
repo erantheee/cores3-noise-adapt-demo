@@ -143,6 +143,7 @@
       <div class="meter"><span id="ctx-bar"></span></div>
       <div class="sub" id="ctx-raw">—</div>
       <div class="sub" id="ctx-note">9 分类 · 只显示，不参与决策</div>
+      <div class="sub" id="vp">声纹 · 未启用</div>
     </div>
     <!--
       声音事件 = 1 s 窗规则判断（main/sound_event.hpp）：键盘 / 风 / 说话 / 撞击。
@@ -494,6 +495,27 @@ function renderContext(f) {
   $("ctx-note").textContent = note;
 }
 
+function renderVoiceprint(s) {
+  const el = $("vp");
+  const vp = s.voiceprint;
+  if (!vp) {
+    el.textContent = "声纹 · 未启用（--voiceprint）";
+    return;
+  }
+  if (vp.error) {
+    el.textContent = "声纹 · " + vp.error;
+    return;
+  }
+  if (!vp.ready) {
+    el.textContent = vp.loading ? "声纹 · WavLM 加载中…" : "声纹 · 未就绪";
+    return;
+  }
+  const score = vp.smoothed !== null && vp.smoothed !== undefined ? vp.smoothed : vp.score;
+  const scoreText = typeof score === "number" ? fmt(score, 2) : "—";
+  const latency = typeof vp.latency_ms === "number" ? ` · ${fmt(vp.latency_ms, 0)} ms` : "";
+  el.textContent = `声纹 · ${vp.verdict || "—"} ${scoreText}${latency} · 影子遥测`;
+}
+
 function renderEvent(f) {
   const missing = f.event_valid === null || f.event_valid === undefined;
   if (missing) {
@@ -540,6 +562,7 @@ function render(s) {
     $("amb-raw").textContent = "还没有设备帧";
     $("ctx-bar").style.width = "0%";
     $("ctx-note").textContent = "9 分类 · 只显示，不参与决策";
+    $("vp").textContent = "声纹 · 还没有设备帧";
     $("evt").textContent = "—";
     $("evt-raw").textContent = "还没有设备帧";
     $("evt-note").textContent = "键盘 / 风 / 撞击 · 只显示，不参与决策";
@@ -550,6 +573,7 @@ function render(s) {
     renderOwnVoice(f);
     renderAmbient(s, f);
     renderContext(f);
+    renderVoiceprint(s);
     renderEvent(f);
     $("state").textContent = f.state_text;
     $("state-raw").textContent = `${f.state} · ${f.conversation || "NONE"}`;
