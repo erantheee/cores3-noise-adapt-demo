@@ -557,3 +557,10 @@ g++ -std=c++17 -O2 -I main -o /tmp/voicsweep tools/voice_decision_sweep.cpp main
 
 **对 D20 的更正**：风噪不是"没有执行端所以先不做"，而是"执行端是 EQ，可以做，但要按 EQ 的
 节奏和接口设计"。
+
+**落地（2026-10-19）**：控制器新增 `apply_wind_eq(command)`（`main/controller.hpp`）：
+- 只在 `tuning_mode == song_eq` 且 `conversation == none` 时生效；
+- 前 5 个低频段（70.7–451.7 Hz）的抬升上限压到 **+2 dB**，中高频不动；
+- 不抬高任何频段（只会压），单元测试覆盖"风压低频 / 对话优先 / 非放歌模式不改 /
+  低增益不动"四条。
+**验证状态**：固件已刷、单测通过；听感 A/B 需要真实风环境，属于待办。

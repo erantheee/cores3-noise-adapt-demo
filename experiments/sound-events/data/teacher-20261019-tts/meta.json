@@ -1,0 +1,21 @@
+{
+  "requested_seconds": 183.20700337499147,
+  "frames": 1716,
+  "frame_rate_hz": 9.366,
+  "audio_seconds": 182.7,
+  "chunks": 9135,
+  "chunk_gaps": [],
+  "bad_lines": 0,
+  "first_frame_ts_ms": 60177,
+  "last_frame_ts_ms": 243102,
+  "first_chunk_ts_ms": 60457,
+  "last_chunk_ts_ms": 243147,
+  "event_counts": {
+    "quiet": 573,
+    "speech": 805,
+    "artifact": 35,
+    "keyboard": 166,
+    "wind": 137
+  },
+  "note": "audio.wav 与 frames.jsonl 按设备 timestamp_ms 对齐；frame_rate 应为 ~10 Hz"
+}

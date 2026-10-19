@@ -9,6 +9,7 @@
 | 路径 | 内容 |
 |---|---|
 | `teacher-20261019-multi/` | 一次 183 s 多条件采集的 **16 kHz 音频**（`audio.wav`）、**10 Hz 24 段**（`frames.jsonl`）、分段边界（`phases.json`）、采集元信息（`meta.json`），以及两个教师的逐窗标签（`teacher_yamnet.jsonl`、`teacher_ast.jsonl`） |
+| `teacher-20261019-tts/` | 2026-10-19 用 4 个 TTS 音色（Tingting/Meijia/Daniel/Samantha）经 Mac 扬声器播 183 s 的**说话正样本**：16 kHz 音频、10 Hz 24 段、教师 YAMNet 标签 |
 | `captures/*.csv` | 规则/学生评估用的逐帧 24 段采集（安静/键盘/风/说话/敲桌），由 `tools/live_band_capture.py` 记录 |
 | `SHA256SUMS` | 全部文件的校验和 |
 

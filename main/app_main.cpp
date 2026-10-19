@@ -799,7 +799,8 @@ void processing_task(void*) {
         // separation is what makes this a no-behaviour-change round.
         command.context = context_result;
 
-        // ---- 声音事件判断（键盘 / 风 / 说话 / 撞击；只上报，不参与决策）----
+        // ---- 声音事件判断（键盘 / 风 / 说话 / 撞击）----
+        // 键盘/说话/撞击只上报；**风**例外：D21 起在 song_eq 且无对话时压低频抬升上限。
         //
         // 撞击（削波）帧不进入 1 s 事件窗：Detector 内部会清窗并报 artifact。这样"撞桌子"
         // 不会因为瞬态形状像键盘而被判成键盘。窗长 1 s，比 9 类模型的 2 s 窗短——
@@ -811,6 +812,10 @@ void processing_task(void*) {
         event_timing->record(static_cast<float>(esp_timer_get_time() - event_started_us));
         command.event.valid = sound_event_out.valid;
         command.event.class_name = sound_event::class_name(sound_event_out.cls);
+        // 风场景 EQ（D21）：只在放歌且没有对话时压低频抬升上限；对话优先。
+        if (sound_event_out.valid && sound_event_out.cls == sound_event::Class::wind) {
+            apply_wind_eq(command);
+        }
 
         const float analyse_ms = static_cast<float>(analyse_done_us - analyse_started_us) / 1000.0f;
         const float decide_ms = static_cast<float>(decide_done_us - analyse_done_us) / 1000.0f;

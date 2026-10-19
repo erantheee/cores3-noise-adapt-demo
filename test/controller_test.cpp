@@ -147,6 +147,37 @@ int main() {
         check(with_bone.media_percent <= 61, "bone_only ducks when bone evidence is present");
     }
 
+    {
+        EarbudCommand song;
+        song.tuning_mode = TuningMode::song_eq;
+        song.conversation = ConversationState::none;
+        for (std::size_t band = 0; band < kBandCount; ++band) song.eq_gain_db[band] = 6.0f;
+        apply_wind_eq(song);
+        check(song.eq_gain_db[0] == 2.0f && song.eq_gain_db[4] == 2.0f,
+              "wind EQ caps the five low bands at +2 dB");
+        check(song.eq_gain_db[5] == 6.0f && song.eq_gain_db[23] == 6.0f,
+              "wind EQ leaves mid/high band lifts untouched");
+
+        EarbudCommand talking = song;
+        talking.conversation = ConversationState::speech_nearby;
+        for (std::size_t band = 0; band < kBandCount; ++band) talking.eq_gain_db[band] = 6.0f;
+        apply_wind_eq(talking);
+        check(talking.eq_gain_db[0] == 6.0f,
+              "speech takes priority over wind EQ (D21)");
+
+        EarbudCommand flat;
+        flat.tuning_mode = TuningMode::flat;
+        for (std::size_t band = 0; band < kBandCount; ++band) flat.eq_gain_db[band] = 6.0f;
+        apply_wind_eq(flat);
+        check(flat.eq_gain_db[0] == 6.0f, "wind EQ does not shape non-song modes");
+
+        EarbudCommand already_low;
+        already_low.tuning_mode = TuningMode::song_eq;
+        already_low.eq_gain_db[0] = 1.0f;
+        apply_wind_eq(already_low);
+        check(already_low.eq_gain_db[0] == 1.0f, "wind EQ never raises a low band");
+    }
+
     check(std::string(adapt_state_name(AdaptState::adjusting)) == "ADJUSTING",
           "state names are stable protocol values");
     check(std::string(conversation_state_name(ConversationState::anticipating)) == "ANTICIPATING",

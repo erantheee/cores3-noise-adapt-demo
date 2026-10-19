@@ -43,6 +43,8 @@ C_CARD_EDGE = (0x2A, 0x30, 0x3A)
 C_TITLE = (0x8E, 0x99, 0xA8)
 C_VALUE = (0xFF, 0xFF, 0xFF)
 C_GREEN = (0x5F, 0xF2, 0xA7)
+C_BLUE = (0x6B, 0xB8, 0xFF)
+C_RED = (0xFF, 0x6B, 0x6B)
 C_DIM = (0x69, 0x73, 0x84)
 C_MUTED = (0x9B, 0xA5, 0xB4)
 C_TRACK = (0x23, 0x28, 0x33)
@@ -199,7 +201,12 @@ def render(state: dict, out_path: str):
     ]
 
     draw_text(cv, fonts["ui16"], 112 * SCALE, 158 * SCALE, state["detail"], C_GREEN)
+    # 事件类别（1 s 窗）：ASCII 小字放在"麦克风正常"同一行的右侧，宽度只算到屏幕右边。
+    draw_text(cv, fonts["m14"], 232 * SCALE, 158 * SCALE, state["event"], state["event_color"])
     draw_text(cv, fonts["ui16"], 112 * SCALE, 179 * SCALE, state["perf"], C_MUTED)
+    event_needs = fonts["m14"].text_width(state["event"])
+    checks.append({"title": "事件", "value": state["event"], "box": W - 232,
+                   "needs": event_needs, "fits": event_needs <= W - 232})
     cv.rounded_rect(112 * SCALE, 200 * SCALE, (112 + 198) * SCALE, 208 * SCALE,
                     radius=4 * SCALE, fill=C_TRACK)
     bar = int(198 * state["confidence"])
@@ -235,6 +242,8 @@ def main():
             "gain": "+8.0 dB",
             "link": "未连接",
             "detail": "麦克风正常",
+            "event": "artifact",          # 最长事件类别（8 字符）
+            "event_color": C_RED,
             "perf": "处理 12.3ms  内存 9999k",
             "confidence": 1.0,
         }
@@ -253,6 +262,8 @@ def main():
             "gain": "+3.7 dB",
             "link": "未连接",
             "detail": "麦克风正常",
+            "event": "keyboard",
+            "event_color": C_BLUE,
             "perf": "处理 8.1ms  内存 214k",
             "confidence": 0.45,
         }
@@ -274,7 +285,7 @@ def main():
     checks_by_font = {
         "ui16": ("端侧算法验证机自动环境当前动作感知人声状态调音增益控制链路麦克风正常处理内存"
                  "未连接人声嘈杂人声提升保持当前设置感知> 2/2"),
-        "m14": "near_voice babble music horn other quiet steady street wind --",
+        "m14": "near_voice babble music horn other quiet steady street wind keyboard speech artifact --",
         "m20": "LIKELY NONE SPEECH +8.0 dB",
     }
     missing = set()

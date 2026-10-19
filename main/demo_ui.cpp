@@ -1,6 +1,7 @@
 #include "demo_ui.hpp"
 
 #include <cstdio>
+#include <cstring>
 #include "esp_log.h"
 #include "lvgl.h"
 
@@ -41,6 +42,8 @@ lv_obj_t* link_value;
 lv_obj_t* context_title;
 lv_obj_t* context_value;
 lv_obj_t* detail_value;
+/// 事件判断（1 s 窗，键盘/风/说话/撞击）。ASCII 类别名，放一行小字，避免再动 115 字子集。
+lv_obj_t* event_value;
 lv_obj_t* performance_value;
 lv_obj_t* confidence_bar;
 lv_obj_t* page_main;
@@ -196,6 +199,14 @@ void demo_ui_create() {
     // after touching any of these strings.
     lv_obj_set_style_text_font(context_value, &lv_font_montserrat_14, 0);
 
+    // 事件类别：只显示 ASCII 类别名（keyboard / wind / speech / artifact / quiet），
+    // 用 montserrat_14，不上中文字库——这个标签每 100 ms 刷一次，不能赌字库。
+    event_value = lv_label_create(page_main);
+    lv_label_set_text(event_value, "--");
+    lv_obj_set_pos(event_value, 232, 158);
+    lv_obj_set_style_text_color(event_value, lv_color_hex(0x697384), 0);
+    lv_obj_set_style_text_font(event_value, &lv_font_montserrat_14, 0);
+
     detail_value = lv_label_create(page_main);
     lv_obj_set_pos(detail_value, 112, 158);
     lv_obj_set_style_text_color(detail_value, lv_color_hex(0x5FF2A7), 0);
@@ -286,6 +297,20 @@ void demo_ui_update(const AnalysisFrame& frame, const EarbudCommand& command,
     lv_label_set_text(link_value, route.mac_connected ? "已连接" : "未连接");
     lv_obj_set_style_text_color(link_value,
         route.mac_connected ? lv_color_hex(0x5FF2A7) : lv_color_hex(0xFFC857), 0);
+
+    // 事件类别放在"麦克风正常"同一行的右侧：它只是展示，不参与决策（风 EQ 除外，见 D21）。
+    if (command.event.valid) {
+        lv_label_set_text(event_value, command.event.class_name);
+        uint32_t color = 0x9BA5B4;
+        if (std::strcmp(command.event.class_name, "speech") == 0) color = 0x5FF2A7;
+        else if (std::strcmp(command.event.class_name, "keyboard") == 0) color = 0x6BB8FF;
+        else if (std::strcmp(command.event.class_name, "wind") == 0) color = 0xFFC857;
+        else if (std::strcmp(command.event.class_name, "artifact") == 0) color = 0xFF6B6B;
+        lv_obj_set_style_text_color(event_value, lv_color_hex(color), 0);
+    } else {
+        lv_label_set_text(event_value, "--");
+        lv_obj_set_style_text_color(event_value, lv_color_hex(0x697384), 0);
+    }
 
     lv_label_set_text(detail_value, frame.mic_valid ? "麦克风正常" : "麦克风异常");
     lv_obj_set_style_text_color(detail_value,

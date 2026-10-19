@@ -1,0 +1,24 @@
+{
+  "phases": [
+    {
+      "phase": "ready",
+      "host_ms": 0
+    },
+    {
+      "phase": "voice_a",
+      "host_ms": 3000
+    },
+    {
+      "phase": "voice_b",
+      "host_ms": 48000
+    },
+    {
+      "phase": "voice_c",
+      "host_ms": 93000
+    },
+    {
+      "phase": "voice_d",
+      "host_ms": 138000
+    }
+  ]
+}

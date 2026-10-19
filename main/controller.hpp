@@ -211,9 +211,37 @@ struct EarbudCommand {
     EvidencePolicy evidence_policy = EvidencePolicy::bone_only;
     /// Model telemetry. `AdaptController` never touches this field.
     ContextResult context;
-    /// 声音事件判断（1 s 窗）。同样只上报：键盘/风/撞击不参与决策。
+    /// 声音事件判断（1 s 窗）。键盘/说话/撞击只上报；风在 song_eq 且无对话时压低频
+    /// 抬升上限（D21，见 apply_wind_eq）。
     SoundEventResult event;
 };
+
+// ── 风场景 EQ（D21）────────────────────────────────────────────────────────────
+//
+// 本 demo 没有降噪，执行端只有 EQ。风噪的能量集中在低频，此时继续把歌曲低频往上抬
+// 既听不出提升、又会让整体更浑；所以风场景的策略是**给低频抬升设上限**，中高频不动。
+// 这里只定义"风时怎么改形状"，不改变"是否放歌/是否下压"的决策：
+//   * 只在 tuning_mode == song_eq（正在放歌）时生效；
+//   * 对话优先（D21）：conversation != none 时 EQ 保持控制器给的原样，不叠加风策略；
+//   * 低频段 = 前 5 个频段（70.7–451.7 Hz），因为它们装的是风噪/轰鸣的主要能量。
+// 真机听感验证需要真实风环境，见 docs/decisions.md D21 的待办。
+namespace wind_eq {
+/// 风时低频段允许的最大抬升（dB）。控制器给 0 增益时不动，只压"抬得过高"的频段。
+constexpr float kLowBandCapDb = 2.0f;
+/// 低频段数量：0..4（70.7 / 141.4 / 244.9 / 346.4 / 451.7 Hz）。
+constexpr std::size_t kLowBandCount = 5;
+}  // namespace wind_eq
+
+/// 把控制器的 EQ 形状按"有风"改一遍。纯函数，方便单测与离线复算。
+inline void apply_wind_eq(EarbudCommand& command) {
+    if (command.tuning_mode != TuningMode::song_eq) return;
+    if (command.conversation != ConversationState::none) return;
+    for (std::size_t band = 0; band < wind_eq::kLowBandCount; ++band) {
+        if (command.eq_gain_db[band] > wind_eq::kLowBandCapDb) {
+            command.eq_gain_db[band] = wind_eq::kLowBandCapDb;
+        }
+    }
+}
 
 /// Turns one analysis frame into an `AnalysisFrame`, including the voice decision.
 ///
