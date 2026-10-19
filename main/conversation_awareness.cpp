@@ -29,6 +29,7 @@ Output Awareness::update(const Evidence& evidence, float dt_ms) {
     const bool cue = evidence.conversation_cue >= params_.cue_threshold;
     const bool own = evidence.own_voice >= params_.own_voice_threshold;
     const bool evidence_present = cue || own;
+    evidence_streak_ = evidence_present ? evidence_streak_ + 1 : 0;
 
     switch (state_) {
         case State::idle:
@@ -67,7 +68,8 @@ Output Awareness::update(const Evidence& evidence, float dt_ms) {
 
         case State::engaged:
             engaged_ms_ += static_cast<std::uint32_t>(dt);
-            if (evidence_present) {
+            // 连续两帧才算"还在说"；单帧噪声尖峰不让关闭倒计时无限续命。
+            if (evidence_present && evidence_streak_ >= 2) {
                 gap_ms_ = 0.0f;
                 silence_ms_ = 0.0f;
             } else {
@@ -120,6 +122,7 @@ Output Awareness::update(const Evidence& evidence, float dt_ms) {
 }
 
 void Awareness::reset() {
+    evidence_streak_ = 0;
     state_ = State::idle;
     media_percent_ = 100.0f;
     confirm_ms_ = 0.0f;

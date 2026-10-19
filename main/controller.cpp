@@ -347,7 +347,8 @@ float voice_likelihood_from_features(const VoiceFeatures& features) {
     return band_term * peak_term * noise_term * spread_term * features.level_gate;
 }
 
-EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
+EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms,
+                                    bool non_voice_event) {
     EarbudCommand command;
     command.sequence = ++sequence_;
     command.timestamp_ms = frame.timestamp_ms;
@@ -378,17 +379,27 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
         valid_ms_ += dt_ms;
         const float noise = clamp01((frame.broadband_dbfs + 58.0f) / 30.0f);
         const float voice = clamp01(frame.voice_likelihood);
-        const bool speech_active = voice > 0.55f && frame.broadband_dbfs > -58.0f;
+        // 0.55：歌曲 EQ/场景判断用的"有人声"门槛；
+        // 0.65：**对话/环境声**的门槛。实测房间噪声的 voice_likelihood 常漂到 0.5–0.6，
+        // 若和 EQ 用同一个门槛，键盘/风扇/远处人声都会反复把对话顶起来（2026-10-19 实测
+        // 环境声一直开着）。对话是更重的动作，门槛必须更高。
+        constexpr float kConversationVoiceThreshold = 0.65f;
+        const bool speech_active =
+            !non_voice_event && voice > 0.55f && frame.broadband_dbfs > -58.0f;
+        const bool conversation_voice =
+            !non_voice_event && voice > kConversationVoiceThreshold &&
+            frame.broadband_dbfs > -58.0f;
 
         // **预判输入**：附近有人开口 = 对话正在开始。这是提前量的唯一来源——"我开口"只能
         // 在事后被检测到，把它当触发输入（旧实现）就永远只能"说过之后才压"，方向与目标相反。
         // 电平门 -58→-42 dBFS：更弱的语音不可信，-42 以上按近场对话计。
         const float cue_level = clamp01((frame.broadband_dbfs + 58.0f) / 16.0f);
         conversation::Evidence evidence;
-        evidence.speech_active = speech_active;
+        evidence.speech_active = conversation_voice;
         evidence.voice_likelihood = voice;
         evidence.level_dbfs = frame.broadband_dbfs;
-        evidence.conversation_cue = speech_active ? cue_level : 0.0f;
+        // 键盘/风/撞击（non_voice_event）不参与对话证据；普通噪声也必须在 0.65 以上。
+        evidence.conversation_cue = conversation_voice ? cue_level : 0.0f;
         // 证据来源按**显式策略**决定，而不是"有就用"。三条路的可信度与失败方式不同，
         // 而且遥测必须如实反映用了哪一条（own_voice_source 与 own_voice_policy）。
         OwnVoiceEvidence effective = own_voice_evidence_;
@@ -419,7 +430,12 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
                 effective.imu_ok = own_voice_evidence_.imu_ok;
                 break;
         }
-        evidence.own_voice = effective.confidence;
+        // 用户 2026-10-19 口径：**不能把自己的声音/近场代理当成"对话开始"**。
+        // 近场代理只能说明"有人在我附近说话"，分不出是我还是别人；拿它当证据会让
+        // 房间噪声/键盘/自己说话都反复把环境声顶开。在真正的自身语音传感器可用之前，
+        // own_voice 一律不作为对话证据（连同 bone 的失败判据一起）。
+        (void)effective;
+        evidence.own_voice = 0.0f;
         awareness_out_ = awareness_.update(evidence, dt_ms);
         const conversation::Output& awareness_out = awareness_out_;
         // 对话正在发生（预测中或已确认）都算"进入对话"：EQ 必须保持平直，音乐让位。

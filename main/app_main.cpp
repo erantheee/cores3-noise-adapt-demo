@@ -772,7 +772,27 @@ void processing_task(void*) {
         own_voice.imu_ok = g_imu_ok;
         controller.set_own_voice_evidence(own_voice);
 
-        EarbudCommand command = controller.update(frame, elapsed_ms);
+        // ---- 声音事件判断（键盘 / 风 / 说话 / 撞击）----
+        // 必须放在 controller.update() **之前**：键盘/风/撞击要作为"不是对话"的否决条件，
+        // 不然房间噪声/键盘会把 voice_likelihood 顶过门槛，环境声一开就关不上。
+        //
+        // 撞击（削波）帧不进入 1 s 事件窗：Detector 内部会清窗并报 artifact。这样"撞桌子"
+        // 不会因为瞬态形状像键盘而被判成键盘。窗长 1 s，比 9 类模型的 2 s 窗短——
+        // 键盘/阵风是短事件，2 s 会把它们平均掉。
+        const int64_t event_started_us = esp_timer_get_time();
+        const sound_event::Output sound_event_out = sound_event_detector->push(
+            frame.band_dbfs, frame.broadband_dbfs, frame.mic_valid,
+            static_cast<float>(now_us) / 1.0e6f);
+        event_timing->record(static_cast<float>(esp_timer_get_time() - event_started_us));
+        const bool non_voice_event =
+            sound_event_out.valid &&
+            (sound_event_out.cls == sound_event::Class::keyboard ||
+             sound_event_out.cls == sound_event::Class::wind ||
+             sound_event_out.cls == sound_event::Class::artifact);
+
+        EarbudCommand command = controller.update(frame, elapsed_ms, non_voice_event);
+        command.event.valid = sound_event_out.valid;
+        command.event.class_name = sound_event::class_name(sound_event_out.cls);
         const int64_t decide_done_us = esp_timer_get_time();
 
         // ---- 听音情境模型（融合第二轮：只上报，不改任何决策）----
@@ -843,19 +863,6 @@ void processing_task(void*) {
         // separation is what makes this a no-behaviour-change round.
         command.context = context_result;
 
-        // ---- 声音事件判断（键盘 / 风 / 说话 / 撞击）----
-        // 键盘/说话/撞击只上报；**风**例外：D21 起在 song_eq 且无对话时压低频抬升上限。
-        //
-        // 撞击（削波）帧不进入 1 s 事件窗：Detector 内部会清窗并报 artifact。这样"撞桌子"
-        // 不会因为瞬态形状像键盘而被判成键盘。窗长 1 s，比 9 类模型的 2 s 窗短——
-        // 键盘/阵风是短事件，2 s 会把它们平均掉。
-        const int64_t event_started_us = esp_timer_get_time();
-        const sound_event::Output sound_event_out = sound_event_detector->push(
-            frame.band_dbfs, frame.broadband_dbfs, frame.mic_valid,
-            static_cast<float>(now_us) / 1.0e6f);
-        event_timing->record(static_cast<float>(esp_timer_get_time() - event_started_us));
-        command.event.valid = sound_event_out.valid;
-        command.event.class_name = sound_event::class_name(sound_event_out.cls);
         // 风场景 EQ（D21）：只在放歌且没有对话时压低频抬升上限；对话优先。
         if (sound_event_out.valid && sound_event_out.cls == sound_event::Class::wind) {
             apply_wind_eq(command);

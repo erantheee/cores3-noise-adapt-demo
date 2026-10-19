@@ -120,6 +120,36 @@ int main() {
               "外部人声 EQ 只动中频段，不动两端");
     }
 
+    // ---- 对话门槛高于 EQ 门槛：一般噪声不能把对话顶起来 ----
+    {
+        AdaptController noisy;
+        EarbudCommand out;
+        // voice 0.6、-45 dBFS：够"有人声"（EQ/场景）但不够对话（0.65）。
+        for (int i = 0; i < 12; ++i) out = noisy.update(frame(-45, 0.6f), 150);
+        check(out.conversation == ConversationState::speech_nearby,
+              "voice 0.6 只报 nearby，不进入对话（对话门槛 0.65）");
+        check(out.media_percent == 100 && !out.ambient_open,
+              "voice 0.6 不压媒体、不开环境声");
+        bool mid = false;
+        for (std::size_t band = 8; band <= 16; ++band) {
+            if (out.eq_gain_db[band] > 0.05f) mid = true;
+        }
+        check(mid, "voice 0.6 仍按背景人声抬中频 EQ");
+    }
+
+    // ---- 键盘/风/撞击事件不参与对话证据 ----
+    {
+        AdaptController vetoed;
+        EarbudCommand out;
+        for (int i = 0; i < 12; ++i) {
+            out = vetoed.update(frame(-45, 0.9f), 150, /*non_voice_event=*/true);
+        }
+        check(out.conversation == ConversationState::none,
+              "键盘/风/撞击事件否决对话（即使 voice 0.9）");
+        check(!out.ambient_open, "非人声事件不得开环境声");
+        check(out.media_percent == 100, "非人声事件不得压媒体");
+    }
+
     // ---- 高噪声安全保持 ----
     {
         AdaptController safety_controller;

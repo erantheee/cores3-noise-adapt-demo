@@ -100,6 +100,9 @@ private:
     float gap_ms_ = 0.0f;
     float silence_ms_ = 0.0f;
     std::uint32_t engaged_ms_ = 0;
+    /// 连续出现证据的帧数。engaged 只允许连续证据重置保持计时；
+    /// 单帧尖峰不能让"关闭环境声"的 2.5 s 倒计时无限续命。
+    std::uint32_t evidence_streak_ = 0;
 };
 
 const char* state_name(State state);
