@@ -80,7 +80,15 @@ echo "Table:  $TABLE"
 echo "App:    $APP"
 echo "SHA256: $HASH"
 
-"$ESPTOOL" --chip esp32s3 --port "$PORT" --baud 921600 write-flash \
-    --flash-mode dio --flash-freq 80m --flash-size 16MB \
-    0x0 "$BOOT" 0x8000 "$TABLE" 0x10000 "$APP"
+# 三个区域**分开写、逐个校验**。2026-10-19 实测：esptool v5.5.0 把三个
+# "地址 文件" 对放在同一条 write-flash 里时，日志会正常打印每个区域、也报
+# "Hash of data verified"，但回读 0x8000 是全 0xFF、0x10000 还是上一个固件——
+# 分区表没写进去，启动报 "No bootable app partitions"，设备停在下载模式。
+# 分开写之后回读逐字节一致。刷机脚本宁可慢几秒，也不能"报告成功但没写进去"。
+for pair in "0x0 $BOOT" "0x8000 $TABLE" "0x10000 $APP"; do
+    # shellcheck disable=SC2086
+    set -- $pair
+    "$ESPTOOL" --chip esp32s3 --port "$PORT" --baud 921600 write-flash \
+        --flash-mode dio --flash-freq 80m --flash-size 16MB "$1" "$2"
+done
 echo "完成。日志：sh tools/monitor.sh"

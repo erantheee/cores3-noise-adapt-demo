@@ -1,0 +1,56 @@
+{
+  "phases": [
+    {
+      "phase": "ready",
+      "host_ms": 439
+    },
+    {
+      "phase": "quiet",
+      "host_ms": 6004
+    },
+    {
+      "phase": "keyboard",
+      "host_ms": 26005
+    },
+    {
+      "phase": "pause",
+      "host_ms": 61004
+    },
+    {
+      "phase": "wind",
+      "host_ms": 65005
+    },
+    {
+      "phase": "pause",
+      "host_ms": 90004
+    },
+    {
+      "phase": "knock",
+      "host_ms": 94005
+    },
+    {
+      "phase": "pause",
+      "host_ms": 106005
+    },
+    {
+      "phase": "speech",
+      "host_ms": 110003
+    },
+    {
+      "phase": "pause",
+      "host_ms": 140004
+    },
+    {
+      "phase": "keyboard",
+      "host_ms": 144004
+    },
+    {
+      "phase": "wind",
+      "host_ms": 164003
+    },
+    {
+      "phase": "done",
+      "host_ms": 179005
+    }
+  ]
+}

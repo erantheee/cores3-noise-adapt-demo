@@ -50,7 +50,7 @@ checks = []
 def check(name, ok, detail):
     checks.append((name, ok, detail)); print(f"{'✅' if ok else '❌'} {name}：{detail}")
 
-check("C1 固件是 v3", schemas == [3], f"schema={schemas}")
+check("C1 固件是 v3 或更新", bool(schemas) and min(schemas) >= 3, f"schema={schemas}")
 check("C2 IMU 就绪", imu_ok and sum(imu_ok)/len(imu_ok) >= 0.9,
       f"{sum(imu_ok)}/{len(imu_ok)} 帧 imu_ok=true")
 check("C3 重力基线（±4g，m/s²）", gravity and 9.0 <= statistics.median(gravity) <= 10.5,
@@ -67,6 +67,13 @@ else:
 expected = {"bone_only": {"bone"}, "near_field_demo": {"near_field"}, "disabled": {"none"}}
 ok = bool(policies) and all(s in expected.get(p, set()) for p in policies for s in sources)
 check("C5b 证据来源与策略一致", ok, f"policy={policies} source={sources}")
+ambient = [r[1].get("ambient_open") for r in frames if "ambient_open" in r[1]]
+if schemas and min(schemas) >= 4:
+    check("C6 环境声意图可读", bool(ambient) and all(isinstance(v, bool) for v in ambient),
+          f"{sum(1 for v in ambient if v)}/{len(ambient)} 帧请求开放"
+          if ambient else "帧里没有 ambient_open")
+else:
+    check("C6 环境声意图可读", True, "v3 固件没有 ambient_open（升级后可见）")
 check("遥测无解析异常", not problems, f"{len(problems)} 条 anomalies")
 if media:
     check("媒体下压确有动作（演示模式观察项）", min(media) < 100,

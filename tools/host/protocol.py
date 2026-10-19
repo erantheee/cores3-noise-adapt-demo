@@ -30,8 +30,9 @@ from typing import Any, Iterable
 
 #: 本上位机实现的协议版本。设备侧 schema_version 不是这个值时必须显式报告不兼容，
 #: 而不是按 v1 去解读——字段含义变了却继续显示，比显示不出来更糟。
-SCHEMA_VERSION = 3
-SUPPORTED_SCHEMA_VERSIONS = (1, 2, 3)
+#: v4 加了 `ambient_open`（环境声开放意图），同时读 v1–v4 的历史日志。
+SCHEMA_VERSION = 4
+SUPPORTED_SCHEMA_VERSIONS = (1, 2, 3, 4)
 
 #: 固件侧的**产品策略**上限（main/controller.hpp 的 kMaxSpeechGainDb）。
 #: 注意：固件实际下发的值被钳到 demo 上限，不是这一个——见下面那个常量。
@@ -74,6 +75,16 @@ CONTEXT_CLASSES = (
 #: 把预热期显示成一个结论。
 CONTEXT_UNKNOWN = "unknown"
 
+#: 端侧声音事件判断（main/sound_event.hpp）的类别。顺序与 `Class` 枚举一致。
+#: `artifact` 是输入中断（削波/撞击），不是声音类别：它只表示"这一帧不可用、窗已清空"。
+EVENT_CLASSES = ("quiet", "speech", "keyboard", "wind", "artifact")
+#: `event_valid=false` 且还没被撞击时，固件报的占位类别（窗还没攒满 1 秒）。
+#: 与情境模型不同，这里固件直接报 `quiet`，所以界面必须靠 `event_valid` 区分"还没判断"
+#: 和"判断为安静"。
+EVENT_UNKNOWN = "quiet"
+#: `event_valid=true` 时允许的类别：`artifact` 只能出现在 valid=false 的帧里。
+EVENT_VALID_CLASSES = ("quiet", "speech", "keyboard", "wind")
+
 
 #: 端侧自己测量的阶段。其余阶段由对端上报（本机目前没有对端，所以它们的 n 一直是 0）。
 #: 与 main/latency_profiler.hpp 的 Stage 枚举顺序一致。
@@ -115,7 +126,7 @@ class Tuning:
 
 @dataclass(frozen=True)
 class CommandFrame:
-    """一帧 EarbudCommand；v1 历史日志与当前 v2 都可读取。"""
+    """一帧 EarbudCommand；v1–v4 历史日志都可读取。"""
 
     sequence: int
     timestamp_ms: int
@@ -130,6 +141,16 @@ class CommandFrame:
     conversation: str = "NONE"
     execution: str = "decision_only"
     ambient_band_dbfs: tuple[float, ...] = ()
+    #: v4：环境声开放**意图**。None 表示这一帧没报（v4 之前的固件）。
+    #: 它是意图，不是执行回执——执行端的结果另外报。
+    ambient_open: bool | None = None
+    #: v4 判据遥测（对话预判的训练与误触发排查要用）。None = 这一帧没报。
+    broadband_dbfs: float | None = None
+    voice_likelihood: float | None = None
+    vocal_ratio: float | None = None
+    spectral_flatness: float | None = None
+    vocal_peakiness: float | None = None
+    excited_vocal_bands: int | None = None
     #: 旧固件的字段（已从固件删除）。保留只为读得懂历史日志；上位机不显示它。
     noise_reduction_db: float | None = None
     #: 设备实际要施加的调音。None 表示这一帧没有报（旧固件不发 eq_gain_db）。
@@ -141,6 +162,11 @@ class CommandFrame:
     context_valid: bool | None = None
     #: 一次前向的耗时，微秒。设备逐帧实报，不是估算。
     context_us: int | None = None
+    #: 端侧声音事件判断（main/sound_event.hpp）：quiet / speech / keyboard / wind /
+    #: artifact。None = 这一帧没报（旧固件）。`event_valid=False` 是"窗还没攒满或刚被
+    #: 撞击清空"，不是"判断为 quiet"——两种情况必须分开显示。
+    event: str | None = None
+    event_valid: bool | None = None
     #: 自身语音证据（v3）。None 表示这一帧没报——v3 之前的固件不发这几个字段。
     #: source 有三种：`bone`（骨传导 IMU）、`near_field`（调用方显式打开开关后的代理兜底）、
     #: `none`（没有证据，fail-closed 不动作）。三态必须分开：把 none 显示成 near_field，
@@ -295,6 +321,16 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
     # 只为读得懂旧固件的帧与历史日志；不会把它放进快照端给界面。
     noise_reduction = _as_float(payload, "noise_reduction_db")
     media_percent = _as_int(payload, "media_percent")
+    # v4：环境声开放意图。缺字段给 None（v4 之前的历史日志），不能默认成 False——
+    # "没报"和"报了一个明确的 false"必须分得开。
+    raw_ambient_open = payload.get("ambient_open")
+    ambient_open = raw_ambient_open if isinstance(raw_ambient_open, bool) else None
+    broadband_dbfs = _as_float(payload, "broadband_dbfs")
+    voice_likelihood = _as_float(payload, "voice_likelihood")
+    vocal_ratio = _as_float(payload, "vocal_ratio")
+    spectral_flatness = _as_float(payload, "spectral_flatness")
+    vocal_peakiness = _as_float(payload, "vocal_peakiness")
+    excited_vocal_bands = _as_int(payload, "excited_vocal_bands")
     confidence = _as_float(payload, "confidence")
     state = _as_str(payload, "state")
     environment = _as_str(payload, "environment")
@@ -305,6 +341,9 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
     context = _as_str(payload, "context")
     context_score = _as_float(payload, "context_score")
     context_us = _as_int(payload, "context_us")
+    event = _as_str(payload, "event")
+    raw_event_valid = payload.get("event_valid")
+    event_valid = raw_event_valid if isinstance(raw_event_valid, bool) else None
     raw_valid = payload.get("context_valid")
     # 只在字段存在时认它：融合第二轮之前的固件根本不发这四个字段，把它们当成"缺字段"
     # 会把每一帧历史日志都标成异常。
@@ -384,10 +423,21 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
         problems.append("v2 帧缺 external_voice_gain_db")
     if schema >= 3 and own_voice_confidence is None:
         problems.append("v3 帧缺 own_voice_confidence")
+    # 声音事件那组字段（event/event_valid）同样一起校验。固件在窗未满或刚撞击清窗时
+    # 报 valid=false；valid=true 却报 artifact 是自相矛盾。
+    if ("event" in payload) != ("event_valid" in payload):
+        problems.append("事件字段只报了一部分（event/event_valid 是一组）")
+    elif event_valid is not None:
+        if event not in EVENT_CLASSES:
+            problems.append(f"未知事件类别 {event!r}")
+        elif event_valid and event not in EVENT_VALID_CLASSES:
+            problems.append(f"event_valid=true 却报了 {event!r}（该类别只能在 valid=false 时出现）")
     if external_voice_gain is not None and not 0.0 <= external_voice_gain <= DEMO_SPEECH_GAIN_DB:
         problems.append(f"现实人声增益 {external_voice_gain:+.2f} dB 越界（合法 0…{DEMO_SPEECH_GAIN_DB}）")
     if not 0 <= media_percent <= 100:
         problems.append(f"媒体音量 {media_percent}% 超出 0–100")
+    if "ambient_open" in payload and not isinstance(raw_ambient_open, bool):
+        problems.append(f"ambient_open 必须是布尔值（实得 {type(raw_ambient_open).__name__}）")
     if not 0.0 <= confidence <= 1.0:
         problems.append(f"置信度 {confidence} 不在 [0,1]")
     if state not in KNOWN_STATES:
@@ -424,6 +474,13 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
             speech_gain_db=d2(speech_gain),
             noise_reduction_db=None if noise_reduction is None else d2(noise_reduction),
             media_percent=media_percent,
+            ambient_open=ambient_open,
+            broadband_dbfs=None if broadband_dbfs is None else d2(broadband_dbfs),
+            voice_likelihood=None if voice_likelihood is None else d2(voice_likelihood),
+            vocal_ratio=None if vocal_ratio is None else d2(vocal_ratio),
+            spectral_flatness=None if spectral_flatness is None else d2(spectral_flatness),
+            vocal_peakiness=None if vocal_peakiness is None else d2(vocal_peakiness),
+            excited_vocal_bands=excited_vocal_bands,
             state=state,
             environment=environment,
             confidence=d2(confidence),
@@ -438,6 +495,8 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
             context_score=None if context_score is None else d2(context_score),
             context_valid=context_valid,
             context_us=context_us,
+            event=event,
+            event_valid=event_valid,
             own_voice_confidence=None if own_voice_confidence is None else d2(own_voice_confidence),
             own_voice_correlation=(
                 None if own_voice_correlation is None else d2(own_voice_correlation)

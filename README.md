@@ -17,16 +17,22 @@
 ## 当前闭环
 
 ```text
-CoreS3 双麦克风 → 24频段环境分析 → 人声/噪声/对话形态 → 端侧策略
+CoreS3 双麦克风 → 24频段环境分析 → 对话开始预判 → 端侧策略
                                                            ↓
-                                                  EarbudCommand v2
+                                                  EarbudCommand v4
                                                            ↓ USB
-                                        Mac三首本地歌曲处理 → AirPods Pro
+                             Mac：歌曲 EQ / 媒体下压 / AirPods 聆听模式 → AirPods Pro
 ```
 
+**对话感知是预判式的（D16）**：附近有人开口的那一刻就先压低媒体，确认对话成立后把
+`ambient_open=true` 发给 Mac 执行端。**当前 demo 走 S3 麦克风中继**（S3 麦 → Mac → 耳机，
+固有时延约 211–231 ms，先把预判与开关跑通）；后续再拓展成 AirPods 通透模式。对话结束后
+恢复媒体与关闭环境声。**不是**"检测到佩戴者说话才下压"——旧实现只能事后反应，方向已改。
+
 CoreS3 承担耳机仓侧的感知、判断与决策；Mac 承担本次 Demo 的音频执行；AirPods Pro 只播放 Mac
-最终输出。AirPods 不开放双耳原始麦克风与通透 DSP，所以当前不能声称使用 AirPods 麦克风完成了
-目标人声增强。真实执行链路尚未接通时，协议固定上报 `execution: decision_only`。
+最终输出。AirPods 不开放双耳原始麦克风与目标人声增益接口，所以当前不能声称使用 AirPods 麦克风
+完成了目标人声增强；环境声只通过切换聆听模式（通透）实现，不是目标人声提取。真实执行链路尚未
+接通时，协议固定上报 `execution: decision_only`。
 
 ## 三笔账的当前状态
 
@@ -75,7 +81,7 @@ CoreS3 承担耳机仓侧的感知、判断与决策；Mac 承担本次 Demo 的
 
 ## 真机踩到的坑（换硬件前请先读）
 
-这三条都**只在真机上暴露**，桌面机上完全看不见，写在这里是为了不要重犯：
+下面每一条都**只在真机上暴露**，桌面机上完全看不见，写在这里是为了不要重犯：
 
 1. **桌面基准会骗人。** 把 24 频段分析里的 Hann 窗提出循环外，真机上 57.1 ms → 7.0 ms
    （8 倍），桌面上只有 14%——因为桌面编译器会向量化那段循环，ESP32-S3 不会。
@@ -87,6 +93,15 @@ CoreS3 承担耳机仓侧的感知、判断与决策；Mac 承担本次 Demo 的
 3. **"打点开销"很容易测成"被测对象"。** 这条度量我写错了三次，前两版分别报 57 ms 和
    7.1 ms，**都是把分析本身算了进去**，因为结束时刻的读时钟放在了工作之后而不是紧挨着开始。
    现在相邻两次读时钟，1.52 µs。
+4. **刷机打印 "Hash of data verified" 不等于写进去了。** 2026-10-19 用 esptool v5.5.0 把
+   bootloader、分区表、app 三个"地址 文件"对放进同一条 `write-flash`：日志逐区打印、每区都报
+   verified，但回读 `0x8000` 全是 `0xFF`、`0x10000` 还是上一版固件。启动停在
+   `E boot: No bootable app partitions`。`tools/flash.sh` 已改成**逐区写、逐区校验**。
+5. **USB-JTAG 的"硬复位"不一定真复位。** 刷完 `Hard resetting via RTS pin...` 之后设备可能
+   停在下载模式，端口在、但一个字节都没有（本项目已知"节点在≠设备在"）。用
+   `esptool --after watchdog-reset run` 才能把 app 跑起来；再不行就拔插 USB。
+6. **刷机/读串口要用 `danger-full-access`。** 工作区沙箱默认禁止打开 `/dev/cu.usbmodem*`，
+   表现为 `Errno 1: Operation not permitted`——它不是"端口被占用"。
 
 ## 屏幕（中文界面）
 
@@ -99,23 +114,42 @@ CoreS3 承担耳机仓侧的感知、判断与决策；Mac 承担本次 Demo 的
 - `控制链路`：Mac 串口是否真实连接
 - 第二页显示 `AirPods Pro`、Mac 控制通道和 Mac 回报的蓝牙输出状态
 - 底部信息行：麦克风正常/异常、处理耗时与剩余内存
+- 声音事件（键盘/风/撞击）**目前只进串口与上位机面板**，屏幕还没这一格；屏幕字库是 115 字
+  子集，加任何标题都要先过 `tools/render_demo_ui.py` 的缺字检查
 
 开机不播放任何歌曲，内置扬声器保持静音。
 
-## EarbudCommand v2
+## EarbudCommand v4
 
 每约 100 ms 从 USB 串口输出一帧 JSON（`kControlPeriodMs = 100.0f`，`main/app_main.cpp`；
 录音期间放宽到 250 ms，见同文件的 `kCapturePeriodMs`。上位机启动时也如实打印这一行）：
 
 ```json
-{"type":"earbud_command","schema":2,"sequence":42,"timestamp_ms":6300,"external_voice_gain_db":3.20,"media_percent":100,"state":"ADJUSTING","environment":"VOICE","mode":"EXTERNAL_VOICE_INTENT","conversation":"LIKELY","confidence":0.92,"execution":"decision_only","link":"simulated","eq_gain_db":[0.0,...,0.0],"ambient_band_dbfs":[-52.1,...,-61.0]}
+{"type":"earbud_command","schema":4,"sequence":42,"timestamp_ms":6300,"speech_gain_db":0.00,"external_voice_gain_db":0.00,"media_percent":60,"ambient_open":true,"state":"ADJUSTING","environment":"VOICE","mode":"FLAT","conversation":"LIKELY","confidence":0.92,"execution":"decision_only","link":"simulated","eq_gain_db":[0.0,...,0.0],"ambient_band_dbfs":[-52.1,...,-61.0],"event":"quiet","event_valid":true}
 ```
 
-没有 Mac 执行回执前，`execution` 必须保持 `decision_only`。现实人声模式下 `eq_gain_db` 必须平直；
-否则就是把现实人声增强错误替换成歌曲中频增强。
+版本历史：v2 = 调音与外部人声字段分离；v3 = 自身语音证据（`own_voice_*` / `imu_*`）；
+v4 = `ambient_open`（环境声开放意图）。`event` / `event_valid`（端侧声音事件判断）是
+**v4 上追加的键**，不涨 schema——与 `latency` 报文追加字段同一条理由：上位机按名读取，
+只增键不破坏旧解析。上位机同时读得懂 v1–v4，旧帧缺字段一律报 `null`，不猜默认值。
 
-`eq_gain_db` 是 S3 给 Mac 的歌曲 EQ 建议，`ambient_band_dbfs` 是 S3 实测环境谱；Mac 还要结合
-EQ 前的歌曲内容生成最终处方。`external_voice_gain_db` 是现实人声增益意图，不代表 AirPods 已执行。
+**`ambient_open` 是意图，不是执行回执。** S3 决定"对话成立，应该让现实声音进来"，执行端
+由 Mac 选：当前 demo 是 `--ambient-executor relay`（S3 麦克风中继，S3 说开才放行音频包）；
+后续是 `--ambient-executor airpods`（兄弟工程 `airpods-control` 切通透模式，关闭切回原模式）。
+执行结果、失败原因、放行/丢弃包数在面板「环境声」卡上单独显示；没有执行端时意图仍然可见，
+不允许把意图写成已执行。
+
+没有 Mac 执行回执前，`execution` 必须保持 `decision_only`。现实人声模式下 `eq_gain_db` 必须平直；
+否则就是把现实人声增强错误替换成歌曲中频增强。**`eq_gain_db` 现在只有 `SONG_EQ` 会写非零值。**
+
+`eq_gain_db` 是 S3 给 Mac 的歌曲 EQ 建议，`ambient_band_dbfs` 是
+S3 实测环境谱。**Mac 目前只按 S3 的逐段建议 × 深度倍率执行，没有做歌曲内容分析**——"结合歌曲
+内容生成最终处方"是计划，不是现状；面板上必须按这个口径显示。`external_voice_gain_db` 是现实
+人声增益意图，不代表 AirPods 已执行。
+
+v4 还带判据遥测：`broadband_dbfs` / `voice_likelihood` / `vocal_ratio` / `spectral_flatness` /
+`vocal_peakiness` / `excited_vocal_bands`。它们只上报，不参与决策，是对话预判训练与误触发排查的
+数据（见 [docs/conversation-prediction.md](docs/conversation-prediction.md)）。
 
 `noise_reduction_db` 是**降噪量的大小**，取值 0…+8，不是负值偏移（固件的钳位是
 `std::clamp(noise_reduction_db_, 0.0f, kMaxNoiseReductionDb)`，`main/controller.cpp`）。
@@ -167,6 +201,44 @@ EQ 前的歌曲内容生成最终处方。`external_voice_gain_db` 是现实人�
 `voice_thresholds` 与 `clip_thresholds` 命名空间里，**必须用真实录音重新标定**——合成信号
 只能证明"已知假阳性没了"，不能证明准确率。
 
+### 对话触发：预判式（D16）
+
+判据回答的是"像不像人声"；**触发对话感知的不是它**。总目标是"预判我即将跟别人讲话"，所以：
+
+- 触发输入是 `conversation_cue`：附近有人开口 + 近场电平门（-58…-42 dBFS）。第一拍进入
+  `anticipating`，媒体立刻预下压（70%）；**不依赖佩戴者开口**。
+- 证据持续 200 ms 进入 `engaged`：媒体压到 60%，同时把 `ambient_open=true` 发给 Mac。
+- 最后一个人声后 2.5 s 无声 → 恢复媒体、关闭环境声；短促声退回 `idle`，环境声不为咳嗽切换。
+- 旧的"自身语音是唯一触发输入"已删除（它只能事后反应）；`own_voice` 只保留为可选确认。
+
+代价写在 D16：播客、电视、旁边桌说话都可能触发预判；当前没有方向与身份信息，靠轮次归属
+（状态表第 36 项）或声纹收紧。验证脚本的旧 C9 断言与新目标冲突，需按 D16 重写。
+
+### 声音事件判断（键盘 / 风 / 撞击）
+
+9 类情境模型没有 keyboard 类，且真实风判不出来；所以另做一条 **1 秒窗的规则判断**（只上报，
+不参与决策），代码在 `main/sound_event.hpp`，现状与数字见
+[`experiments/sound-events/README.md`](experiments/sound-events/README.md)：
+
+- 输入仍是固件已有的 24 段 dBFS + 宽带电平，**不新增 DSP**；15 维特征（质心、斜率、
+  语音带峰值集中度、低频能量占比、包络起伏……）全部是它们的初等函数。
+- 输出 `event`：`quiet / speech / keyboard / wind / artifact`，随串口帧下发，面板新增
+  「事件（端侧规则）」卡。`event_valid=false` 表示 1 s 窗没攒满或刚被撞击清空——界面必须把它
+  与"判断为安静"分开，否则就是在把"还没判断"说成"判断为安静"。
+- **撞击是前置门控**：削波帧（`mic_valid=false`）直接清空事件窗并报 `artifact`。键盘与撞击
+  在时域上都是冲击，不先门控的话撞一下桌子就会被判成敲键盘。
+- 2026-10-19 两段真机采集上：keyboard/wind 召回 **83.7%**（keyboard 78% / wind 90%），
+  安静/说话误报 **0.0%**。**这是单键盘单房间的数字，不是跨条件泛化证据。**
+- **真机固件复测（v5b）**：键盘段 79% 帧报 keyboard（连续 15 秒不闪断）；风段 **0 帧**
+  被误报成 keyboard（加"斜率不能太陡"门前是 20%）；敲桌段削波时报 artifact，未削波时
+  落 quiet，只有 5/60 帧报 keyboard。**口径：单次现场行为验证，不是准确率测量。**
+- 已知假阳性方向（必须记住）：这版规则不区分"键盘"与"其他未削波的瞬态"（关门、杯子碰桌），
+  负样本还没采；9 类模型把真实说话 100% 判成 `other`（域偏移），与事件规则无关。
+
+真正修"键盘被四判据当成人声、导致媒体下压"（本次采集实测键盘帧 82.6% 报 `VOICE`、
+80.6% 进 `conversation=LIKELY`、媒体被压到 60%）需要让**决策路径**消费事件判断或收紧
+四判据；本轮按"只上报、不改决策"落地，行为变更要单独拍板。
+
 ## 构建
 
 本地要求 ESP-IDF 5.4.1：
@@ -189,14 +261,19 @@ idf.py -p /dev/cu.usbmodemXXX flash monitor
 `main/controller.cpp` 刻意不依赖 ESP-IDF，所以整条决策路径可以在开发机上秒级验证。
 **新增判据或阈值时必须在这里补用例。**
 
-当前 **7 个套件、251 条断言**（2026-10-16 实测全部通过）：
-controller 51、noise_analyzer 46、latency_profiler 40、mic_capture 16、mic_decimator 15、
-voiceprint_gate 60、context_window **23**。
+当前 **10 个套件、323 条断言**（2026-10-19 实测全部通过）：
+controller 40、noise_analyzer 46、latency_profiler 40、mic_capture 16、mic_decimator 15、
+voiceprint_gate 60、context_window 23、conversation_awareness 38、bone_voice 19、sound_event 26。
 
 `context_window` 是融合第二轮加的：它拿 `experiments/listening-model/scripts/features.py`
 （训练那一侧的权威实现）在固定配方上的输出当金标准，逐维比对固件里的 92 维窗口构造。
 移植错一个索引不会报错，只会安静地换个类别——所以这条比对必须存在。
 重新生成金标准：`.venv/bin/python experiments/listening-model/scripts/emit_window_golden.py`。
+
+`sound_event` 是声音事件判断加的：它用同一份真机采集导出 15 维窗特征与规则判断当金标准
+（`test/sound_event_golden.h`），逐值比对 C++ 移植；同时用合成序列单测地板跟踪器、
+状态机保持、撞击清窗。重新生成：
+`.venv/bin/python experiments/sound-events/export_golden.py --out test/sound_event_golden.h <两段 CSV>`。
 
 ```bash
 cmake -S test -B build-host-tests
@@ -210,8 +287,8 @@ CI 里这一步跑在固件构建**之前**（[`.github/workflows/build.yml`](.g
 上位机（`tools/host/`）另有一套自己的自测，同样是纯 Python、秒级、不需要设备：
 
 ```bash
-python3 tools/host/tests/test_host.py            # 47 组、4205 条断言
-node tools/host/tests/render_check.js <快照.json> # 可选：用 DOM 桩真跑一遍界面渲染（60 条通过、0 条失败）
+python3 tools/host/tests/test_host.py            # 51 组、7550 条断言
+node tools/host/tests/render_check.js <快照.json> # 可选：用 DOM 桩真跑一遍界面渲染（60 条通过、0 条失败，条数随快照内容略变）
 ```
 
 `render_check.js` 存在的原因很具体：这台机器上无头浏览器拿不到显示器，系统也不允许截屏，
@@ -292,6 +369,8 @@ python3 tools/voice_separability.py --enroll 甲A.wav 甲B.wav 甲C.wav \
 ```bash
 sh tools/host_up.sh                    # 真机（自动找 /dev/cu.usbmodem*）
 sh tools/host_up.sh --relay-audio      # S3 麦克风实时中继到 AirPods（可 --relay-device 改目标）
+sh tools/host_up.sh --ambient-executor relay  # S3 的 ambient_open 意图 → S3 麦克风中继到耳机（当前玩法）
+sh tools/host_up.sh --ambient-executor airpods  # 后续：切 AirPods 通透模式
 sh tools/host_up.sh --mock             # 没有设备也能先把界面跑起来
 sh tools/host_up.sh --replay 记录/x.log --speed 4    # 回放历史日志
 # 然后打开 http://127.0.0.1:8787/
@@ -332,7 +411,7 @@ sh tools/host_up.sh --replay 记录/x.log --speed 4    # 回放历史日志
 提取、方向选择或歌曲避让 EQ。不要把听到现实声音写成“已经完成目标人声增强”。
 
 面板会显示：环境 / 当前动作 / **语音段增益** / **调音（24 频段 EQ 形状）** /
-**中继延迟（实测排队 + 驱动侧输出）** /
+**环境声（S3 意图 vs Mac 执行结果）** / **中继延迟（实测排队 + 驱动侧输出）** /
 **决策模式**（设备上报的 `mode`：`FLAT` / `SONG_EQ` / `EXTERNAL_VOICE_INTENT` / `SAFETY_HOLD`）/
 控制链路 / 置信度、最近 90 秒的趋势、端侧分段延迟（每 10 秒一次汇总）、状态变化与异常列表、
 以及最近几行设备原始输出。
@@ -417,7 +496,7 @@ sh tools/host_up.sh               # 起上位机时会自动带起播放器（--
 
 - 曲库：`tools/player/tracks.json`。**先按两首做**（《渡口》与 Sweet Child），加第三首只需往
   `tracks` 里加一项，播放器与面板都不用改。
-- **默认音量 100%**：播放器不再预设 30% 限制；仍可在面板上随时调节。
+- **默认播放增益 150%**：100% 是文件原始电平，网页可在 0–200% 调节；它与对话媒体衰减分别计算。
 - 为什么是独立的 Swift 进程：macOS 上能做实时多段 EQ 的只有 `AVAudioEngine + AVAudioUnitEQ`，
   而 Python 这边没有 PyObjC。协议是 stdin/stdout 上的 JSON 行，见
   `tools/player/player.swift` 顶部注释。
@@ -458,7 +537,7 @@ Mac 的 `applied` / `idle` / `silent` / `bypass` / `unavailable`（有证据：
 ### 上位机自测
 
 ```bash
-python3 tools/host/tests/test_host.py      # 47 组、4205 条断言，不需要设备、不需要串口
+python3 tools/host/tests/test_host.py      # 50 组、6639 条断言，不需要设备、不需要串口
 node tools/host/tests/render_check.js <快照.json>   # 用 DOM 桩真跑一遍 render()：60 条通过、0 条失败
 ```
 

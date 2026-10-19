@@ -21,6 +21,7 @@
 #include "mic_capture.hpp"
 #include "mic_decimator.hpp"
 #include "sdkconfig.h"
+#include "sound_event.hpp"
 
 namespace {
 constexpr uint32_t kSampleRate = 48000;
@@ -84,26 +85,35 @@ constexpr int64_t kLatencyReportPeriodUs = 10 * 1000 * 1000;
 const char* kTag = "cores3_noise_adapt";
 MacAudioRoute g_mac_route;
 
-/// Emit one frame of EarbudCommand v3.
+/// Emit one frame of EarbudCommand v4.
 ///
 /// v3 adds the own-voice evidence (`own_voice_confidence` / `own_voice_correlation` /
 /// `own_voice_source`) plus `imu_ok`. Without it a device-side verification cannot tell
 /// "bone evidence never arrived" apart from "evidence arrived and the state machine still
 /// did not duck" -- and those two have completely different fixes.
 ///
-/// Two deliberate changes from the previous revision:
+/// v4 adds `ambient_open`: the anticipation state machine's "let reality in" intent. The
+/// device cannot execute it itself; the host maps it to an AirPods listening-mode switch and
+/// must report that execution separately from this intent.
+///
+/// Two deliberate changes from an earlier revision:
 ///   * `noise_reduction_db` is gone. This product's actions are gain and tuning; the field
 ///     was computed, printed and shown on the device screen while nothing consumed it.
 ///   * `eq_gain_db` is now transmitted. It was always computed (24 per-band gains) and
 ///     applied to the command, but never sent -- so the host could not show the tuning at
 ///     all, and the panel had to infer its shape from the scalar `speech_gain_db`.
 ///
-/// Band gains are printed with one decimal on purpose: they only ever hold 0 or the same
-/// scalar speech gain, and one decimal keeps a frame near 250 bytes.
+/// Band gains are printed with one decimal on purpose: they only ever hold 0 or a small
+/// per-band value from SONG_EQ, and one decimal keeps a frame near 250 bytes.
 void emit_command_json(const EarbudCommand& command) {
     std::printf("{\"type\":\"earbud_command\",\"schema\":%lu,\"sequence\":%lu,"
                 "\"timestamp_ms\":%lu,\"speech_gain_db\":%.2f,"
                 "\"external_voice_gain_db\":%.2f,\"media_percent\":%u,"
+                "\"ambient_open\":%s,"
+                // 判据遥测：训练对话预判与排查误触发都要这些量（见 conversation-prediction.md）。
+                "\"broadband_dbfs\":%.1f,\"voice_likelihood\":%.3f,"
+                "\"vocal_ratio\":%.3f,\"spectral_flatness\":%.4f,"
+                "\"vocal_peakiness\":%.3f,\"excited_vocal_bands\":%u,"
                 "\"state\":\"%s\",\"environment\":\"%s\",\"mode\":\"%s\","
                 "\"conversation\":\"%s\",\"confidence\":%.2f,"
                 "\"own_voice_confidence\":%.3f,\"own_voice_correlation\":%.3f,"
@@ -118,6 +128,13 @@ void emit_command_json(const EarbudCommand& command) {
                 static_cast<unsigned long>(command.timestamp_ms),
                 command.speech_gain_db, command.external_voice_gain_db,
                 command.media_percent,
+                command.ambient_open ? "true" : "false",
+                static_cast<double>(command.broadband_dbfs),
+                static_cast<double>(command.voice_likelihood),
+                static_cast<double>(command.vocal_ratio),
+                static_cast<double>(command.spectral_flatness),
+                static_cast<double>(command.vocal_peakiness),
+                static_cast<unsigned>(command.excited_vocal_bands),
                 adapt_state_name(command.state), environment_name(command.environment),
                 tuning_mode_name(command.tuning_mode),
                 conversation_state_name(command.conversation),
@@ -144,11 +161,15 @@ void emit_command_json(const EarbudCommand& command) {
     // 情境模型只上报，不参与任何决策。`"context_valid":false` 就是"窗口还没攒够 2 秒"，
     // 上位机要能把它与"模型说 unknown"分开。类别名与训练那 9 个字符串逐字相同：
     // 屏幕、串口、模型头文件共用 listening_model.h 的 kClassNames 这一份。
+    // 声音事件判断同样只上报：`event_valid=false` 表示 1 s 窗还没攒满（或刚被撞击清空），
+    // 上位机必须把这两种情况与"判断成 quiet"分开显示。
     std::printf("],\"context\":\"%s\",\"context_score\":%.3f,\"context_valid\":%s,"
-                "\"context_us\":%ld}\n",
+                "\"context_us\":%ld,\"event\":\"%s\",\"event_valid\":%s}\n",
                 command.context.class_name, static_cast<double>(command.context.score),
                 command.context.valid ? "true" : "false",
-                static_cast<long>(command.context.inference_us));
+                static_cast<long>(command.context.inference_us),
+                command.event.class_name,
+                command.event.valid ? "true" : "false");
 }
 
 /// Report the per-stage breakdown, then clear the window so the next report covers the
@@ -394,13 +415,18 @@ void processing_task(void*) {
         heap_caps_malloc(sizeof(context::ContextWindow), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     auto* context_timing = static_cast<context::ContextTiming*>(
         heap_caps_malloc(sizeof(context::ContextTiming), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    // 声音事件判断器（1 s × 15 维 + 地板跟踪，约 2.4 KB）。同样走堆：音频任务栈只有 16 KB。
+    static_assert(sound_event::kBandCount == kBandCount, "事件判断与控制器频段数不一致");
+    auto* sound_event_detector = static_cast<sound_event::Detector*>(
+        heap_caps_malloc(sizeof(sound_event::Detector), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     if (decimated == nullptr || pending == nullptr || encode_buffer == nullptr ||
-        context_window == nullptr || context_timing == nullptr) {
+        context_window == nullptr || context_timing == nullptr || sound_event_detector == nullptr) {
         ESP_LOGE(kTag, "Capture buffer allocation failed");
         vTaskDelete(nullptr);
     }
     new (context_window) context::ContextWindow();
     new (context_timing) context::ContextTiming();
+    new (sound_event_detector) sound_event::Detector();
 
     NoiseAnalyzer analyzer;
     AdaptController controller;
@@ -639,7 +665,11 @@ void processing_task(void*) {
             }
         }
 
-        const float period_ms = (g_record_seconds >= 0) ? kCapturePeriodMs : kControlPeriodMs;
+        // 只有**有限时长录音**才放宽控制节拍。无限流（`rec start`，也就是中继/环境声）
+        // 必须保持 100 ms：中继是对话预判的执行端，把感知节拍降到 250 ms 等于自己把
+        // 预判做慢。这个区别是环境声改走 S3 中继后才重要的。
+        const bool finite_recording = g_record_seconds > 0;
+        const float period_ms = finite_recording ? kCapturePeriodMs : kControlPeriodMs;
         const bool due = (now_us - last_control_us) >=
                          static_cast<int64_t>(period_ms * 1000.0f);
         // Both conditions are required: the cadence decides when a decision is wanted, the
@@ -658,6 +688,10 @@ void processing_task(void*) {
         const int64_t analyse_started_us = esp_timer_get_time();
         AnalysisFrame frame = analyzer.analyze(samples, filled,
             static_cast<uint32_t>(now_us / 1000));
+        // 判据历史必须跟着输入一起断：无效帧（削波/非有限值）已经写进了时域闸门的历史，
+        // 不丢掉的话，削波段和恢复后的干净段会被当成同一个连续声音。NoiseAnalyzer::reset()
+        // 的文档要求调用，这里补上——在此之前主循环从来没调用过它。
+        if (!frame.mic_valid) analyzer.reset();
         if (g_record_seconds >= 0) {
             capture_analyse_us += static_cast<uint32_t>(esp_timer_get_time() - analyse_started_us);
         }
@@ -682,7 +716,9 @@ void processing_task(void*) {
                                               imu_sample.accel[2] * imu_sample.accel[2]);
             bone_voice.push_imu(magnitude, static_cast<float>(imu_sample.t_us) / 1000.0f);
         }
-        // 语音带（第 8–16 段，300–4000 Hz）的平均电平，作为骨传导判据的音频侧包络。
+        // 语音带（第 8–16 段，约 997–3415 Hz）的平均电平，作为骨传导判据的音频侧包络。
+        // 注意它**不是**判据用的 300–4000 Hz 语音带（main/controller.cpp 的 in_speech_band，
+        // 第 3–16 段）；两者差在低频段，这里只用于与 IMU 包络做相关，不参与人声判定。
         float speech_band_dbfs = 0.0f;
         for (std::size_t band = 8; band <= 16; ++band) {
             speech_band_dbfs += frame.band_dbfs[band] / 9.0f;
@@ -751,6 +787,17 @@ void processing_task(void*) {
         // Assigned after `controller.update()`, and the controller never reads it back: that
         // separation is what makes this a no-behaviour-change round.
         command.context = context_result;
+
+        // ---- 声音事件判断（键盘 / 风 / 说话 / 撞击；只上报，不参与决策）----
+        //
+        // 撞击（削波）帧不进入 1 s 事件窗：Detector 内部会清窗并报 artifact。这样"撞桌子"
+        // 不会因为瞬态形状像键盘而被判成键盘。窗长 1 s，比 9 类模型的 2 s 窗短——
+        // 键盘/阵风是短事件，2 s 会把它们平均掉。
+        const sound_event::Output sound_event_out = sound_event_detector->push(
+            frame.band_dbfs, frame.broadband_dbfs, frame.mic_valid,
+            static_cast<float>(now_us) / 1.0e6f);
+        command.event.valid = sound_event_out.valid;
+        command.event.class_name = sound_event::class_name(sound_event_out.cls);
 
         const float analyse_ms = static_cast<float>(analyse_done_us - analyse_started_us) / 1000.0f;
         const float decide_ms = static_cast<float>(decide_done_us - analyse_done_us) / 1000.0f;

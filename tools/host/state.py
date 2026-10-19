@@ -105,6 +105,24 @@ CONTEXT_TEXT = {
 }
 
 
+#: 端侧声音事件判断（main/sound_event.hpp）的类别译名。`artifact` 是输入中断（削波/撞击），
+#: 不是声音类别；界面上要把它显示成"受撞击"而不是"未知"。
+EVENT_TEXT = {
+    "quiet": "安静",
+    "speech": "说话",
+    "keyboard": "敲键盘",
+    "wind": "吹风",
+    "artifact": "撞击/削波",
+}
+
+
+def event_text(value: str | None) -> str:
+    """事件类别的显示文本。`None`（这一帧没报）与 `artifact` 必须分开。"""
+    if value is None:
+        return "—"
+    return EVENT_TEXT.get(value, f"未知({value})")
+
+
 def context_text(value: str | None) -> str:
     """模型类别的显示文本。
 
@@ -242,6 +260,8 @@ class HostState:
         self.player = None
         #: 音频中继（S3 麦克风 → Mac 输出）。为 None = 本次运行没开中继。
         self.relay = None
+        #: 环境声执行端（tools/host/ambient.py，切 AirPods 聆听模式）。为 None = 没启用。
+        self.ambient = None
 
         self.latest: CommandFrame | None = None
         self.latency: LatencyReport | None = None
@@ -284,6 +304,7 @@ class HostState:
         self._last_state: str | None = None
         self._last_environment: str | None = None
         self._last_context: str | None = None
+        self._last_event: str | None = None
         self._last_mic_valid: bool | None = None
 
     # ------------------------------------------------------------------ 连接
@@ -326,6 +347,16 @@ class HostState:
         """
         with self.lock:
             self.player = player
+
+    def attach_ambient(self, ambient: object | None) -> None:
+        """挂上环境声执行端（tools/host/ambient.py）。
+
+        与 player/relay 同样的鸭子类型理由。这里必须把两类信息分开：
+        **设备意图**（帧里的 `ambient_open`）与**执行结果**（`ambient.open`）。
+        "意图 true、执行失败"是一个必须被看见的状态，不能合并成"已开放"。
+        """
+        with self.lock:
+            self.ambient = ambient
 
     # ------------------------------------------------------------------ 喂数据
 
@@ -416,6 +447,8 @@ class HostState:
                 # 情境类别（模型的判断）。与 env（固件自己的四分类）是两个不同的量，
                 # 并排看它们的**分歧**才是这个模型现阶段的用处。窗没满时为 None。
                 "ctx": frame.context if frame.context_valid else None,
+                # 声音事件（1 s 窗规则）。valid=false 时给 None，与"判断为安静"分开。
+                "evt": frame.event if frame.event_valid else None,
             }
         )
 
@@ -434,6 +467,13 @@ class HostState:
                 frame.context,
             )
             self._last_context = frame.context
+
+        # 事件只在有效时记变更；quiet 不刷事件，否则一次敲击结束会立刻刷一条"安静"。
+        # artifact 单独记：它表示输入中断（撞击/削波），是排查"模型 2 秒没输出"的钥匙。
+        if frame.event_valid and frame.event != self._last_event:
+            if frame.event in ("keyboard", "wind", "speech", "artifact"):
+                self.log("event", f"事件 → {event_text(frame.event)}", frame.event)
+            self._last_event = frame.event
 
         # 麦克风有效性没有单独字段，只能从 state 判断（固件在 mic_valid 为假时进 mic_fault）。
         mic_valid = frame.state != "MIC FAULT"
@@ -614,6 +654,9 @@ class HostState:
             #: 中继的实时读数。measurable=False 表示这个播放端不报告排队深度——
             #: 界面必须把"测不到"和"延迟为零"分开显示。
             "relay": self.relay.live() if self.relay is not None else None,
+            #: 环境声执行端（AirPods 聆听模式）。None = 本次运行没启用执行端；
+            #: 设备意图在 frame.ambient_open，两者必须分开读。
+            "ambient": self.ambient.snapshot() if self.ambient is not None else None,
             "control": {
                 "sent": self.control_sent,
                 "acknowledged": self.control_acknowledged,
@@ -661,6 +704,15 @@ class HostState:
                 "speech_gain_db": frame.speech_gain_db,
                 "external_voice_gain_db": frame.external_voice_gain_db,
                 "media_percent": frame.media_percent,
+                # v4：环境声开放**意图**（不是执行回执）。None = 这一帧没报（旧固件）。
+                "ambient_open": frame.ambient_open,
+                # v4 判据遥测（训练对话预判/排查误触发）。None = 这一帧没报。
+                "broadband_dbfs": frame.broadband_dbfs,
+                "voice_likelihood": frame.voice_likelihood,
+                "vocal_ratio": frame.vocal_ratio,
+                "spectral_flatness": frame.spectral_flatness,
+                "vocal_peakiness": frame.vocal_peakiness,
+                "excited_vocal_bands": frame.excited_vocal_bands,
                 "confidence": frame.confidence,
                 "state": frame.state,
                 "state_text": state_text(frame.state),
@@ -682,6 +734,10 @@ class HostState:
                 "context_score": frame.context_score,
                 "context_valid": frame.context_valid,
                 "context_us": frame.context_us,
+                # 声音事件判断。与情境模型同一纪律：没报 / 窗未满 / 有判断三态分开。
+                "event": frame.event,
+                "event_text": event_text(frame.event),
+                "event_valid": frame.event_valid,
                 "mode": frame.mode,
                 "conversation": frame.conversation,
                 "execution": frame.execution,
@@ -793,6 +849,7 @@ __all__ = [
     "Stats",
     "capture_text",
     "context_text",
+    "event_text",
     "environment_text",
     "link_text",
     "self_check",

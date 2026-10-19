@@ -12,12 +12,15 @@
 from __future__ import annotations
 
 import argparse
+import json
 import signal
 import sys
 import threading
 import time
 import webbrowser
+from pathlib import Path
 
+from .ambient import AmbientService, RelayAmbient
 from .audio_relay import (
     DEFAULT_DEVICE,
     DEFAULT_TARGET_MS,
@@ -40,6 +43,16 @@ from .sources import (
 from .state import HostState
 
 DEFAULT_WEB_PORT = 8787
+
+
+def default_airpods_cli() -> str:
+    """默认的兄弟工程 CLI 路径：../airpods-control/bin/airpods。
+
+    不把它复制/依赖成包：那是独立的 macOS 工具（AX 控制中心），有自己的一套实测与授权。
+    找不到就如实报"不可用"，不是崩溃。
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    return str(repo_root.parent / "airpods-control" / "bin" / "airpods")
 
 
 class DeviceWriter:
@@ -118,7 +131,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--player-volume",
         type=float,
         default=DEFAULT_VOLUME_PERCENT,
-        help=f"播放器音量百分比，默认 {DEFAULT_VOLUME_PERCENT:.0f}，可在面板上调节",
+        help=f"播放增益百分比（100%% 为原始电平），默认 {DEFAULT_VOLUME_PERCENT:.0f}，可在面板上调节",
     )
     parser.add_argument(
         "--relay-audio",
@@ -148,19 +161,52 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_TARGET_MS,
         help=f"播放端允许的最大排队深度（毫秒），默认 {DEFAULT_TARGET_MS:g}",
     )
+    parser.add_argument(
+        "--ambient-executor",
+        choices=("off", "relay", "airpods"),
+        default="off",
+        help=(
+            "环境声执行端。off=只显示 S3 的 ambient_open 意图；"
+            "relay=当前 demo 路径：S3 麦克风 → Mac → 耳机中继，S3 说开就放行音频"
+            "（固有时延约 211–231 ms，先把预判与开关跑通）；"
+            "airpods=后续拓展路径：用兄弟工程 airpods-control 把 AirPods 切到通透模式"
+            "（需要辅助功能权限，会短暂开合控制中心声音面板）"
+        ),
+    )
+    parser.add_argument(
+        "--airpods-cli",
+        default=default_airpods_cli(),
+        help="airpods-control 的 CLI 路径；默认取兄弟工程 ../airpods-control/bin/airpods",
+    )
+    parser.add_argument(
+        "--ambient-mode",
+        choices=("transparency", "adaptive", "anc"),
+        default="transparency",
+        help="（--ambient-executor airpods）开放环境声时切到的聆听模式，默认 transparency",
+    )
+    parser.add_argument(
+        "--frames-jsonl",
+        default="",
+        help=(
+            "把每帧解析结果追加写成 JSONL（对话预判训练集用）。"
+            "包含判据遥测、环境谱、决策与环境声意图；标签由人另外标（见 docs/conversation-prediction.md）"
+        ),
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     source = build_source(args)
+    # relay 执行端需要中继基础设施；--relay-audio 只表示"开机就常开中继"。
+    relay_needed = args.relay_audio or args.ambient_executor == "relay"
     relay = (
         AudioRelay(
             player=args.relay_player,
             device=args.relay_device,
             target_ms=args.relay_target_ms,
         )
-        if args.relay_audio
+        if relay_needed
         else None
     )
     if relay is not None:
@@ -169,16 +215,36 @@ def main(argv: list[str] | None = None) -> int:
         except RelayError as exc:
             print(f"无法启动音频中继：{exc}", file=sys.stderr)
             return 3
+    # 环境声执行端必须在 HostState 之前定下来：on_mic_chunk 要按"门控"还是"直通"接。
+    # relay 执行端走门控（S3 说开才放行），--relay-audio 则是常开中继（调试/对照）。
+    relay_ambient = RelayAmbient(relay) if args.ambient_executor == "relay" and relay else None
+    if args.ambient_executor == "relay" and relay is None:
+        print("无法启用中继执行端：中继没有创建", file=sys.stderr)
+        return 3
+    if relay_ambient is not None:
+        on_mic_chunk = relay_ambient.feed
+    elif relay is not None:
+        on_mic_chunk = lambda chunk: relay.feed(chunk.pcm, chunk.rate)  # noqa: E731
+    else:
+        on_mic_chunk = None
     state = HostState(
         source=source.name,
         detail=source.detail,
-        on_mic_chunk=(lambda chunk: relay.feed(chunk.pcm, chunk.rate)) if relay else None,
+        on_mic_chunk=on_mic_chunk,
     )
     if relay is not None:
         # 中继的数字要进快照：这条通路上原来最缺的就是"现在到底晚了多少"。
         # 顺序要紧：attach 必须发生在 HostState 建好之后（这里曾经写成之前，结果是
         # 启动就 UnboundLocalError —— 而所有单测都测不到 main()，是启动横幅救的场）。
         state.attach_relay(relay)
+    if relay_ambient is not None:
+        ambient = relay_ambient
+    elif args.ambient_executor == "airpods":
+        ambient = AmbientService(args.airpods_cli, open_mode=args.ambient_mode)
+    else:
+        ambient = None
+    if ambient is not None:
+        state.attach_ambient(ambient)
     broadcaster = Broadcaster(state)
     writer = DeviceWriter()
 
@@ -246,7 +312,24 @@ def main(argv: list[str] | None = None) -> int:
                 print("  注意      ffplay 不报告排队深度：这条路的延迟只能靠声学测量，"
                       "面板会显示为「测不到」")
         else:
-            print("  中继      未开启（加 --relay-audio）")
+            print("  中继      未开启（加 --relay-audio 或 --ambient-executor relay）")
+        if relay_ambient is not None:
+            print(
+                "  环境声    S3 ambient_open 意图 → S3 麦克风中继到耳机"
+                f"（执行端 s3-relay，设备「{args.relay_device}」，"
+                f"排队上限 {args.relay_target_ms:g} ms）"
+            )
+            print("  注意      中继通路的固有时延约 211–231 ms（蓝牙占 170 ms）；"
+                  "这一版只验证预判与开关，不宣称能听清对面")
+        elif isinstance(ambient, AmbientService):
+            print(
+                f"  环境声    S3 ambient_open 意图 → AirPods「{args.ambient_mode}」"
+                f"（执行端 {ambient.cli_path}）"
+            )
+            if not ambient.available:
+                print("  注意      找不到 airpods-control CLI：意图会显示，但执行端不可用")
+        else:
+            print("  环境声    只显示 S3 意图（--ambient-executor relay|airpods 才执行）")
         if isinstance(source, ReplaySource):
             print("  注意      回放只是把历史日志搬到界面上，不代表设备现在的状态")
         if isinstance(source, MockSource):
@@ -325,25 +408,85 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_browser and not args.quiet:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
 
+    # 可选：逐帧落盘，作为对话预判的训练/复盘数据（对齐主机单调时钟，便于和录音对齐）。
+    frames_log = None
+    if args.frames_jsonl:
+        try:
+            frames_log = open(args.frames_jsonl, "a", encoding="utf-8", buffering=1)
+        except OSError as exc:
+            print(f"无法打开 --frames-jsonl 文件：{exc}", file=sys.stderr)
+            return 2
+    logged_sequence: int | None = None
+    started_monotonic = time.monotonic()
+
     # 主线程只做一件事：按节拍发布快照，并把最新一帧的决策下发给 Mac 执行端。
     # 没有新帧时也发快照，界面才能区分"设备停了"与"浏览器和主机之间的连接断了"——
     # 这两种情况的处置完全不同。
     while not stop.is_set():
         broadcaster.publish()
+        latest = state.latest
+        if (
+            frames_log is not None
+            and latest is not None
+            and latest.sequence != logged_sequence
+        ):
+            logged_sequence = latest.sequence
+            frames_log.write(
+                json.dumps(
+                    {
+                        "t_host_s": round(time.monotonic() - started_monotonic, 3),
+                        "t_device_ms": latest.timestamp_ms,
+                        "seq": latest.sequence,
+                        "broadband_dbfs": latest.broadband_dbfs,
+                        "voice_likelihood": latest.voice_likelihood,
+                        "vocal_ratio": latest.vocal_ratio,
+                        "spectral_flatness": latest.spectral_flatness,
+                        "vocal_peakiness": latest.vocal_peakiness,
+                        "excited_vocal_bands": latest.excited_vocal_bands,
+                        "mode": latest.mode,
+                        "environment": latest.environment,
+                        "conversation": latest.conversation,
+                        "media_percent": latest.media_percent,
+                        "ambient_open": latest.ambient_open,
+                        "own_voice_confidence": latest.own_voice_confidence,
+                        "own_voice_source": latest.own_voice_source,
+                        "context": latest.context,
+                        "context_score": latest.context_score,
+                        "band_dbfs": list(latest.ambient_band_dbfs),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
         if player_service is not None:
             # 决策的形状永远来自 S3，这里只是把它搬到音频上；apply_decision 内部有节流。
             # 旧固件不发 eq_gain_db（tuning 为 None）时下发全平直：**没有建议就该什么都不做**，
             # 而不是把上一次的形状留在曲子上。
-            latest = state.latest
             if latest is not None:
                 bands = list(latest.tuning.band_gain_db) if latest.tuning else [0.0] * 24
                 player_service.apply_decision(bands, float(latest.media_percent))
+        if ambient is not None:
+            # S3 的 ambient_open 意图 → 执行端（relay 门控 / AirPods 聆听模式）。三条安全规则：
+            #   * 旧固件（v4 之前）不报 ambient_open → 当成"不开放"，不猜；
+            #   * 设备静默/掉线 → 必须关回去，不能把人留在环境声里；
+            #   * 执行端自己异步、失败有 last_error，面板分开显示意图与执行。
+            want_open = False
+            if latest is not None and latest.ambient_open is not None:
+                want_open = bool(latest.ambient_open)
+            if state.is_stale() or state.is_silent() or not state.connected:
+                want_open = False
+            ambient.set_open(want_open)
         time.sleep(0.1)
 
+    if frames_log is not None:
+        frames_log.close()
     httpd.shutdown()
     source_thread.join(timeout=3.0)
     if player_service is not None:
         player_service.stop()
+    if ambient is not None:
+        # 退出时必须把人从通透模式切回去；stop() 内部会先做这一步再停线程。
+        ambient.stop()
     if relay is not None:
         live = relay.live() or {}
         relay.stop()

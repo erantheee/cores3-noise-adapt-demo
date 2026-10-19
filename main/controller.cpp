@@ -353,6 +353,17 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
     command.timestamp_ms = frame.timestamp_ms;
     command.eq_gain_db.fill(0.0f);
     command.ambient_band_dbfs = frame.band_dbfs;
+    // 判据遥测：训练集与误触发排查都要这些量，决策逻辑一行都不用它们。
+    command.broadband_dbfs = frame.broadband_dbfs;
+    command.voice_likelihood = frame.voice_likelihood;
+    {
+        const VoiceFeatures telemetry = extract_voice_features(frame);
+        command.vocal_ratio = telemetry.vocal_ratio;
+        command.spectral_flatness = telemetry.spectral_flatness;
+        command.vocal_peakiness = telemetry.vocal_peakiness;
+        command.excited_vocal_bands =
+            static_cast<uint8_t>(std::min<std::size_t>(telemetry.excited_vocal_bands, 255));
+    }
 
     if (!frame.mic_valid || !std::isfinite(frame.broadband_dbfs)) {
         invalid_ms_ += dt_ms;
@@ -369,13 +380,15 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
         const float voice = clamp01(frame.voice_likelihood);
         const bool speech_active = voice > 0.55f && frame.broadband_dbfs > -58.0f;
 
-        // 触发交给 Apple 式对话感知：判据是"佩戴者自己开口"，不是"附近有人在说话"。
-        // 旧轮次启发式（语音→300-2500 ms 停顿→再语音，或 2.4 s 持续语音）已删除：它检的是
-        // "这段音频像不像对话"，播客/电视/路人说话都能满足，方向就是错的。
+        // **预判输入**：附近有人开口 = 对话正在开始。这是提前量的唯一来源——"我开口"只能
+        // 在事后被检测到，把它当触发输入（旧实现）就永远只能"说过之后才压"，方向与目标相反。
+        // 电平门 -58→-42 dBFS：更弱的语音不可信，-42 以上按近场对话计。
+        const float cue_level = clamp01((frame.broadband_dbfs + 58.0f) / 16.0f);
         conversation::Evidence evidence;
         evidence.speech_active = speech_active;
         evidence.voice_likelihood = voice;
         evidence.level_dbfs = frame.broadband_dbfs;
+        evidence.conversation_cue = speech_active ? cue_level : 0.0f;
         // 证据来源按**显式策略**决定，而不是"有就用"。三条路的可信度与失败方式不同，
         // 而且遥测必须如实反映用了哪一条（own_voice_source 与 own_voice_policy）。
         OwnVoiceEvidence effective = own_voice_evidence_;
@@ -409,31 +422,35 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
         evidence.own_voice = effective.confidence;
         awareness_out_ = awareness_.update(evidence, dt_ms);
         const conversation::Output& awareness_out = awareness_out_;
-        const bool own_voice_active =
-            awareness_out.state == conversation::State::confirming ||
+        // 对话正在发生（预测中或已确认）都算"进入对话"：EQ 必须保持平直，音乐让位。
+        const bool conversation_active =
+            awareness_out.state == conversation::State::anticipating ||
             awareness_out.state == conversation::State::engaged;
 
-        command.conversation = own_voice_active
-                                   ? ConversationState::likely
-                                   : (speech_active ? ConversationState::speech_nearby
-                                                    : ConversationState::none);
+        command.conversation =
+            awareness_out.engaged
+                ? ConversationState::likely
+                : (awareness_out.anticipating
+                       ? ConversationState::anticipating
+                       : (speech_active ? ConversationState::speech_nearby
+                                        : ConversationState::none));
+        // 环境声开放意图只在对话**确认**后为真：预测阶段先只压媒体，避免一声咳嗽
+        // 就让 AirPods 切到通透模式；执行端的开关动作为此要慢半拍是对的。
+        command.ambient_open = awareness_out.ambient_open;
 
         // 遥测：报"实际生效的那一份"证据（骨传导或代理），而不是原始输入。
         command.own_voice = effective;
         command.evidence_policy = evidence_policy_;
 
-        // The actions are deliberately distinct:
-        //   * SONG_EQ asks the Mac renderer to adapt one of the three local songs.
-        //   * EXTERNAL_VOICE_INTENT asks for real-world speech gain. AirPods Pro cannot execute
-        //     that command through a public API, so the Mac bridge must report it as simulated
-        //     until the S3-mic relay path is measured or an open earbud DSP replaces AirPods.
-        //   * SAFETY_HOLD forbids positive gain in a very loud non-speech environment. It is a
-        //     conservative proxy, not a car-sound classifier; crossing-road recognition remains
-        //     a later model/calibration task.
-        // 自己开口与“外部人声增强”必须互斥。同一帧同时满足语音频谱和自身语音证据时，
-        // 自身语音优先：只让对话状态机下压媒体，不给自己的声音加 300–4000 Hz EQ。
-        // 之前这里仅看 speech_active，导致自己的声纹也进入 EXTERNAL_VOICE_INTENT。
-        if (own_voice_active) {
+        // 动作是分离的，字段也必须分离：
+        //   * SONG_EQ 是歌曲的 24 段 EQ 建议，也是唯一会写 eq_gain_db 的模式；
+        //   * EXTERNAL_VOICE_INTENT 是现实人声增益意图，只走标量；
+        //   * SAFETY_HOLD 禁止正增益。
+        // 为什么外部人声模式不再写 eq_gain_db：AirPods 执行不了"现实人声增益"，把同一条
+        // 1–4 kHz 曲线加到歌曲上就是"用歌曲中频假装人声增强"——D0 明确禁止，README 也写着
+        // 该模式下 eq_gain_db 必须平直。之前为了让面板动起来写进去过，那是演示便利，
+        // 不是产品行为；这里按契约改回平直。
+        if (conversation_active) {
             command.environment = EnvironmentKind::voice_likely;
             command.tuning_mode = TuningMode::flat;
         } else if (frame.broadband_dbfs < -56.0f) {
@@ -462,23 +479,8 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
         if (command.tuning_mode == TuningMode::external_voice_intent) {
             const float drive = clamp01(0.25f + 1.35f * voice);
             voice_target = std::min(kDemoSpeechGainDb, noise * kDemoSpeechGainDb * drive + 0.4f);
-            // Ducking is what makes the lift noticeable at all: raising a band while the bed stays
-            // put is easy to miss, pulling the bed down is not.
-            //
-            // Depth is driven by `speech_run_ms_` -- how long speech has been continuously
-            // detected -- not by the per-frame `voice` value. Per-frame confidence oscillates, and
-            // gating the duck on it produced a target that wandered between 40% and 100% frame to
-            // frame, so the slew never settled instead of reaching the configured floor
-            // the policy asks for. Sustained speech is also the honest trigger: a one-frame blip
-            // should not slam the bed to the floor.
-            // 深度斜坡：从"刚听到人声"到"压到底"用 250 ms。原来是 600 ms，叠加 slew 的
-            // 时间常数后实测要 700 ms 才压到 30%——用户的原话是"反应略慢"。
-            // 下压深度由状态机给出（它自己负责 onset/duck/hold/restore 全程）。这里不再用
-            // "持续语音时长"算第二遍深度：两处各算一次，斜坡就会互相打架 —— 项目里已经有过
-            // 一次这样的记录（每秒级抖动让媒体只压到 46%）。
             media_target = awareness_out.media_percent;
         } else if (command.tuning_mode == TuningMode::safety_hold) {
-            // Never add gain in a loud non-speech environment.
             voice_target = 0.0f;
         }
         // 对话感知一旦成立，媒体就下压，与选哪种调音模式无关：Apple 这条功能不挑模式，
@@ -507,24 +509,10 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
 
         for (std::size_t band = 0; band < kBandCount; ++band) {
             const bool speech_band = band >= 8 && band <= 16;
-            if (command.tuning_mode == TuningMode::external_voice_intent) {
-                // The speech band moves with the scalar, so `eq_gain_db` is a real per-band
-                // prescription rather than a flat line. Previously this branch wrote nothing and
-                // the 24-band curve stayed at 0 dB while the scalar said 5 dB -- the panel and the
-                // device screen disagreed about whether anything was happening.
-                //
-                // A gentle taper on the outermost speech bands keeps the curve readable as a
-                // hump; the demo is meant to be obvious, not to be a rectangle.
-                const float edge = (band == 8 || band == 16) ? 0.75f : 1.0f;
-                // Tuning, not a broadband volume change: bands outside the speech range stay at
-                // 0 dB. Without this guard every one of the 24 bands was lifted, which the
-                // controller test caught as "bands outside the speech band stay flat" -- the demo
-                // being loud is not the same as the tuning being right.
-                command.eq_gain_db[band] = speech_band ? speech_gain_db_ * edge : 0.0f;
-            } else if (command.tuning_mode == TuningMode::song_eq) {
-                // A bounded environment-only suggestion.  The Mac combines the ambient
-                // spectrum sent below with the clean pre-EQ spectrum of one of the three local
-                // songs before applying its final content-aware prescription.
+            // 只有 SONG_EQ 写 24 段曲线。外部人声模式保持全 0：那条意图没有执行者，
+            // 把它写进歌曲 EQ 等于偷换成一个可听动作（D0）。要让它可听，得先有现实人声的
+            // 真实增益通路，而不是改这里。
+            if (command.tuning_mode == TuningMode::song_eq) {
                 const float band_noise = clamp01((frame.band_dbfs[band] + 62.0f) / 32.0f);
                 const float importance = speech_band ? 1.0f : (band < 5 ? 0.45f : 0.70f);
                 command.eq_gain_db[band] = std::min(4.0f, 4.0f * band_noise * importance);
@@ -603,6 +591,7 @@ const char* conversation_state_name(ConversationState state) {
         case ConversationState::none: return "NONE";
         case ConversationState::speech_nearby: return "SPEECH_NEARBY";
         case ConversationState::likely: return "LIKELY";
+        case ConversationState::anticipating: return "ANTICIPATING";
     }
     return "UNKNOWN";
 }

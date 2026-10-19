@@ -17,3 +17,19 @@ tools/relay/relaysink
 
 # 声纹止损门用的独立 venv（torch 无法在 DSH 自带 python 里加载）
 .venv/
+
+# 教师模型与蒸馏实验缓存（体积大，按需下载，不入库）
+experiments/sound-events/teacher/*.tflite
+experiments/sound-events/teacher/*.tar.gz
+experiments/sound-events/.venv-teacher/
+.tfhub-cache/
+.hf-cache/
+.uv-cache/
+
+# 数据集快照：只提交频段/标签，不提交原始音频（仓库公开，音频含说话声）
+!experiments/sound-events/data/
+!experiments/sound-events/data/**
+!experiments/sound-events/data/**/*.jsonl
+
+# 播放器构建产物（源码是 tools/player/player.swift）
+tools/player/player.new

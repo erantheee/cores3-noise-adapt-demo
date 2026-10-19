@@ -39,7 +39,7 @@ AirPods Pro 播放最终输出；分别验证歌曲 EQ、现实人声增益意�
 | 12 | 声纹可分性（止损门） | ⏸ **未测** | 需同一人分次、换条件录多条 |
 | 13 | 上位机 `ows-earbud-demo` 对接 | ⏸ **未开始** | 需改你已排练的 Mac 工程，待确认 |
 | 14 | 端侧目标人提取（TSE） | ⏸ **不在本轮范围** | 6 GMACs 量级，另一个工程 |
-| 15 | **本仓库自带上位机** | ✅ **完成** | `tools/host/`，47 组 4205 条断言；真机已在跑。第 29 项起面板上有「情境」格 |
+| 15 | **本仓库自带上位机** | ✅ **完成** | `tools/host/`，50 组 6639 条断言；真机已在跑。第 29 项起面板上有「情境」格 |
 | 16 | **串口 DTR 真 bug（三个工具读不到数据）** | ✅ **已修** | 实测 dtr=False 10 秒 0 字节 → dtr=True 10 秒 17115 字节 |
 | 17 | **口径：本机不做降噪，只有增益与调音** | ✅ **已落到上位机** | 面板删掉降噪格与曲线；固件侧的残留见第 19 项 |
 | 18 | 上位机回控（录音）可用性 | ✅ **已修并真机验证** | 控制台改为内置 USB-Serial/JTAG；`rec start` 得到 `capture started` 回执 |
@@ -89,17 +89,28 @@ AirPods Pro 播放最终输出；分别验证歌曲 EQ、现实人声增益意�
 | 43 | **演示模式证据策略**（同分支） | ✅ 已实现并进遥测 | 三态 `bone_only` / `near_field_demo` / `disabled`（用户决定：演示用近场代理）；帧里带 `own_voice_policy`，面板与串口都能看到，避免把代理说成自身语音。**已知代价**：C9（旁人说话不触发）在演示模式下预期失败，检查器自测有 `demo_policy` 与 `source_mismatch` 两个场景覆盖。见 [apple-conversation-awareness.md](apple-conversation-awareness.md) 第 15 节 |
 | 44 | **对话感知迁移·状态交接** | ✅ 已写 | 交付清单 / 已验证数字 / 未完成四件事（各自可复制命令）/ 三条必须记住的结论，见 [apple-conversation-awareness.md](apple-conversation-awareness.md) 第 16 节 |
 | 45 | **真机被动检查（新增工具）** | ⚠️ 6/8 通过，抓到 C4c | `tools/check_device_passive.py` 从面板 `/api/snapshot` 轮询，不独占串口、不需人配合；实测 C1✅ C2✅ C3✅（重力 p50 9.88）C4b✅，**C4c ❌ 30.1 Hz（设计 100 Hz）**、C5b 策略并存待查。见 [apple-conversation-awareness.md](apple-conversation-awareness.md) 第 16.5 节 |
+| 46 | **预判式对话感知 + 环境声开放（D16）** | 🟡 **代码与单测已完成；待烧机实测** | 触发从 `own_voice` 换成 `conversation_cue`（附近有人开口）：`idle → anticipating → engaged → releasing`，第一拍就预下压，确认后 `ambient_open` 意图置 true；协议升到 **v4**。Mac 加 `tools/host/ambient.py`：`--ambient-open airpods` 时经兄弟工程 `airpods-control` 切 AirPods 通透模式、关闭切回原模式，执行失败如实上报。**外部人声模式不再写歌曲 EQ**（D0 契约，单测改为钉平直）。已知代价：播客/电视/旁人说话也会触发预判；旧 C9 断言与新目标冲突，验证脚本待按 D16 重写。见 [decisions.md](decisions.md) D16 |
+| 47 | **端侧声音事件判断（键盘 / 风 / 撞击门控）** | ✅ **已刷机并现场复测**（2026-10-19） | `main/sound_event.hpp`：1 s 窗 × 15 维 + 噪声地板跟踪 + 状态机保持；`mic_valid=false`（撞击/削波）清窗并报 `artifact`。串口帧追加 `event`/`event_valid`（v4 上追加键），面板新增「事件（端侧规则）」卡。离线：keyboard/wind 召回 **83.7%**（keyboard 78% / wind 90%），安静/说话误报 **0.0%**。**真机 v5 复测**：键盘段 81% 帧 keyboard；风段 56% wind 但 **20% 误报 keyboard**；敲桌报 artifact。加「键盘斜率不能太陡（slope > -1.35，质心 > 800 Hz 豁免）」后 **v5b**：键盘 79%、风段 **0 帧误报 keyboard**、敲桌仅 5/60 帧报 keyboard。**卡在**：单键盘单房间、每段只复测一次；"静置"段疑似混入真实击键；跨条件泛化未验证；屏幕还没有这一格。见 [`experiments/sound-events/README.md`](experiments/sound-events/README.md) |
+| 47a | ├ **刷机脚本漏写分区表（esptool v5 多文件写）** | ✅ 已修 | 三个"地址 文件"对放同一条 `write-flash` 时，日志逐区打印、每区都报 verified，但回读 0x8000 全 0xFF、0x10000 仍是旧固件；启动报 `No bootable app partitions`。`tools/flash.sh` 改成逐区写、逐区校验 |
+| 47b | └ **刷后停在下载模式** | ✅ 已绕过 | `Hard resetting via RTS pin...` 后设备可能停在下载模式：端口在、0 字节。用 `esptool --after watchdog-reset run` 启动；再不行拔插 USB |
+| 48 | **大模型上机评估（YAMNet 级）** | ⏸ **决定不上，只做主机侧教师** | S3 实测：24 段分析 7.07 ms/100 ms、9 类模型 0.18 ms、事件规则估算 <0.05 ms；YAMNet INT8 社区数据约 500 ms/0.96 s patch（1 Hz 单核 50%、延迟 ≥1.5 s），且要 4 MB 模型 + 1.2 MB arena + 重划分区。真正的瓶颈是真实数据域偏移，不是模型容量。端侧模型准入线见 [`decisions.md` D18](decisions.md)；YAMNet 只在 Mac 侧做自动标注/教师 |
+| 49 | **教师-学生蒸馏管线** | 🟡 **数据管线通、教师与 v1 学生已实测；学生未过准入线，暂不替换规则** | `tools/collect_teacher_data.py`：同时采 16 kHz 音频 + 10 Hz 24 段（设备 `timestamp_ms` 对齐）。2026-10-19 多条件采集 183 s：1716 帧、182.7 s 音频、0 丢块、0 坏行。教师：官方 YAMNet（0.96 s）说话强（Speech 0.93）、键盘/风/敲桌弱；AST（10.24 s）键盘/说话强、风/敲桌弱——都还不能自动标风/敲桌。学生 v1（15→16→4，324 参数，训练 2251 窗）：v5 recall 0.86 / 误报 0.28，v5b 0.75 / 0.31；规则同留出 0.54 / 0.00 与 0.54 / 0.12。**学生召回高但误报没过 D18 准入线**，继续用规则。下一步：补人工标签跨条件数据、用教师做辅助任务/过滤，再训 v2。见 `experiments/sound-events/README.md` |
+| 50 | **蒸馏目标重定：说话 vs 非说话（D19）** | 🟡 **方向已定，二分类 gate 原型待训** | 教师（官方 YAMNet）在同一 183 s 采集上：speech 召回 79% / 非语音误报 7.6%；固件四判据：99% / **92.3%**。判断：决策只需 speech 正类，键盘/风只作硬负样本；教师不需在风/敲桌上准。键盘/风规则降级为展示类。二分类学生原型（15→16→2，3 分钟教师标签）跨会话：说话段召回 0.59、v5 0.40、非语音误报 0–18%——方向对但数据不够。下一步：用教师自动标注大量真机录音训 gate，验收线为 speech 召回不降、非语音误报 <10%，通过前不改决策路径。见 D19 |
+| 51 | **语音 gate 与风噪优化解耦（D20）** | ✅ **已定边界；风检测保留为展示，风噪优化另立轨道** | D19 把风降为负样本，不影响规则风检测继续输出 `event=wind`。当前 1 s 窗事件判断不是控制级风检测（无强度、onset 约 0.5–1 s），且本 demo 无风噪执行端（D0：不做降噪；AirPods 不开放降噪 DSP；S3 麦只是代理感知）。风噪优化若要做，需先定义动作，再评估短窗检测/双麦相干性，单独立项；不在本轮 speech gate 范围内 |
+| 52 | **风 = EQ 适配（D21）+ 说话/风混合场景** | 🟡 **方向已修；混合数据待采、接口待拆** | 更正 D20：执行端是 EQ（本 demo 只有增益与调音），1 s 窗慢检测对 EQ 够用，只有降噪才要 <200 ms。混合场景要求语音 gate 与风检测**正交**：输出改为 `speech_gate` + `wind` 两路（学生用共享主干 + 两个头），不允许相互覆盖；EQ 候选为"风时压低频抬升、说话时语音优先且 EQ 平直"。验收线：混合段 speech 召回不低于 speech-only 的 80%、wind 召回不低于 wind-only 的 80%。EQ 只能优化音乐，不能提升风里对方说话的清晰度（后者需耳机侧降噪，本 demo 没有）。见 D21 |
+| 52a | ├ **数字混音：说话被风掩蔽的量化** | ✅ 已做（机制验证，非现场） | 把已有纯风/纯说话两段 16 kHz 音频按 SNR 叠加后过官方 YAMNet：Speech 帧命中率干净说话 79%，SNR −5/0/+5/+10 dB 时降到 20/34/44/51%——风会显著掩蔽说话。设备侧 15 维特征同样被稀释：数字混音下 wind 规则与 speech 规则**从未同时为真**（0%），单输出类别无法表达"说话+风"，证实 D21 的双头设计必要。**这是机制验证，不是现场准确率** |
+| 52b | └ **外放 surrogate 尝试：无效** | ❌ 不可用 | 用 Mac 扬声器播风声 + TTS 说话让 S3 收，因为 ① Mac 当时静音、② 扬声器回放的风在声学上不像真风（教师 wind_mic≈0、设备 wind 规则 0–4%），采到的段不能当混合证据。已恢复静音；混合场景准确率仍需真实环境数据 |
 
 
-**断言计数（2026-10-16 实测，第 1、6、7、15、29、31 项共用）**：主机 C++ 单测 **7 套件合计 251 条**
-（controller 51、noise_analyzer **46**、latency_profiler 40、mic_capture 16、mic_decimator 15、
-voiceprint_gate 60、context_window **23**），全部通过。noise_analyzer 从 39 涨到 46 是第 31/32 项加的：
+**断言计数（2026-10-19 实测）**：主机 C++ 单测 **10 套件合计 323 条**
+（controller 40、noise_analyzer 46、latency_profiler 40、mic_capture 16、mic_decimator 15、
+voiceprint_gate 60、context_window 23、conversation_awareness 38、bone_voice 19、sound_event 26），全部通过。noise_analyzer 从 39 涨到 46 是第 31/32 项加的：
 持续哼唧、静音→哼唧的起始跳变、以及"说话仍能通过"的**成对**断言。context_window 的 23 条是第 29 项
 加的：92 维逐个与 `features.py` 的金标准比对、环形缓冲绕回、三处口径（运动=0、时间基线、
 未过闸门的语音乘积）各钉一条。**旧的 221 / 228 条读数已作废。**
 上位机自测 `python3 tools/host/tests/test_host.py` 输出
-**47 组、4205 条断言**，`node tools/host/tests/render_check.js` 输出 **60 条通过、0 条失败**
-（渲染校验现在也断言情境卡的三种状态：没报 / 窗没满 / 有判断）。
+**51 组、7550 条断言**，`node tools/host/tests/render_check.js` 输出 **60 条通过、0 条失败**（条数随快照内容略变）
+（渲染校验现在也断言情境卡与事件卡的三种状态：没报 / 窗没满 / 有判断）。
 这些数字会随代码变化，改完代码要重新跑一遍再同步到 README。
 
 **这条测试自己也有口径风险**：`context_window` 的金标准是生成物
@@ -228,7 +239,7 @@ SHA256 `2ca5420b4b46c464e6f0b73a73376343a6fcc099e5f98e205229f947d26fd19f`），
 ```bash
 sh tools/host_up.sh          # 真机，面板在 http://127.0.0.1:8787/
 sh tools/host_up.sh --mock   # 没有设备也能先把界面跑起来
-python3 tools/host/tests/test_host.py   # 47 组、4205 条断言，不需要设备
+python3 tools/host/tests/test_host.py   # 50 组、6639 条断言，不需要设备
 ```
 
 分工写清楚了：**上位机负责显示与回控（`rec start` / `rec stop`），落盘仍由
@@ -396,7 +407,7 @@ SHA256 前缀 `cfe4efba216fbe59`）。
 
 ## 已知的维护风险
 
-- **文档里的数字是手工同步的**：断言总数（主机 251、上位机 4205、渲染校验 60）、真机延迟
+- **文档里的数字是手工同步的**：断言总数（主机 297、上位机 6639、渲染校验 49）、真机延迟
   （节拍 100.03、分析 7.02、决策 0.06）都写在 README 与两份 docs 里。改代码不会自动改它们。
   目前没有 CI 检查，所以**改完代码要同时搜一遍这几个数字**。
 - 真机数字与固件版本绑定：当前实测值对应 **100 ms 节拍**（`4308366` 引入）。换版本后必须重新

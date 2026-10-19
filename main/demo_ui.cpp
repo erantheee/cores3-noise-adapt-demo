@@ -76,6 +76,8 @@ const char* conversation_text(ConversationState state) {
         case ConversationState::none: return "NONE";
         case ConversationState::speech_nearby: return "SPEECH";
         case ConversationState::likely: return "LIKELY";
+        // 预测到对话开始、还没确认。用 ASCII 短串：字库是 115 字子集，别赌某个汉字存在。
+        case ConversationState::anticipating: return "PRE";
     }
     return "UNKNOWN";
 }

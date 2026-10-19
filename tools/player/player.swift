@@ -120,6 +120,8 @@ final class Player {
     private var bypass = false
 
     private var depth: Double = 2.5
+    /// 100% 是文件原始电平；100…200% 通过 EQ 的全局增益实现，独立于对话媒体衰减。
+    private var playbackGainPercent: Double = defaultVolumePercent
     private var mediaPercent: Double = 100
     private var sourceBands = [Double](repeating: 0, count: bandCenters.count)
     private var targetBands = [Double](repeating: 0, count: bandCenters.count)
@@ -156,8 +158,10 @@ final class Player {
         for (index, band) in eq.bands.enumerated() {
             band.filterType = .parametric
             band.frequency = bandCenters[index]
-            // 固件那 24 段是分析滤波器组，中心频率间隔约 1/4 倍频程；Mac 这里是参数均衡，
-            // 用 0.30 倍频程让相邻段轻微交叠，避免在面板上画出一条梳状曲线。
+            // 固件那 24 段是**单频点分析**（每段一个 Goertzel），中心频率间距实测
+            // 0.22–1.0 倍频程（低频宽、高频窄，不是等宽）；Mac 这里是参数均衡，固定用
+            // 0.30 倍频程。两者不是同一个带宽，所以 Mac 只能复现"要抬哪些段"，不能声称
+            // 复现固件的分析滤波器形状。
             band.bandwidth = 0.30
             band.gain = 0
             band.bypass = false
@@ -206,7 +210,7 @@ final class Player {
         // player.play() 会抛 "player started when in a disconnected state"——本机实测第一次
         // play 就崩，而且抛在 Objective-C 异常里，上位机只能看到进程没了。
         if !tracks.isEmpty { _ = loadFile(index: 0) }
-        player.volume = Float(max(0, min(100, defaultVolumePercent)) / 100.0)
+        player.volume = defaultVolumePercent <= 0 ? 0 : 1
         do {
             try engine.start()
             engineRunning = true
@@ -247,12 +251,19 @@ final class Player {
         let gains = currentBands
         let shouldBypass = bypass
         let media = mediaPercent
+        let playbackGain = playbackGainPercent
         lock.unlock()
 
         if engineRunning {
             for (index, band) in eq.bands.enumerated() {
                 band.gain = Float(gains[index])
             }
+            // 网页播放增益与 S3 的逐段 EQ、对话 media_percent 分开。AVAudioPlayerNode.volume
+            // 只能表达 0…1，超过原始电平的部分用 AVAudioUnitEQ.globalGain 实现。
+            eq.globalGain = playbackGain > 0
+                ? Float(20.0 * log10(max(0.01, min(2.0, playbackGain / 100.0))))
+                : -96.0
+            player.volume = playbackGain > 0 ? 1 : 0
             eq.bypass = shouldBypass
             // 媒体音量是 S3 的另一项决定（当前固定 100）。放在 EQ 之后，顺序与设备语义一致。
             engine.mainMixerNode.outputVolume = Float(max(0, min(100, media)) / 100.0)
@@ -283,6 +294,7 @@ final class Player {
             "track_path": tracks.indices.contains(trackIndex) ? tracks[trackIndex].path : "",
             "position_s": positionSecondsLocked(),
             "duration_s": durationSecondsLocked(),
+            "volume_percent": playbackGainPercent,
             "depth": depth,
             "media_percent": mediaPercent,
             "source_bands": sourceBands,
@@ -314,8 +326,8 @@ final class Player {
             select(index: index, autoplay: (command["autoplay"] as? Bool) ?? true)
         case "seek": seek(to: (command["seconds"] as? Double) ?? 0)
         case "volume":
-            let percent = (command["percent"] as? Double) ?? 80
-            player.volume = Float(max(0, min(100, percent)) / 100.0)
+            let percent = (command["percent"] as? Double) ?? 100
+            lock.lock(); playbackGainPercent = max(0, min(200, percent)); lock.unlock()
         case "eq": applyEq(command)
         case "bypass":
             lock.lock(); bypass = (command["on"] as? Bool) ?? false; lock.unlock()
@@ -580,7 +592,7 @@ final class Player {
 // ---------------------------------------------------------------- 入口
 
 /// 默认不限制播放器音量；仍可在面板上调节，或用 `--volume` 覆盖。
-var defaultVolumePercent: Double = 100
+var defaultVolumePercent: Double = 150
 
 let arguments = CommandLine.arguments
 var tracksPath = URL(fileURLWithPath: arguments[0]).deletingLastPathComponent()

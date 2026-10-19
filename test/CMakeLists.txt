@@ -62,3 +62,9 @@ add_test(NAME conversation_awareness_test COMMAND conversation_awareness_test)
 add_executable(bone_voice_test bone_voice_test.cpp ${COMMON_SOURCES})
 target_include_directories(bone_voice_test PRIVATE ../main)
 add_test(NAME bone_voice_test COMMAND bone_voice_test)
+
+# 端侧声音事件判断（1 s 窗 × 15 维 + 规则 + 状态机）。头文件无 IDF 依赖。
+# 金标准由真机采集导出（test/sound_event_golden.h），见 experiments/sound-events/。
+add_executable(sound_event_test sound_event_test.cpp)
+target_include_directories(sound_event_test PRIVATE ../main)
+add_test(NAME sound_event_test COMMAND sound_event_test)

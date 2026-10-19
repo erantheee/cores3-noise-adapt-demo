@@ -34,19 +34,24 @@ from .protocol import CAPTURE_RATE_HZ, DEMO_SPEECH_GAIN_DB, SCHEMA_VERSION
 #: 控制节拍，与固件 main/app_main.cpp 的 kControlPeriodMs 一致（100 ms）。
 CONTROL_PERIOD_S = 0.1
 
-#: 与环境对应的决策，按固件 controller.cpp 的四条分支给（不是随便造几个数）：
+
+def _mock_dbfs(environment: str) -> float:
+    """每个环境的模拟宽带电平（dBFS）。只用于让判据遥测有合理量级。"""
+    return {"QUIET": -65.0, "NOISY": -38.0, "VOICE": -40.0, "LOUD": -20.0}.get(environment, -60.0)
+
+#: 与环境对应的决策，按固件 controller.cpp 的分支给（不是随便造几个数）：
 #:   QUIET → flat，什么都不做；NOISY → song_eq，只给逐段建议、标量增益为 0；
-#:   VOICE → external_voice_intent，语音段抬到实发上限、媒体让位；
+#:   VOICE → 预判到对话：媒体让位 + `ambient_open` 意图；歌曲 EQ 保持平直（D0）；
 #:   LOUD  → safety_hold，禁止正增益（这一条最容易被模拟源写错成"越大声抬越多"）。
 TARGETS = {
     "QUIET": {"gain": 0.0, "media": 100, "confidence": 0.95, "mode": "FLAT",
-              "conversation": "NONE"},
+              "conversation": "NONE", "ambient_open": False},
     "NOISY": {"gain": 0.0, "media": 100, "confidence": 0.98, "mode": "SONG_EQ",
-              "conversation": "NONE"},
-    "VOICE": {"gain": 7.6, "media": 30, "confidence": 0.99, "mode": "EXTERNAL_VOICE_INTENT",
-              "conversation": "LIKELY"},
+              "conversation": "NONE", "ambient_open": False},
+    "VOICE": {"gain": 0.0, "media": 60, "confidence": 0.99, "mode": "FLAT",
+              "conversation": "LIKELY", "ambient_open": True},
     "LOUD": {"gain": 0.0, "media": 100, "confidence": 1.0, "mode": "SAFETY_HOLD",
-             "conversation": "NONE"},
+             "conversation": "NONE", "ambient_open": False},
 }
 
 #: 模拟的情境模型输出：固件那 4 个环境各自对应的类别与分数。**这是模拟值，不是测量值**——
@@ -62,6 +67,21 @@ CONTEXT_FOR_ENVIRONMENT = {
 #: 固件要攒满 2 秒窗（20 帧 × 100 ms）才给判断，在那之前报 valid=false + 占位类别 unknown。
 #: 模拟源必须复刻这一段，否则面板会在那两秒里显示一个凭空的类别。
 CONTEXT_WARMUP_S = 2.0
+
+#: 模拟的声音事件输出（1 s 窗规则，main/sound_event.hpp）。**这是模拟值，不是测量值**：
+#: 按环境映射只是为了在 --mock 下把事件卡的五个类别与三态都跑到，不代表真机在这些环境下
+#: 会这么判。真机实测是：键盘/风在 9 类模型里几乎都落到 other；本规则在采集上的召回数字
+#: 见 experiments/sound-events/README.md。
+EVENT_FOR_ENVIRONMENT = {
+    "QUIET": "quiet",
+    "NOISY": "wind",
+    "VOICE": "speech",
+    "LOUD": "keyboard",
+}
+
+#: 事件窗 1 s（10 帧）。窗没满时固件报 `event="quiet", event_valid=false`——靠 valid 区分
+#: "还没判断"与"判断为安静"，模拟源必须复刻。
+EVENT_WARMUP_S = 1.0
 
 #: 环境序列与各段时长（秒）。刻意包含升段与降段，让面板上的趋势线有形状。
 SCHEDULE: tuple[tuple[str, float], ...] = (
@@ -151,14 +171,16 @@ class MockDevice:
         context_class, context_score = CONTEXT_FOR_ENVIRONMENT[environment]
         context_us = int(155 + 25 * self._random.random())
 
-        # 24 段建议的形状按模式给，与固件一致：人声模式抬 8–16 段（两端 0.75 收口），
-        # song_eq 抬全部频段但夹在 4 dB 内，flat / safety_hold 一律 0 dB。
+        # 声音事件判断（1 s 窗）：窗没满时 valid=false，类别报占位 quiet。
+        event_valid = at_s >= EVENT_WARMUP_S
+        event_class = EVENT_FOR_ENVIRONMENT[environment]
+
+        # 24 段建议的形状按模式给，与固件一致：只有 SONG_EQ 写曲线（抬全部频段、夹在 4 dB 内）；
+        # 人声模式是标量意图，eq_gain_db 必须平直（D0：不能用 1–4 kHz 歌曲曲线假装人声增强）；
+        # flat / safety_hold 一律 0 dB。
         mode = str(target["mode"])
         bands = [0.0] * 24
-        if mode == "EXTERNAL_VOICE_INTENT":
-            for band in range(8, 17):
-                bands[band] = round(self._gain * (0.75 if band in (8, 16) else 1.0), 2)
-        elif mode == "SONG_EQ":
+        if mode == "SONG_EQ":
             for band in range(24):
                 importance = 1.0 if 8 <= band <= 16 else (0.45 if band < 5 else 0.70)
                 bands[band] = round(min(4.0, 4.0 * 0.6 * importance), 2)
@@ -183,6 +205,17 @@ class MockDevice:
                         "speech_gain_db": round(max(0.0, self._gain + jitter), 2),
                         "external_voice_gain_db": round(max(0.0, self._gain + jitter), 2),
                         "media_percent": int(round(self._media)),
+                        # v4：环境声开放意图。模拟源只报**意图**，执行结果由 Mac 的
+                        # ambient 执行端自己报；两者混在一起就是面板撒谎。
+                        "ambient_open": bool(target["ambient_open"]),
+                        # v4 判据遥测（与固件同构）。模拟源不追求真实，只要求字段形状与
+                        # 取值范围和真机一致，这样 --mock 才能把训练/调试链路跑起来。
+                        "broadband_dbfs": round(_mock_dbfs(environment), 1),
+                        "voice_likelihood": round(0.8 if environment == "VOICE" else 0.02, 3),
+                        "vocal_ratio": round(0.82 if environment == "VOICE" else 0.30, 3),
+                        "spectral_flatness": round(0.08 if environment == "VOICE" else 0.40, 4),
+                        "vocal_peakiness": round(0.45 if environment == "VOICE" else 0.70, 3),
+                        "excited_vocal_bands": 12 if environment == "VOICE" else 6,
                         "state": state,
                         "environment": environment,
                         "mode": mode,
@@ -198,6 +231,11 @@ class MockDevice:
                         "context_score": round(context_score, 3) if context_valid else 0.0,
                         "context_valid": context_valid,
                         "context_us": context_us,
+                        # 声音事件判断（1 s 窗规则，main/sound_event.hpp）。valid=false 有两种
+                        # 情况：窗还没攒满，或刚被撞击清空（那时类别是 artifact）。模拟源只
+                        # 复刻前者；artifact 由测试直接构造帧。
+                        "event": event_class if event_valid else "quiet",
+                        "event_valid": event_valid,
                         # 自身语音证据（v3）。字段名与 main/app_main.cpp 的实发内容一致：
                         # source 只有 "bone" / "near_field" 两种，面板据此区分"骨传导证据"
                         # 与"近场代理占位"——代理那条路在真机静音素材上误触发过，不能混着显示。

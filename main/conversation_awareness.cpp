@@ -6,9 +6,8 @@
 namespace conversation {
 namespace {
 
-/// 一阶趋近。tau 取下降/上升各自的常数，所以调用点必须自己选对 tau——
-/// 这里不用 controller.cpp 里那个按 target 大小自动挑 attack/release 的写法，
-/// 那种写法在下压（target 变小）时会走 release 常数，是这个项目已经踩过一次的坑。
+/// 一阶趋近。tau 由调用点按状态给定，不按 target 大小自动挑——旧实现踩过
+/// "下压（target 变小）走 release 常数"的坑。
 float approach(float current, float target, float dt_ms, float tau_ms) {
     const float alpha = 1.0f - std::exp(-std::max(dt_ms, 0.0f) / std::max(tau_ms, 1.0f));
     return current + (target - current) * alpha;
@@ -27,54 +26,70 @@ float near_field_own_voice(float level_dbfs, float voice_likelihood) {
 
 Output Awareness::update(const Evidence& evidence, float dt_ms) {
     const float dt = std::max(dt_ms, 0.0f);
-    const bool own_voice = evidence.own_voice >= params_.own_voice_threshold;
+    const bool cue = evidence.conversation_cue >= params_.cue_threshold;
+    const bool own = evidence.own_voice >= params_.own_voice_threshold;
+    const bool evidence_present = cue || own;
 
     switch (state_) {
         case State::idle:
-            if (own_voice) {
-                state_ = State::confirming;
+            if (evidence_present) {
+                state_ = State::anticipating;
+                confirm_ms_ = 0.0f;
+                gap_ms_ = 0.0f;
+                silence_ms_ = 0.0f;
+                engaged_ms_ = 0;
                 confirm_ms_ = dt;
+                if (confirm_ms_ >= params_.onset_confirm_ms) {
+                    state_ = State::engaged;
+                    gap_ms_ = 0.0f;
+                }
             }
             break;
 
-        case State::confirming:
-            if (own_voice) {
+        case State::anticipating:
+            engaged_ms_ += static_cast<std::uint32_t>(dt);
+            if (evidence_present) {
                 confirm_ms_ += dt;
+                silence_ms_ = 0.0f;
                 if (confirm_ms_ >= params_.onset_confirm_ms) {
+                    // 预测升级为确认：从这里开始环境声意图变 true。
                     state_ = State::engaged;
-                    engaged_ms_ = 0;
-                    silence_ms_ = 0.0f;
+                    gap_ms_ = 0.0f;
                 }
             } else {
-                // 短促声音不触发，而且**不累积**：否则"每隔一会儿响一下"会被攒成一次对话。
+                // 短促声不升级，也不累积：一声咳嗽退回 idle，环境声没有动过。
                 state_ = State::idle;
                 confirm_ms_ = 0.0f;
+                silence_ms_ = 0.0f;
+                engaged_ms_ = 0;
             }
             break;
 
         case State::engaged:
             engaged_ms_ += static_cast<std::uint32_t>(dt);
-            if (own_voice) {
+            if (evidence_present) {
+                gap_ms_ = 0.0f;
                 silence_ms_ = 0.0f;
             } else {
+                gap_ms_ += dt;
                 silence_ms_ += dt;
-                if (silence_ms_ >= params_.hold_ms) state_ = State::releasing;
+                if (gap_ms_ >= params_.hold_ms) state_ = State::releasing;
             }
             break;
 
         case State::releasing:
-            // 注意：这里**不**再累加 engaged_ms。它报的是"这次对话持续了多久"，
-            // 恢复尾巴不属于对话；在真机上用它验证 hold/restore 时序，多算就废了。
-            if (own_voice) {
-                // 又说起来了：直接回到下压。对话中间的换气不该让媒体先抬回来再压下去。
+            if (evidence_present) {
+                // 又说起来了：直接回到下压、环境声重新打开。恢复尾巴不属于对话。
                 state_ = State::engaged;
+                gap_ms_ = 0.0f;
                 silence_ms_ = 0.0f;
-            } else if (media_percent_ >= 99.0f) {
-                // 99% 就是 -0.09 dB，人耳和媒体链路都分辨不出；卡在 99.5% 只会让状态机
-                // 在 releasing 里多待两个时间常数（指数趋近要 5τ 才到 99.5%）。
-                state_ = State::idle;
-                engaged_ms_ = 0;
-                silence_ms_ = 0.0f;
+            } else {
+                silence_ms_ += dt;
+                if (media_percent_ >= 99.0f) {
+                    state_ = State::idle;
+                    silence_ms_ = 0.0f;
+                    engaged_ms_ = 0;
+                }
             }
             break;
     }
@@ -84,9 +99,7 @@ Output Awareness::update(const Evidence& evidence, float dt_ms) {
     if (state_ == State::engaged) {
         target = params_.duck_floor_percent;
         tau = params_.duck_ms;
-    } else if (state_ == State::confirming) {
-        // 快速入口：先给用户一个可感知但有界的响应，完整下压仍需通过 onset_confirm_ms。
-        // 这比缩短 2 秒情境模型窗口安全：后者会把训练时从未见过的半窗统计量喂给模型。
+    } else if (state_ == State::anticipating) {
         target = std::clamp(params_.preview_floor_percent,
                             params_.duck_floor_percent, 100.0f);
         tau = params_.preview_duck_ms;
@@ -96,6 +109,9 @@ Output Awareness::update(const Evidence& evidence, float dt_ms) {
     Output out;
     out.state = state_;
     out.engaged = state_ == State::engaged;
+    out.anticipating = state_ == State::anticipating;
+    // 环境声只在对话确认后打开：预测阶段先只压媒体，避免被一声咳嗽切到通透模式。
+    out.ambient_open = state_ == State::engaged;
     out.media_percent = media_percent_;
     out.own_voice = evidence.own_voice;
     out.engaged_ms = engaged_ms_;
@@ -107,6 +123,7 @@ void Awareness::reset() {
     state_ = State::idle;
     media_percent_ = 100.0f;
     confirm_ms_ = 0.0f;
+    gap_ms_ = 0.0f;
     silence_ms_ = 0.0f;
     engaged_ms_ = 0;
 }
@@ -114,7 +131,7 @@ void Awareness::reset() {
 const char* state_name(State state) {
     switch (state) {
         case State::idle: return "IDLE";
-        case State::confirming: return "CONFIRMING";
+        case State::anticipating: return "ANTICIPATING";
         case State::engaged: return "ENGAGED";
         case State::releasing: return "RELEASING";
     }

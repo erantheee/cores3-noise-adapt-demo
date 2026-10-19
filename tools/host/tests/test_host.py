@@ -27,6 +27,7 @@ sys.path.insert(0, str(ROOT))
 
 from host.protocol import (  # noqa: E402
     CONTEXT_CLASSES,
+    EVENT_VALID_CLASSES,
     DEMO_SPEECH_GAIN_DB,
     MAX_NOISE_REDUCTION_DB,
     MAX_SPEECH_GAIN_DB,
@@ -58,6 +59,7 @@ from host.state import (  # noqa: E402
     self_check,
     state_text,
 )
+from host.ambient import AmbientError, AmbientService, RelayAmbient  # noqa: E402
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "device_real.log"
 
@@ -224,6 +226,54 @@ def test_context_model_frame() -> None:
     check(not legacy.problems, f"没有情境字段的旧帧不应有异常（实得 {legacy.problems}）")
     eq(legacy.value.context, None, "旧帧的 context 为 None（不是空串）")
     eq(legacy.value.context_valid, None, "旧帧的 context_valid 为 None：区分没报与报了假")
+
+
+def test_event_frame() -> None:
+    """端侧声音事件判断（main/sound_event.hpp）的 `event` / `event_valid`。
+
+    三态必须分得开：没报（旧固件）/ 窗未满或刚撞击（valid=false）/ 有判断（valid=true）。
+    把 valid=false 画成"安静"就是把"还没判断"说成"判断为安静"。
+    """
+    base = (
+        '"type":"earbud_command","schema":4,"sequence":11,"timestamp_ms":1100,'
+        '"speech_gain_db":0.00,"external_voice_gain_db":0.00,"media_percent":100,'
+        '"state":"OBSERVING","environment":"QUIET","confidence":0.80,'
+        '"own_voice_confidence":0.05,"link":"simulated"'
+    )
+    valid_line = "{" + base + ',"event":"keyboard","event_valid":true}'
+    parsed = parse_line(valid_line)
+    check(not parsed.problems, f"有效事件帧不应有异常（实得 {parsed.problems}）")
+    eq(parsed.value.event, "keyboard", "事件类别原样读出（协议里永远是 ASCII 标识）")
+    eq(parsed.value.event_valid, True, "event_valid 读为布尔真")
+
+    # 撞击帧：valid=false + artifact。它不是"安静"，也不是"没判断出来"。
+    knock = parse_line("{" + base + ',"event":"artifact","event_valid":false}')
+    check(not knock.problems, f"撞击帧不应有异常（实得 {knock.problems}）")
+    eq(knock.value.event, "artifact", "撞击帧的类别是 artifact")
+    eq(knock.value.event_valid, False, "撞击帧的 event_valid 为假")
+
+    # 旧固件：两个字段都没有 → None，而不是空串/默认 quiet。
+    legacy = parse_line("{" + base + "}")
+    check(not legacy.problems, f"没有事件字段的旧帧不应有异常（实得 {legacy.problems}）")
+    eq(legacy.value.event, None, "旧帧的 event 为 None（区分没报与报了 quiet）")
+    eq(legacy.value.event_valid, None, "旧帧的 event_valid 为 None")
+
+    # 自相矛盾：valid=true 却报 artifact。
+    contradiction = parse_line("{" + base + ',"event":"artifact","event_valid":true}')
+    check(any("event_valid=true" in p for p in contradiction.problems),
+          "artifact + valid=true 必须被协议层拒绝")
+    # 只报一半。
+    partial = parse_line("{" + base + ',"event":"keyboard"}')
+    check(any("只报了一部分" in p for p in partial.problems),
+          "只报 event 不报 event_valid 必须被协议层拒绝")
+
+    # 快照层：中文译名与三态。
+    state = HostState(source="test")
+    state.feed_line(valid_line)
+    frame = state.snapshot()["frame"]
+    eq(frame["event"], "keyboard", "快照里的 event 是 ASCII 标识")
+    eq(frame["event_text"], "敲键盘", "快照里给出中文译名")
+    eq(frame["event_valid"], True, "快照里的 event_valid 保留三态")
 
 
 def test_own_voice_frame() -> None:
@@ -829,10 +879,26 @@ def test_mock_device_is_wire_compatible() -> None:
         if frame["mode"] == "SONG_EQ":
             check(max(frame["eq_gain_db"]) <= 4.0 + 1e-9, "song_eq 的逐段建议不超过 4 dB")
         elif frame["mode"] == "EXTERNAL_VOICE_INTENT":
-            check(abs(max(frame["eq_gain_db"]) - frame["external_voice_gain_db"]) < 0.2,
-                  "人声模式的曲线必须跟着标量走，不能一个动一个不动")
+            check(max(frame["eq_gain_db"]) == 0.0,
+                  "人声模式的歌曲 EQ 必须平直（D0：标量意图不是歌曲 EQ）")
         elif frame["mode"] in ("FLAT", "SAFETY_HOLD"):
             check(max(frame["eq_gain_db"]) == 0.0, f"{frame['mode']} 不得给正增益")
+        # v4 环境声意图：模拟源必须与当前固件同构，否则 --mock 会掩盖一条坏链路。
+        check(isinstance(frame.get("ambient_open"), bool), "模拟帧必须带 ambient_open 布尔意图")
+        for key in (
+            "broadband_dbfs",
+            "voice_likelihood",
+            "vocal_ratio",
+            "spectral_flatness",
+            "vocal_peakiness",
+            "excited_vocal_bands",
+        ):
+            check(isinstance(frame.get(key), (int, float)),
+                  f"模拟帧必须带判据遥测 {key}")
+        if frame["environment"] == "VOICE":
+            check(frame["ambient_open"] is True, "对话帧必须请求开放环境声")
+        else:
+            check(frame["ambient_open"] is False, "非对话帧不得请求开放环境声")
         check(0 <= frame["media_percent"] <= 100, "模拟媒体音量在 0–100")
         check(frame["link"] == "simulated", "模拟源的 link 必须是 simulated")
         # 情境字段（融合第二轮）。最需要钉住的是**预热段**：真机在窗攒满 2 秒之前报
@@ -849,6 +915,15 @@ def test_mock_device_is_wire_compatible() -> None:
                   f"模拟类别必须在模型的 9 类里（实得 {frame['context']}）")
             check(0.0 <= frame["context_score"] <= 1.0, "模拟置信度在 [0,1]")
             check(frame["context_us"] > 0, "模拟前向耗时为正值")
+        # 声音事件判断（1 s 窗）。同样要钉住预热段：真机在窗攒满 1 秒之前报 valid=false。
+        check("event_valid" in frame, "模拟帧必须带事件字段")
+        if frame["timestamp_ms"] < 1000:
+            check(frame["event_valid"] is False, "1 s 内窗还没满，event_valid 必须是 false")
+            check(frame["event"] == "quiet", "窗没满时报占位类别 quiet")
+        else:
+            check(frame["event_valid"] is True, "窗满之后必须给出事件判断")
+            check(frame["event"] in EVENT_VALID_CLASSES,
+                  f"模拟事件类别必须合法（实得 {frame['event']}）")
 
 
 def test_mock_can_reproduce_faults() -> None:
@@ -1604,6 +1679,178 @@ def test_player_decision_path_is_not_silently_dropped() -> None:
     check("串口断了" in service.snapshot()["last_error"], "失败原因要进快照，面板才看得见")
 
 
+def test_ambient_executor_and_intent_parsing() -> None:
+    """环境声：设备只报意图，Mac 执行；意图与执行结果必须分开。
+
+    这是本轮新增的链路（S3 预判对话 → ambient_open 意图 → Mac 切 AirPods 聆听模式）。
+    测三件最容易骗人的事：旧帧没有字段不能当成 false；执行失败不能报成已开放；
+    关闭时必须切回用户原来的聆听模式。
+    """
+
+    class _Completed:
+        def __init__(self, code: int, out: str = "") -> None:
+            self.returncode = code
+            self.stdout = out
+            self.stderr = ""
+
+    # ---- 解析：v4 带 ambient_open；v3 没有 → None；类型不对 → 异常 ----
+    payload = {
+        "type": "earbud_command",
+        "schema": 4,
+        "sequence": 1,
+        "timestamp_ms": 100,
+        "speech_gain_db": 0.0,
+        "external_voice_gain_db": 0.0,
+        "media_percent": 60,
+        "ambient_open": True,
+        "state": "ADJUSTING",
+        "environment": "VOICE",
+        "mode": "FLAT",
+        "conversation": "LIKELY",
+        "confidence": 0.9,
+        "execution": "decision_only",
+        "link": "simulated",
+    }
+    frame = parse_line(json.dumps(payload)).value
+    check(isinstance(frame, CommandFrame) and frame.ambient_open is True,
+          "v4 帧必须解析出 ambient_open 意图")
+    old_payload = dict(payload)
+    old_payload.pop("ambient_open")
+    old_payload["schema"] = 3
+    old_frame = parse_line(json.dumps(old_payload)).value
+    check(old_frame.ambient_open is None,
+          "v3 没有 ambient_open：必须报 None，不能默认成 False")
+    bad_payload = dict(payload)
+    bad_payload["ambient_open"] = "yes"
+    bad_parsed = parse_line(json.dumps(bad_payload))
+    check(any("ambient_open" in problem for problem in bad_parsed.problems),
+          "ambient_open 不是布尔值必须记为异常")
+
+    # ---- 执行端：读原模式 → 切通透 → 关闭时切回 ----
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(list(argv))
+        if argv[1] == "status":
+            return _Completed(0, "AirPods Pro   电量：80%\n聆听模式：降噪\n")
+        return _Completed(0, "✅ 已切到「通透模式」")
+
+    service = AmbientService(Path(__file__), autostart=False, runner=runner)
+    check(service.available, "测试 CLI 路径存在时执行端应可用")
+    service.set_open(True)
+    service.step()
+    snapshot = service.snapshot()
+    check(snapshot["open"] is True, "意图 open 后执行端报告已开放")
+    check(snapshot["previous_mode"] == "anc", "切换前必须先读到原聆听模式")
+    check(any(argv[1:] == ["mode", "transparency"] for argv in calls),
+          "必须真的调用 mode transparency")
+    service.set_open(False)
+    service.step()
+    check(service.snapshot()["open"] is False, "意图关闭后执行端报告已关闭")
+    check(any(argv[1:] == ["mode", "anc"] for argv in calls),
+          "关闭时必须切回切换前的模式")
+
+    # ---- 已经是通透模式时不得重复切换 ----
+    calls.clear()
+
+    def already_runner(argv):
+        calls.append(list(argv))
+        return _Completed(0, "聆听模式：通透模式\n")
+
+    already = AmbientService(Path(__file__), autostart=False, runner=already_runner)
+    already.set_open(True)
+    already.step()
+    check(not any(argv[1:] == ["mode", "transparency"] for argv in calls),
+          "已经是通透模式时不得重复切换")
+
+    # ---- 执行失败：必须如实报错，并且在退避窗口内不刷屏 ----
+    calls.clear()
+    now = [100.0]
+
+    def failing_runner(argv):
+        calls.append(list(argv))
+        if argv[1] == "status":
+            return _Completed(0, "聆听模式：降噪\n")
+        return _Completed(5, "❌ 打不开控制中心声音面板")
+
+    failing = AmbientService(
+        Path(__file__), autostart=False, runner=failing_runner, clock=lambda: now[0]
+    )
+    failing.set_open(True)
+    failing.step()
+    failed_snapshot = failing.snapshot()
+    check(failed_snapshot["open"] is False, "执行失败时绝不能报已开放")
+    check("打不开控制中心声音面板" in str(failed_snapshot["last_error"]),
+          "失败原因必须留在快照里")
+    mode_calls = len([argv for argv in calls if argv[1] == "mode"])
+    failing.step()
+    check(len([argv for argv in calls if argv[1] == "mode"]) == mode_calls,
+          "失败退避窗口内不得每 100 ms 重试")
+    now[0] += 4.0
+    failing.step()
+    check(len([argv for argv in calls if argv[1] == "mode"]) > mode_calls,
+          "退避结束后必须重试")
+
+    # ---- CLI 不存在：必须报不可用，不能假装 ----
+    missing = AmbientService(Path("/nonexistent/airpods-cli"), autostart=False, runner=runner)
+    missing.set_open(True)
+    missing.step()
+    missing_snapshot = missing.snapshot()
+    check(missing_snapshot["available"] is False, "CLI 不存在时执行端必须报不可用")
+    check("不存在" in str(missing_snapshot["last_error"]), "不可用原因必须可见")
+
+    # ---- 快照：面板能同时看到设备意图与执行结果 ----
+    state = HostState(source="serial")
+    state.attach_ambient(service)
+    check(state.snapshot()["ambient"] is not None, "环境声执行端必须进快照")
+
+
+def test_relay_ambient_gate() -> None:
+    """环境声走 S3 中继（当前 demo 路径）：门控必须真的拦住/放行，且状态可读。
+
+    这条链路的危险性不在算法，而在"关着的时候以为开着"：设备会一直推 16 kHz 音频，
+    执行端必须能证明自己确实在丢弃、确实在放行。失败/不可用也要如实上报。
+    """
+
+    class _FakeRelay:
+        def __init__(self) -> None:
+            self.failure = None
+            self.fed: list[tuple[bytes, int]] = []
+
+        def feed(self, pcm: bytes, rate: int) -> None:
+            self.fed.append((pcm, rate))
+
+    fake = _FakeRelay()
+    gate = RelayAmbient(fake)
+    check(gate.available, "中继执行端在 relay 正常时可用")
+    check(gate.snapshot()["executor"] == "s3-relay", "执行端类型必须如实上报")
+    gate.feed(b"closed", 16000)
+    check(fake.fed == [], "关闭时音频包不得进入中继")
+    check(gate.snapshot()["chunks_dropped"] == 1, "关闭时丢弃必须计数")
+
+    gate.set_open(True)
+    gate.feed(b"open", 16000)
+    check(fake.fed == [(b"open", 16000)], "开放后音频包必须进入中继")
+    snapshot = gate.snapshot()
+    check(snapshot["open"] is True and snapshot["target"] is True, "开放状态必须进快照")
+    check(snapshot["chunks_fed"] == 1, "放行包数必须计数")
+
+    gate.set_open(False)
+    gate.feed(b"again", 16000)
+    check(fake.fed == [(b"open", 16000)], "关闭后不得再把包塞给中继")
+    check(gate.snapshot()["open"] is False, "关闭状态必须进快照")
+
+    fake.failure = "播放端报错"
+    check(gate.available is False, "中继失败时执行端必须报不可用")
+    check(gate.snapshot()["last_error"] == "播放端报错", "失败原因必须可见")
+
+    state = HostState(source="serial")
+    state.attach_ambient(gate)
+    ambient_snapshot = state.snapshot()["ambient"]
+    check(ambient_snapshot is not None and ambient_snapshot["executor"] == "s3-relay",
+          "面板快照里要能看到中继执行端")
+
+
 def main() -> int:
     tests = [
         test_d2_matches_c_printf,
@@ -1611,6 +1858,7 @@ def main() -> int:
         test_command_frame_full,
         test_new_firmware_frame_carries_tuning,
         test_context_model_frame,
+        test_event_frame,
         test_own_voice_frame,
         test_context_model_is_not_guessed,
         test_old_firmware_frame_still_reads,
@@ -1644,6 +1892,8 @@ def main() -> int:
         test_server_endpoints,
         test_interval_stats_and_percentile,
         test_player_decision_path_is_not_silently_dropped,
+        test_ambient_executor_and_intent_parsing,
+        test_relay_ambient_gate,
         test_audio_relay_budget_caps_backlog,
         test_relay_measures_real_queue_depth_not_our_writes,
         test_relay_reports_unmeasurable_instead_of_guessing,

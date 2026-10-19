@@ -145,6 +145,18 @@
       <div class="sub" id="ctx-note">9 分类 · 只显示，不参与决策</div>
     </div>
     <!--
+      声音事件 = 1 s 窗规则判断（main/sound_event.hpp）：键盘 / 风 / 说话 / 撞击。
+      它与「情境」是两条独立判断：情境看 2 s × 9 类场景，事件看 1 s 瞬态。
+      三态必须分开：没报 / 窗未满（或刚被撞击清空）/ 有判断。把 valid=false 画成
+      "安静"就是在把"还没判断"说成"判断为安静"。
+    -->
+    <div class="card" id="evt-card">
+      <h2>事件（端侧规则）</h2>
+      <div class="value small" id="evt">—</div>
+      <div class="sub" id="evt-raw">—</div>
+      <div class="sub" id="evt-note">键盘 / 风 / 撞击 · 只显示，不参与决策</div>
+    </div>
+    <!--
       自身语音证据 = 这一拍"谁在说话"的依据。source 必须显示出来：
       骨传导（IMU）与近场代理是两条完全不同的路，代理那条在真机静音素材上误触发过
       （docs/apple-conversation-awareness.md 第 10.4 节），混着显示就是在上位机上撒谎。
@@ -166,6 +178,12 @@
       <div class="value" id="gain">—</div>
       <div class="meter"><span id="gain-bar"></span></div>
       <div class="sub" id="gain-cap">硬上限 +6.5 dB</div>
+    </div>
+    <div class="card">
+      <h2>环境声（S3 意图 → 执行端）</h2>
+      <div class="value small" id="amb">—</div>
+      <div class="sub" id="amb-raw">—</div>
+      <div class="sub" id="amb-note">设备只报意图；切 AirPods 聆听模式由 Mac 执行（--ambient-open airpods）</div>
     </div>
     <div class="card">
       <h2>调音（24 频段 EQ）</h2>
@@ -214,9 +232,9 @@
         <button id="btn-prev">上一首</button>
         <button id="btn-play">▶ 播放</button>
         <button id="btn-next">下一首</button>
-        <span class="sub">音量</span>
-        <input type="range" id="player-vol" min="0" max="100" step="5" value="100" style="flex:1 1 120px">
-        <span class="sub" id="player-vol-text">100%</span>
+        <span class="sub">播放增益</span>
+        <input type="range" id="player-vol" min="0" max="200" step="5" value="150" style="flex:1 1 120px">
+        <span class="sub" id="player-vol-text">150%</span>
       </div>
       <div class="sub" id="player-note">—</div>
     </div>
@@ -400,6 +418,52 @@ function renderOwnVoice(f) {
   }
 }
 
+// 环境声：必须把**设备意图**（帧里的 ambient_open）与**Mac 执行结果**（ambient.open）
+// 分开显示。"意图 true、执行失败"是一个必须被看见的状态，不能合并成"已开放"。
+function renderAmbient(s, f) {
+  const intent = f.ambient_open;
+  const exec = s.ambient;
+  if (intent === null || intent === undefined) {
+    $("amb").textContent = "—";
+    $("amb-raw").textContent = "这一帧没有 ambient_open 字段（v4 之前的固件）";
+    $("amb-note").textContent = "设备上报不出意图，执行端不会自己猜";
+    return;
+  }
+  $("amb").textContent = intent ? "意图：开放" : "意图：关闭";
+  const relay = exec && exec.executor === "s3-relay";
+  if (!exec) {
+    $("amb-raw").textContent = "执行端未启用";
+    $("amb-note").textContent = "加 --ambient-executor relay（当前玩法）或 airpods（后续）才执行";
+    return;
+  }
+  if (!exec.available) {
+    $("amb-raw").textContent = relay ? "中继不可用" : "执行端不可用（找不到 airpods CLI）";
+    $("amb-note").textContent = exec.last_error || "意图已上报，但没有执行者";
+    return;
+  }
+  if (exec.last_error) {
+    $("amb-raw").textContent = "执行失败：" + exec.last_error;
+    $("amb-note").textContent = exec.open
+      ? "当前仍处于开放状态；下一个目标变化时会重试"
+      : "意图已上报，但执行端没有动作";
+    return;
+  }
+  if (relay) {
+    $("amb-raw").textContent = exec.open
+      ? "中继已开（S3 麦 → 耳机）"
+      : "中继已关（音频包在 Mac 端丢弃）";
+    $("amb-note").textContent = "已放行 " + (exec.chunks_fed || 0) + " 包 / 丢弃 " +
+      (exec.chunks_dropped || 0) + " 包 · 固有时延约 211–231 ms";
+  } else if (exec.open) {
+    $("amb-raw").textContent = "已切到「" + exec.open_mode + "」，切换前是「" +
+      (exec.previous_mode || "未知") + "」";
+    $("amb-note").textContent = "关闭时切回切换前的模式";
+  } else {
+    $("amb-raw").textContent = exec.target ? "正在打开…" : "已关闭（环境声未进入）";
+    $("amb-note").textContent = "S3 只报意图；切聆听模式由 Mac 执行";
+  }
+}
+
 function renderContext(f) {
   const bar = $("ctx-bar");
   const unknown = f.context_valid === null || f.context_valid === undefined;
@@ -426,6 +490,32 @@ function renderContext(f) {
     : `前向 ${f.context_us} µs · 只显示，不参与决策`;
 }
 
+function renderEvent(f) {
+  const missing = f.event_valid === null || f.event_valid === undefined;
+  if (missing) {
+    $("evt").textContent = "—";
+    $("evt-raw").textContent = "这一帧没有事件字段";
+    $("evt-note").textContent = "固件未上报事件判断（本版之前的固件）";
+    return;
+  }
+  if (!f.event_valid) {
+    // artifact：撞击/削波把窗清空了，这不是"安静"，也不是"没判断出来"。
+    if (f.event === "artifact") {
+      $("evt").textContent = "受撞击/削波";
+      $("evt-raw").textContent = "窗已清空，重新攒 1 秒";
+      $("evt-note").textContent = "撞击不进事件窗：防止瞬态被误判成键盘";
+    } else {
+      $("evt").textContent = "攒窗中…";
+      $("evt-raw").textContent = "窗口未满 1 秒";
+      $("evt-note").textContent = "键盘 / 风 / 撞击 · 只显示，不参与决策";
+    }
+    return;
+  }
+  $("evt").textContent = f.event_text;
+  $("evt-raw").textContent = f.event;
+  $("evt-note").textContent = "1 s 窗规则 · 只显示，不参与决策";
+}
+
 function render(s) {
   lastSnapshot = s;
   $("source-text").textContent = s.source_text + (s.source_detail ? " · " + s.source_detail : "");
@@ -442,14 +532,21 @@ function render(s) {
   const f = s.frame;
   if (!f) {
     ["env", "ctx", "state", "gain", "media", "link", "conf"].forEach((id) => ($(id).textContent = "—"));
+    $("amb").textContent = "—";
+    $("amb-raw").textContent = "还没有设备帧";
     $("ctx-bar").style.width = "0%";
     $("ctx-note").textContent = "9 分类 · 只显示，不参与决策";
+    $("evt").textContent = "—";
+    $("evt-raw").textContent = "还没有设备帧";
+    $("evt-note").textContent = "键盘 / 风 / 撞击 · 只显示，不参与决策";
   } else {
     $("env").textContent = f.environment_text;
     $("env").className = "value env-" + f.environment;
     $("env-raw").textContent = f.environment;
     renderOwnVoice(f);
+    renderAmbient(s, f);
     renderContext(f);
+    renderEvent(f);
     $("state").textContent = f.state_text;
     $("state-raw").textContent = `${f.state} · ${f.conversation || "NONE"}`;
     $("gain").textContent = fmt(f.external_voice_gain_db, 2, " dB");

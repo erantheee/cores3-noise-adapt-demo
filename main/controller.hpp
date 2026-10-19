@@ -20,8 +20,10 @@ constexpr float kMaxSpeechGainDb = 6.5f;
 /// +10 dB of gain) and from the measured OWS result in the sibling project (speech band +7.8 dB
 /// measured, +9.7 dB peak, hard constraint 10 dB). So:
 ///   * gain swing 0 → kDemoSpeechGainDb (8.0 dB, inside the measured/verified range, 2 dB margin)
-///   * the same value is written into the speech bands of eq_gain_db, so the 24-band curve moves
-///     instead of staying flat -- previously the speech-likely branch left eq_gain_db at zero
+///   * **the 24-band EQ is SONG_EQ only**. External-voice intent is a scalar intent; it must not be
+///     written into the song's speech band, because that is exactly the substitution D0 forbids
+///     (real-voice gain must not be expressed as a 1–4 kHz song EQ). An earlier demo revision did
+///     write it there to make the panel move; that was a contract violation, not a feature.
 ///   * media ducks to kDemoMediaFloorPercent (60%): enough to expose dialogue while keeping the
 ///     programme present. The previous 25% floor was a strong demo value, not a model result.
 constexpr float kDemoSpeechGainDb = 8.0f;
@@ -38,6 +40,8 @@ enum class ConversationState : uint8_t {
     none,
     speech_nearby,
     likely,
+    /// 预测到对话开始（媒体已预下压），但还没有确认；环境声尚未打开。
+    anticipating,
 };
 
 enum class AdaptState : uint8_t {
@@ -122,6 +126,16 @@ struct ContextResult {
     const char* class_name = "unknown";
 };
 
+/// 端侧声音事件判断（键盘 / 风 / 说话 / 安静 / 撞击）的输出。
+///
+/// 与 `ContextResult` 同一纪律：由音频任务写、`AdaptController` 从不读回；本轮只上报，
+/// 不改任何决策。类别名指向 `sound_event.hpp` 的静态字符串，生命周期同进程。
+struct SoundEventResult {
+    /// False = 窗还没攒满，或刚被撞击清空。此时 `class_name` 不可当判断用。
+    bool valid = false;
+    const char* class_name = "quiet";
+};
+
 /// 自身语音证据的来源策略。
 ///
 /// 三条路的**可信度与失败方式完全不同**，所以它必须是一个显式策略、并且要进遥测：
@@ -160,14 +174,28 @@ struct OwnVoiceEvidence {
 };
 
 struct EarbudCommand {
-    /// v3 加了自身语音证据（own_voice，含 imu_gravity）。v2 及以前没有这几个字段。
-    /// v3 尚未烧到任何设备，所以补字段不另起版本号；一旦上过机就必须再涨版本。
-    uint32_t schema_version = 3;
+    /// v4 加了 `ambient_open`（环境声开放意图）。v3（自身语音证据）已上过机，所以新增
+    /// 字段必须涨版本；上位机同时读得懂 v1–v4。
+    uint32_t schema_version = 4;
     uint32_t sequence = 0;
     uint32_t timestamp_ms = 0;
     float speech_gain_db = 0.0f;
     float external_voice_gain_db = 0.0f;
     uint8_t media_percent = 100;
+    /// 环境声开放意图。true = 对话已确认，应该让现实声音进入耳朵。
+    ///
+    /// demo 里由执行端（S3 麦克风中继 / 后续 AirPods 聆听模式）执行。**没有执行回执时
+    /// 它只是意图**，面板必须把"意图"与"已执行"分开显示。
+    bool ambient_open = false;
+    // ── 判据遥测（只上报，不参与决策）────────────────────────────────────────────
+    // 对话预判的训练与误触发排查都需要这些量；它们本来就在分析器里算过，不做二次计费。
+    // 详见 docs/conversation-prediction.md。
+    float broadband_dbfs = -120.0f;
+    float voice_likelihood = 0.0f;
+    float vocal_ratio = 0.0f;
+    float spectral_flatness = 0.0f;
+    float vocal_peakiness = 0.0f;
+    uint8_t excited_vocal_bands = 0;
     std::array<float, kBandCount> eq_gain_db{};
     std::array<float, kBandCount> ambient_band_dbfs{};
     AdaptState state = AdaptState::observing;
@@ -183,6 +211,8 @@ struct EarbudCommand {
     EvidencePolicy evidence_policy = EvidencePolicy::bone_only;
     /// Model telemetry. `AdaptController` never touches this field.
     ContextResult context;
+    /// 声音事件判断（1 s 窗）。同样只上报：键盘/风/撞击不参与决策。
+    SoundEventResult event;
 };
 
 /// Turns one analysis frame into an `AnalysisFrame`, including the voice decision.

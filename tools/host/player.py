@@ -46,7 +46,7 @@ INTERNAL_COMMANDS = {"eq"}
 NUMERIC_FIELDS = {"index", "seconds", "percent", "depth"}
 BOOLEAN_FIELDS = {"on", "autoplay"}
 
-DEFAULT_VOLUME_PERCENT = 100.0
+DEFAULT_VOLUME_PERCENT = 150.0
 #: 决策下发的节流：设备 10 Hz、播放器 20 ms 一次斜坡，按帧发没有意义，只会刷屏。
 DECISION_MIN_INTERVAL_S = 0.2
 DECISION_MIN_DELTA_DB = 0.05
@@ -221,6 +221,11 @@ class PlayerService:
             count = (self._state or {}).get("track_count") or 0
             if count and not 0 <= int(payload["index"]) < int(count):
                 raise PlayerError(f"曲目序号 {payload['index']} 超出范围（0…{int(count) - 1}）")
+        if name == "volume" and "percent" in payload:
+            percent = float(payload["percent"])
+            if not 0.0 <= percent <= 200.0:
+                raise PlayerError("播放增益必须在 0…200% 之间")
+            self.volume_percent = percent
         self._send(payload)
         return {"ok": True, "sent": payload}
 
@@ -318,7 +323,7 @@ class PlayerService:
             "track_count": state.get("track_count", 0),
             "position_s": state.get("position_s"),
             "duration_s": state.get("duration_s"),
-            "volume_percent": self.volume_percent,
+            "volume_percent": state.get("volume_percent", self.volume_percent),
             "depth": state.get("depth", self.depth),
             "media_percent": state.get("media_percent"),
             "source_bands": state.get("source_bands") or [],
