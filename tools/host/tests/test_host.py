@@ -1852,17 +1852,20 @@ def test_relay_ambient_gate() -> None:
     gate.feed(b"closed", 16000)
     check(fake.fed == [], "关闭时音频包不得进入中继")
     check(gate.snapshot()["chunks_dropped"] == 1, "关闭时丢弃必须计数")
+    check(gate.snapshot()["preroll_chunks"] == 1, "关闭时保留预缓冲包用于快速打开")
 
     gate.set_open(True)
+    check(fake.fed == [(b"closed", 16000)],
+          "打开瞬间先灌预缓冲（缩短可听延迟）")
     gate.feed(b"open", 16000)
-    check(fake.fed == [(b"open", 16000)], "开放后音频包必须进入中继")
+    check(fake.fed == [(b"closed", 16000), (b"open", 16000)], "开放后音频包必须进入中继")
     snapshot = gate.snapshot()
     check(snapshot["open"] is True and snapshot["target"] is True, "开放状态必须进快照")
-    check(snapshot["chunks_fed"] == 1, "放行包数必须计数")
+    check(snapshot["chunks_fed"] == 2, "放行包数必须计数（含预缓冲）")
 
     gate.set_open(False)
     gate.feed(b"again", 16000)
-    check(fake.fed == [(b"open", 16000)], "关闭后不得再把包塞给中继")
+    check(fake.fed == [(b"closed", 16000), (b"open", 16000)], "关闭后不得再把包塞给中继")
     check(gate.snapshot()["open"] is False, "关闭状态必须进快照")
 
     fake.failure = "播放端报错"

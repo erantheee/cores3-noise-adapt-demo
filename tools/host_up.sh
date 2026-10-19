@@ -59,11 +59,12 @@ if [ "${1:-}" = "--detach" ]; then
 fi
 
 set -- --web-port "$WEB_PORT" "$@"
-# 环境声执行端默认 airpods：S3 说"对话成立"就切通透。没有 CLI / AX 权限 / 耳机时，
-# 执行端会在面板上如实报不可用；传 --ambient-executor off/relay 可覆盖。
+# 环境声执行端默认 relay（本 demo 的既定路径）：S3 麦克风 → Mac → AirPods 中继，
+# S3 的 ambient_open 意图只做门控，**不碰 AirPods 聆听模式**。airpods 执行端是可选分支，
+# 必须显式传 --ambient-executor airpods；不要擅自改默认。
 case " $* " in
     *" --ambient-executor "*|*" --mock "*|*" --replay "*) : ;;
-    *) set -- --ambient-executor airpods "$@" ;;
+    *) set -- --ambient-executor relay "$@" ;;
 esac
 if [ -n "${CORES3_PORT:-}" ]; then
     case " $* " in

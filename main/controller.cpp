@@ -509,10 +509,13 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms) {
 
         for (std::size_t band = 0; band < kBandCount; ++band) {
             const bool speech_band = band >= 8 && band <= 16;
-            // 只有 SONG_EQ 写 24 段曲线。外部人声模式保持全 0：那条意图没有执行者，
-            // 把它写进歌曲 EQ 等于偷换成一个可听动作（D0）。要让它可听，得先有现实人声的
-            // 真实增益通路，而不是改这里。
-            if (command.tuning_mode == TuningMode::song_eq) {
+            if (command.tuning_mode == TuningMode::external_voice_intent) {
+                // 背景/别人说话（还没构成"正在和我对话"）→ 抬 1–3.6 kHz 让中频起来；
+                // 边缘两个频段收一点，形状读起来是个驼峰。对话一旦成立会走 flat + 下压，
+                // 不再抑制这条（用户 2026-10-19 口径：别人的对话也要拉 EQ）。
+                const float edge = (band == 8 || band == 16) ? 0.75f : 1.0f;
+                command.eq_gain_db[band] = speech_band ? speech_gain_db_ * edge : 0.0f;
+            } else if (command.tuning_mode == TuningMode::song_eq) {
                 const float band_noise = clamp01((frame.band_dbfs[band] + 62.0f) / 32.0f);
                 const float importance = speech_band ? 1.0f : (band < 5 ? 0.45f : 0.70f);
                 command.eq_gain_db[band] = std::min(4.0f, 4.0f * band_noise * importance);

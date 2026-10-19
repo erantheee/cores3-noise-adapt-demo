@@ -151,7 +151,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--relay-device",
         default=DEFAULT_DEVICE,
         help=(
-            f"中继要钉住的输出设备名（子串匹配），默认 {DEFAULT_DEVICE}。"
+            f"中继要钉住的输出设备名（子串匹配），默认 {DEFAULT_DEVICE or '跟随系统默认输出'}。"
             "只钉这条流的输出，不改系统默认输出；设备不在时会如实报警"
         ),
     )
@@ -222,7 +222,10 @@ def main(argv: list[str] | None = None) -> int:
         print("无法启用中继执行端：中继没有创建", file=sys.stderr)
         return 3
     if relay_ambient is not None:
-        on_mic_chunk = relay_ambient.feed
+        # HostState 传的是 MicChunk（含 pcm/rate），RelayAmbient.feed 要两个参数。
+        # 2026-10-19 实测这个签名错会让每个 mic_chunk 抛 TypeError，串口每秒重连一次，
+        # 中继环境声音频根本进不来——"中继一直好好的"其实是这条回调从没跑通过。
+        on_mic_chunk = lambda chunk: relay_ambient.feed(chunk.pcm, chunk.rate)  # noqa: E731
     elif relay is not None:
         on_mic_chunk = lambda chunk: relay.feed(chunk.pcm, chunk.rate)  # noqa: E731
     else:
@@ -476,7 +479,8 @@ def main(argv: list[str] | None = None) -> int:
             if state.is_stale() or state.is_silent() or not state.connected:
                 want_open = False
             ambient.set_open(want_open)
-        time.sleep(0.1)
+        # 50 ms 足够跟上 10 Hz 设备帧，又把"意图→执行"的额外延迟从 100 ms 压到 50 ms。
+        time.sleep(0.05)
 
     if frames_log is not None:
         frames_log.close()

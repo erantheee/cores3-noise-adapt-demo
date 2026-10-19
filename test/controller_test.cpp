@@ -98,6 +98,28 @@ int main() {
               "the frame still reports no own-voice evidence");
     }
 
+    // ---- 背景/别人说话（还没构成对话）：中频 EQ 要起来 ----
+    {
+        AdaptController background;
+        EarbudCommand out;
+        // -54 dBFS、voice 0.8：speech_active 成立，但对话 cue（-58 起按 16 dB 归一）
+        // 只有 0.25，低于 0.5 门限 -> 不进入 anticipating，走 external_voice_intent。
+        for (int i = 0; i < 12; ++i) out = background.update(frame(-54, 0.8f), 150);
+        check(out.conversation == ConversationState::speech_nearby,
+              "背景人声只报 nearby，不升级为对话（cue 未过门限）");
+        check(out.media_percent == 100, "背景人声不压媒体");
+        check(!out.ambient_open, "背景人声不开环境声");
+        check(out.tuning_mode == TuningMode::external_voice_intent,
+              "背景人声选择外部人声意图");
+        bool mid_lifted = false;
+        for (std::size_t band = 8; band <= 16; ++band) {
+            if (out.eq_gain_db[band] > 0.05f) mid_lifted = true;
+        }
+        check(mid_lifted, "背景别人说话：1–3.6 kHz 中频 EQ 被抬起");
+        check(out.eq_gain_db[0] == 0.0f && out.eq_gain_db[23] == 0.0f,
+              "外部人声 EQ 只动中频段，不动两端");
+    }
+
     // ---- 高噪声安全保持 ----
     {
         AdaptController safety_controller;

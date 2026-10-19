@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import collections
 import subprocess
 import threading
 import time
@@ -247,12 +248,17 @@ class RelayAmbient:
     设备端是否在推流由上位机启动时发的 `rec start` 决定（见 `__main__.py`），本类不碰串口。
     """
 
+    #: 关闭时保留最近多少包（20 ms/包 → 160 ms 预缓冲）。打开时先灌这些，避免等下一包。
+    PREROLL_CHUNKS = 8
+
     def __init__(self, relay: object, enabled: bool = True) -> None:
         self.relay = relay
         self.enabled = enabled
         self._lock = threading.RLock()
         self._open = False
         self._target = False
+        self._pre_roll: collections.deque[tuple[bytes, int]] = collections.deque(
+            maxlen=self.PREROLL_CHUNKS)
         self._fed_chunks = 0
         self._dropped_chunks = 0
         self._opens = 0
@@ -268,6 +274,7 @@ class RelayAmbient:
 
     def set_open(self, want: bool) -> None:
         """请求开放/关闭环境声。非阻塞；只改门控，不碰设备与播放端。"""
+        buffered: list[tuple[bytes, int]] = []
         with self._lock:
             want = bool(want)
             if want == self._target:
@@ -276,14 +283,24 @@ class RelayAmbient:
             self._open = want
             if want:
                 self._opens += 1
+                buffered = list(self._pre_roll)
+                self._pre_roll.clear()
+            else:
+                self._pre_roll.clear()
             self._last_change_at = time.monotonic()
+        # 锁外灌预缓冲：relay.feed 可能阻塞，不能占着状态锁。
+        for pcm, rate in buffered:
+            self.relay.feed(pcm, rate)
+            with self._lock:
+                self._fed_chunks += 1
 
     def feed(self, pcm: bytes, rate: int) -> None:
         """由数据源线程对每个麦克风包调用一次。关闭时丢弃，不排队。"""
         with self._lock:
-            open_now = self._open
-            if not open_now:
+            if not self._open:
+                # 关着的时候不丢，留最近 160 ms：打开瞬间先灌进去，缩短"可听"延迟。
                 self._dropped_chunks += 1
+                self._pre_roll.append((pcm, rate))
                 return
             self._fed_chunks += 1
         self.relay.feed(pcm, rate)
@@ -309,5 +326,6 @@ class RelayAmbient:
                 "executor": "s3-relay",
                 "chunks_fed": self._fed_chunks,
                 "chunks_dropped": self._dropped_chunks,
+                "preroll_chunks": len(self._pre_roll),
                 "opens": self._opens,
             }
