@@ -485,9 +485,13 @@ function renderContext(f) {
   $("ctx").textContent = f.context_text;
   bar.style.width = pct + "%";
   $("ctx-raw").textContent = `${f.context} · ${pct.toFixed(0)}%`;
-  $("ctx-note").textContent = f.context_us === null || f.context_us === undefined
+  let note = f.context_us === null || f.context_us === undefined
     ? "9 分类 · 只显示，不参与决策"
     : `前向 ${f.context_us} µs · 只显示，不参与决策`;
+  if (f.speech_gate_valid === true && typeof f.speech_gate === "number") {
+    note += ` · 说话 gate ${f.speech_gate.toFixed(2)}（${f.speech_gate_us ?? 0} µs，只做遥测）`;
+  }
+  $("ctx-note").textContent = note;
 }
 
 function renderEvent(f) {

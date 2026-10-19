@@ -738,6 +738,10 @@ class HostState:
                 "event": frame.event,
                 "event_text": event_text(frame.event),
                 "event_valid": frame.event_valid,
+                # 说话/非说话二分类学生：只做遥测，界面要标"只显示"。
+                "speech_gate": frame.speech_gate,
+                "speech_gate_valid": frame.speech_gate_valid,
+                "speech_gate_us": frame.speech_gate_us,
                 "mode": frame.mode,
                 "conversation": frame.conversation,
                 "execution": frame.execution,

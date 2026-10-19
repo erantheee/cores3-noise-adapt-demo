@@ -214,6 +214,11 @@ struct EarbudCommand {
     /// 声音事件判断（1 s 窗）。键盘/说话/撞击只上报；风在 song_eq 且无对话时压低频
     /// 抬升上限（D21，见 apply_wind_eq）。
     SoundEventResult event;
+    /// 92 维窗上的"说话 vs 非说话"二分类学生（speech_gate_model.h）的分数与耗时。
+    /// **只做遥测**，不参与决策；要替换四判据必须过 D19 验收（当前数据还不够）。
+    float speech_gate_score = 0.0f;
+    bool speech_gate_valid = false;
+    int32_t speech_gate_us = 0;
 };
 
 // ── 风场景 EQ（D21）────────────────────────────────────────────────────────────

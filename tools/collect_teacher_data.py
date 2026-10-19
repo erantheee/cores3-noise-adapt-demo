@@ -192,6 +192,9 @@ class Capture:
             "event_valid": payload.get("event_valid"),
             "context": payload.get("context"),
             "context_valid": payload.get("context_valid"),
+            "speech_gate": payload.get("speech_gate"),
+            "speech_gate_valid": payload.get("speech_gate_valid"),
+            "speech_gate_us": payload.get("speech_gate_us"),
             "media_percent": payload.get("media_percent"),
         }
         self.frames_path.write(json.dumps(record, ensure_ascii=False) + "\n")

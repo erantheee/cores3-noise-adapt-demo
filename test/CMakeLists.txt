@@ -68,3 +68,9 @@ add_test(NAME bone_voice_test COMMAND bone_voice_test)
 add_executable(sound_event_test sound_event_test.cpp)
 target_include_directories(sound_event_test PRIVATE ../main)
 add_test(NAME sound_event_test COMMAND sound_event_test)
+
+# 说话 vs 非说话二分类学生（92 维窗）。金标准与 main/speech_gate_model.h 由
+# experiments/sound-events/export_speech_gate.py 一起生成。
+add_executable(speech_gate_test speech_gate_test.cpp)
+target_include_directories(speech_gate_test PRIVATE ../main)
+add_test(NAME speech_gate_test COMMAND speech_gate_test)

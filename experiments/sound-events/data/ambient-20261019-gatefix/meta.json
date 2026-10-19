@@ -1,0 +1,17 @@
+{
+  "requested_seconds": 12.22359837499971,
+  "frames": 113,
+  "frame_rate_hz": 9.244,
+  "audio_seconds": 11.72,
+  "chunks": 586,
+  "chunk_gaps": [],
+  "bad_lines": 0,
+  "first_frame_ts_ms": 1469,
+  "last_frame_ts_ms": 13390,
+  "first_chunk_ts_ms": 1769,
+  "last_chunk_ts_ms": 13475,
+  "event_counts": {
+    "quiet": 113
+  },
+  "note": "audio.wav 与 frames.jsonl 按设备 timestamp_ms 对齐；frame_rate 应为 ~10 Hz"
+}

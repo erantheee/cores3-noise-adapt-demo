@@ -162,6 +162,11 @@ class CommandFrame:
     context_valid: bool | None = None
     #: 一次前向的耗时，微秒。设备逐帧实报，不是估算。
     context_us: int | None = None
+    #: 92 维窗上的说话/非说话二分类学生输出（speech_gate_model.h）。None = 旧固件没报。
+    #: **只做遥测**：当前不参与决策，替换四判据要过 D19 验收。
+    speech_gate: float | None = None
+    speech_gate_valid: bool | None = None
+    speech_gate_us: int | None = None
     #: 端侧声音事件判断（main/sound_event.hpp）：quiet / speech / keyboard / wind /
     #: artifact。None = 这一帧没报（旧固件）。`event_valid=False` 是"窗还没攒满或刚被
     #: 撞击清空"，不是"判断为 quiet"——两种情况必须分开显示。
@@ -308,6 +313,11 @@ def _as_float(payload: dict[str, Any], key: str) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return float(value)
+
+
+def _as_bool(payload: dict[str, Any], key: str) -> bool | None:
+    value = payload.get(key)
+    return value if isinstance(value, bool) else None
 
 
 def _as_str(payload: dict[str, Any], key: str) -> str | None:
@@ -471,6 +481,14 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
                 f"context_valid=false 却报了类别 {context!r}（占位符应是 {CONTEXT_UNKNOWN!r}）"
             )
 
+    speech_gate = _as_float(payload, "speech_gate")
+    speech_gate_valid = _as_bool(payload, "speech_gate_valid")
+    speech_gate_us = _as_int(payload, "speech_gate_us")
+    if speech_gate is not None and not 0.0 <= speech_gate <= 1.0:
+        problems.append(f"说话 gate 分数 {speech_gate} 不在 [0,1]")
+    if speech_gate_us is not None and speech_gate_us < 0:
+        problems.append(f"说话 gate 推理耗时 {speech_gate_us} µs 为负数")
+
     return ParsedLine(
         value=CommandFrame(
             sequence=sequence,
@@ -499,6 +517,9 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
             context_score=None if context_score is None else d2(context_score),
             context_valid=context_valid,
             context_us=context_us,
+            speech_gate=speech_gate,
+            speech_gate_valid=speech_gate_valid,
+            speech_gate_us=speech_gate_us,
             event=event,
             event_valid=event_valid,
             own_voice_confidence=None if own_voice_confidence is None else d2(own_voice_confidence),

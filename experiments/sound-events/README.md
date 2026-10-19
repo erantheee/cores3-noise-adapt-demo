@@ -269,3 +269,22 @@ TFHUB_CACHE_DIR=$PWD/.tfhub-cache experiments/sound-events/.venv-teacher/bin/pyt
 
 **结论**：混合场景的"架构"可以现在定（两路独立），但"准确率/阈值"必须等真实混合数据；
 合成数据不能用于 D18 准入。
+
+
+## 说话 vs 非说话学生（上机只遥测）
+
+- 训练/导出：`experiments/sound-events/export_speech_gate.py` → `main/speech_gate_model.h`
+  + `test/speech_gate_golden.h`；结构 92→24→2，约 2.3k 参数。
+- 训练数据：multi（教师标签）+ TTS（教师标签）+ B（人工分段），共 797 窗。
+- **口径坑（已修）**：92 维里 72–79（电平/voice_likelihood）和 84（电平阶跃）依赖设备的
+  `broadband_dbfs`（48 kHz 时域 RMS），而训练侧当时只能用 24 段功率近似；端侧用真实值，
+  于是安静房间 gate 报 0.94–1.0。现在训练和端侧都把 9 维清零，设备与离线重算 corr 0.999。
+- 当前跨会话仍不达标（multi→TTS 误报 54%、TTS→multi 61%），所以**只遥测、不替换四判据**。
+- 调试通道：串口 `vector` + `tools/dump_window_vector.py`，用于逐维对比端侧/训练侧特征。
+
+复现：
+
+```sh
+.venv/bin/python experiments/sound-events/export_speech_gate.py
+cd build-host-tests && cmake --build . && ctest
+```

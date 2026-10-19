@@ -1,3 +1,4 @@
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -14,6 +15,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "latency_profiler.hpp"
+#include "speech_gate_model.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -164,12 +166,16 @@ void emit_command_json(const EarbudCommand& command) {
     // 声音事件判断同样只上报：`event_valid=false` 表示 1 s 窗还没攒满（或刚被撞击清空），
     // 上位机必须把这两种情况与"判断成 quiet"分开显示。
     std::printf("],\"context\":\"%s\",\"context_score\":%.3f,\"context_valid\":%s,"
-                "\"context_us\":%ld,\"event\":\"%s\",\"event_valid\":%s}\n",
+                "\"context_us\":%ld,\"event\":\"%s\",\"event_valid\":%s,"
+                "\"speech_gate\":%.3f,\"speech_gate_valid\":%s,\"speech_gate_us\":%ld}\n",
                 command.context.class_name, static_cast<double>(command.context.score),
                 command.context.valid ? "true" : "false",
                 static_cast<long>(command.context.inference_us),
                 command.event.class_name,
-                command.event.valid ? "true" : "false");
+                command.event.valid ? "true" : "false",
+                static_cast<double>(command.speech_gate_score),
+                command.speech_gate_valid ? "true" : "false",
+                static_cast<long>(command.speech_gate_us));
 }
 
 /// Report the per-stage breakdown, then clear the window so the next report covers the
@@ -248,6 +254,12 @@ constexpr std::size_t kConsoleLineMax = 96;
 char g_console_line[kConsoleLineMax];
 std::size_t g_console_fill = 0;
 
+/// 调试用：最近一次满窗的 92 维特征。控制台发 `vector` 时原样打印，
+/// 用来核对端侧特征与训练侧 features.py 是否同口径（golden 只覆盖金标准样例）。
+float g_latest_window_vector[context::kFeatureCount];
+bool g_latest_window_vector_valid = false;
+uint32_t g_latest_window_vector_ms = 0;
+
 /// Read whatever the console has and act on complete lines. Returns true when a command
 /// was handled, so the caller can act without polling twice.
 bool poll_console_command() {
@@ -266,6 +278,20 @@ bool poll_console_command() {
                                 "\"seconds\":%ld,\"rate\":%lu}\n",
                                 static_cast<long>(g_record_seconds),
                                 static_cast<unsigned long>(kRelayRate));
+                    handled = true;
+                } else if (std::strncmp(g_console_line, "vector", 6) == 0) {
+                    if (g_latest_window_vector_valid) {
+                        std::printf("{\"type\":\"window_vector\",\"valid\":true,"
+                                    "\"t_ms\":%lu,\"vector\":[",
+                                    static_cast<unsigned long>(g_latest_window_vector_ms));
+                        for (std::size_t i = 0; i < context::kFeatureCount; ++i) {
+                            std::printf("%s%.6f", i == 0 ? "" : ",",
+                                        static_cast<double>(g_latest_window_vector[i]));
+                        }
+                        std::printf("]}\n");
+                    } else {
+                        std::printf("{\"type\":\"window_vector\",\"valid\":false}\n");
+                    }
                     handled = true;
                 } else if (std::strncmp(g_console_line, "rec stop", 8) == 0) {
                     g_record_seconds = -1;
@@ -781,6 +807,11 @@ void processing_task(void*) {
         if (context_window->full()) {
             float window_vector[context::kFeatureCount];
             context_window->build_vector(window_vector);
+            for (std::size_t i = 0; i < context::kFeatureCount; ++i) {
+                g_latest_window_vector[i] = window_vector[i];
+            }
+            g_latest_window_vector_ms = frame.timestamp_ms;
+            g_latest_window_vector_valid = true;
             float logits[listening_model::kClassCount];
             const int64_t inference_started_us = esp_timer_get_time();
             listening_model::classify(window_vector, logits);
@@ -794,6 +825,19 @@ void processing_task(void*) {
             context_result.inference_us = static_cast<int32_t>(inference_us);
             context_result.class_name = listening_model::kClassNames[class_index];
             context_timing->record(static_cast<float>(inference_us));
+
+            // 说话 vs 非说话二分类学生（只上报）。输入与 9 类模型同一个 92 维窗向量。
+            float gate_logits[speech_gate::kClassCount];
+            const int64_t gate_started_us = esp_timer_get_time();
+            speech_gate::classify(window_vector, gate_logits);
+            command.speech_gate_us =
+                static_cast<int32_t>(esp_timer_get_time() - gate_started_us);
+            const float gate_max = gate_logits[0] > gate_logits[1]
+                                       ? gate_logits[0] : gate_logits[1];
+            const float gate_exp0 = std::exp(gate_logits[0] - gate_max);
+            const float gate_exp1 = std::exp(gate_logits[1] - gate_max);
+            command.speech_gate_score = gate_exp1 / (gate_exp0 + gate_exp1);
+            command.speech_gate_valid = true;
         }
         // Assigned after `controller.update()`, and the controller never reads it back: that
         // separation is what makes this a no-behaviour-change round.

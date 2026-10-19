@@ -477,6 +477,14 @@ g++ -std=c++17 -O2 -I main -o /tmp/voicsweep tools/voice_decision_sweep.cpp main
      92% 降到 <10%，并在真机复测；通过前不改 `AdaptController` 的判据路径。
 5. **局限**：教师标签来自 Mac 侧 16 kHz 音频，设备侧只有 24 段特征；蒸馏后仍需人工分段
    做最终验收（教师与固件口径不同，不能互相替代）。
+6. **学生 v4 已上机，但只做遥测（2026-10-19）**：92→24→2（speech_gate_model.h），
+   与 9 类模型共用同一个 92 维窗；串口新增 `speech_gate`/`speech_gate_valid`/`speech_gate_us`。
+   **发现并修复一个口径 bug**：训练侧 92 维特征里依赖 `broadband_dbfs` 的 9 维
+   （72–79 电平/voice_likelihood、84 电平阶跃），训练数据没有设备真实 broadband（脚本用
+   24 段功率近似），导致端侧 gate 在安静房间报 0.94–1.0。现在训练和端侧都把这 9 维清零，
+   设备值与离线重算 **corr 0.999 / max|diff| 0.07**，安静房间回到 0.004。
+   **验收仍不通过**：跨会话 multi→TTS 误报 54%、TTS→multi 误报 61%、合成模型在真的安静
+   采集上误报 26%，因此 gate 只显示、不参与决策，四判据不动。
 
 
 ---

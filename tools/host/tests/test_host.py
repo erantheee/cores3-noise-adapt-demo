@@ -276,6 +276,29 @@ def test_event_frame() -> None:
     eq(frame["event_valid"], True, "快照里的 event_valid 保留三态")
 
 
+
+def test_speech_gate_frame() -> None:
+    """92 维窗上的说话/非说话二分类学生：只做遥测，字段缺省要能读旧日志。"""
+    base = (
+        '"type":"earbud_command","schema":4,"sequence":12,"timestamp_ms":1200,'
+        '"speech_gain_db":0.00,"external_voice_gain_db":0.00,"media_percent":100,'
+        '"state":"OBSERVING","environment":"QUIET","confidence":0.80,'
+        '"own_voice_confidence":0.05,"link":"simulated"'
+    )
+    line = "{" + base + ',"speech_gate":0.83,"speech_gate_valid":true,"speech_gate_us":9}'
+    parsed = parse_line(line)
+    check(not parsed.problems, f"有效 gate 帧不应有异常（实得 {parsed.problems}）")
+    eq(parsed.value.speech_gate, 0.83, "说话 gate 分数原样读出")
+    eq(parsed.value.speech_gate_valid, True, "speech_gate_valid 读为布尔真")
+    eq(parsed.value.speech_gate_us, 9, "说话 gate 推理耗时读出")
+
+    legacy = parse_line("{" + base + "}")
+    check(not legacy.problems, f"旧固件没有 gate 字段也不该报错（实得 {legacy.problems}）")
+    eq(legacy.value.speech_gate, None, "旧固件 speech_gate 为 None，不是 0")
+    eq(legacy.value.speech_gate_valid, None, "旧固件 speech_gate_valid 为 None")
+
+
+
 def test_own_voice_frame() -> None:
     """v3（2026-10-16）起，帧里多了自身语音证据。
 
@@ -1861,6 +1884,7 @@ def main() -> int:
         test_new_firmware_frame_carries_tuning,
         test_context_model_frame,
         test_event_frame,
+        test_speech_gate_frame,
         test_own_voice_frame,
         test_context_model_is_not_guessed,
         test_old_firmware_frame_still_reads,
