@@ -1,5 +1,9 @@
 # AI OWS 耳机仓综合体验 Demo
 
+> **2026-10-20 目标对齐更新：** 下一阶段验证“听音乐 → 用户主动与旁人交流 → 回到听音乐”，主线为音乐环境适应与主动对话联动。现实人声增益与歌曲 EQ 可以同时执行，在冲突频段适度让位；不能把环境音中继称为目标人声分离。“别人先叫用户”是否纳入本阶段仍待确认。
+>
+> 当前能力、优化顺序和验收范围以 [产品口径](docs/product-alignment.md) 为准。下文保留历史实现与测量记录，涉及旧版本的状态不代表当前全部能力；GitHub 主分支与本地未提交声纹/对话实验须分别看待。情境模型当前仅上报结果，不参与控制；本地声纹推理运行在 Mac。此次仅更新文档，未部署固件或复测听感。
+
 本项目用 **CoreS3 = AI OWS 耳机仓、Mac = 播放器与原型执行器、AirPods Pro = 本次耳机**，
 验证端侧 AI 根据环境、时间、个人历史和用户纠正做出的综合听音决策是否真的有用。
 
@@ -94,7 +98,7 @@ CoreS3 承担耳机仓侧的感知、判断与决策；Mac 承担本次 Demo 的
 - `环境`：安静 / 噪声 / 人声嘈杂 / 高噪声
 - `当前动作`：保持 / 歌曲调音 / 现实人声增益意图 / 安全保持
 - `人声状态`：`NONE / SPEECH / LIKELY`；只是 S3 麦克风启发式，不是身份识别
-- `调音`：`SONG_EQ` 的 24 段建议；现实人声模式下保持歌曲 EQ 平直
+- `调音`：`SONG_EQ` 的 24 段建议；对话时保留歌曲 EQ 并协调冲突频段（目标口径；实现与验证状态见产品口径）
 - `人声增益`：现实中对方说话的增益意图，硬上限 +6.5 dB
 - `控制链路`：Mac 串口是否真实连接
 - 第二页显示 `AirPods Pro`、Mac 控制通道和 Mac 回报的蓝牙输出状态
@@ -111,8 +115,8 @@ CoreS3 承担耳机仓侧的感知、判断与决策；Mac 承担本次 Demo 的
 {"type":"earbud_command","schema":2,"sequence":42,"timestamp_ms":6300,"external_voice_gain_db":3.20,"media_percent":100,"state":"ADJUSTING","environment":"VOICE","mode":"EXTERNAL_VOICE_INTENT","conversation":"LIKELY","confidence":0.92,"execution":"decision_only","link":"simulated","eq_gain_db":[0.0,...,0.0],"ambient_band_dbfs":[-52.1,...,-61.0]}
 ```
 
-没有 Mac 执行回执前，`execution` 必须保持 `decision_only`。现实人声模式下 `eq_gain_db` 必须平直；
-否则就是把现实人声增强错误替换成歌曲中频增强。
+没有 Mac 执行回执前，`execution` 必须保持 `decision_only`。现实人声模式允许歌曲 EQ 同时工作；
+歌曲 EQ 与现实人声增益必须分开表示，不能用歌曲中频增强冒充现实人声增强。
 
 `eq_gain_db` 是 S3 给 Mac 的歌曲 EQ 建议，`ambient_band_dbfs` 是 S3 实测环境谱；Mac 还要结合
 EQ 前的歌曲内容生成最终处方。`external_voice_gain_db` 是现实人声增益意图，不代表 AirPods 已执行。
@@ -321,7 +325,7 @@ sh tools/host_up.sh --replay 记录/x.log --speed 4    # 回放历史日志
 | 设备侧打包 + USB | 约 20 ms + 未单独测 | 固件 320 点一块（设备自报 `decimated/chunks = 320.1`） |
 | 丢弃 | **0 ms / 50 秒**；启动排空 0 ms | `dropped_ms` / `drained_ms` |
 
-**这个 211–231 ms 是这条拓扑的物理下限，不是调参调出来的**：其中 170.7 ms 是蓝牙输出，
+**这个 211–231 ms 是当时配置下播放端排队与驱动侧输出的合计估计，不是完整声学端到端延迟或不可改变的物理下限**：其中 170.7 ms 是蓝牙输出，
 `relaysink` 只占 40–60 ms，设备侧 20 ms。要更小只能换拓扑（见 D2：混合必须发生在出声的那台
 设备上）。面板上这一格同时写着"不含设备侧打包与 USB"，不许把它当成整条链路的全部。
 
