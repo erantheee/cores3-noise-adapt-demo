@@ -121,6 +121,7 @@ AirPods Pro 播放最终输出；分别验证歌曲 EQ、现实人声增益意�
 | 70 | **WavLM 声纹门控接入上位机（D29→D31）** | ✅ **已接 S3 self-veto（HEAD）；实验性、默认关闭** | `--voiceprint` 启用 worker（WavLM-SV 512d，1.5 s 窗，约 45–90 ms/窗）；判定经串口回传 S3（`voiceprint self` / `other` / `pending`）。self → 设备不压/不抬/不开环境声；other → 按 D16。2026-10-21 修复：判定 3 s 无新行自动过期、host 退出/串口关闭发 `voiceprint off`、固件遥测补齐（D31）。`--voiceprint` 仍默认不开，未过验收。 |
 | 71 | **环境声执行端默认关闭（D30）** | ✅ **默认 off（D30/D31 后仍不变）** | `host_up.sh` 真机默认 `--ambient-executor off`，要环境声必须显式 relay/airpods；上位机/播放器/声纹遥测照常。self/other 已接进 S3（D31），但门控仍是实验性、未过验收，所以默认保持 off。 |
 | 72 | **2026-10-21 收尾（本轮）** | ✅ **文档与仓库卫生同步** | 声纹 self-veto（3 s 过期、host clear、遥测 `voiceprint_valid` / `voiceprint_self` / `voiceprint_age_ms`）；回控回执只在新的 capture 事件时 acknowledged；`/api/stop` 先清理（含 `ambient.stop`）再退出；README 全量同步、`.gitignore` 音频策略、根 `LICENSE`（MIT）、`TODOS.md` 承接本轮未做的 P2。固件侧 P2（no_data / EQ 平滑 / 忙等）不在本轮。 |
+| 73 | **声纹 self-veto 真机复测（2026-10-21）** | ✅ **通过** | 固件为 CI artifact `cores3_noise_adapt_demo.bin` SHA256 `0b1a72…`（842,272 B，由收尾 HEAD 构建）。串口实测：`voiceprint pending` 后对话不锁（仍 `LIKELY`）；`voiceprint self 0.93` 后 `conversation=NONE`、`media≈100`、`ambient_open=false`；`voiceprint other 0.10` 恢复 `LIKELY`/60/true；`voiceprint off` 后 `voiceprint_age_ms=-1`；不再有新判定 3 s 后 `voiceprint_valid=false` 且对话恢复。每帧均带 `voiceprint_valid/self/age_ms` 三键。|
 
 
 **断言计数（2026-10-21 定稿实测）**：主机 C++ 单测 **11 套件合计 365 条**
