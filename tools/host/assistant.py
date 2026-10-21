@@ -125,6 +125,14 @@ class AssistantService:
         self._decision_number = 0
         #: 已显示过的最新片段号：并发的 ASR 请求完成顺序可能乱序，旧片段不能覆盖新转写。
         self._transcript_number = 0
+        #: 已显示过的最新摘要片段号：LLM 并发返回时旧摘要不能覆盖新摘要。
+        self._summary_number = 0
+        #: 环境声授权的"对话轮次"起点。6 s 滚动分段**不**推进它——否则每 6 s 就有
+        #: 一个旧判定被判过期，执行端会开一下关一下。只有静音后真正开始新一轮对话才推进。
+        self._authorization_epoch_started_at: float | None = None
+        #: 判定与轮次绑定：stamp 在片段派发时，旧轮次/旧录音的判定不能给新轮次授权。
+        self._authorization_epoch_id = 0
+        self._new_episode_pending = True
 
     @property
     def configured(self) -> bool:
@@ -215,7 +223,7 @@ class AssistantService:
                         launch = (
                             event["number"], event["seconds"], event["chunks"],
                             event["chunks_lost"], event["telemetry"], attributed,
-                            ordered,
+                            ordered, event.get("epoch_id", 0),
                         )
                         del self._pending_events[event_id]
                 if launch is not None and any(text for _, text in launch[6]):
@@ -227,38 +235,76 @@ class AssistantService:
                     else:
                         # 有转写但没有 LLM：不能伪造语义判定；环境声授权走"未配置"回退。
                         number = int(launch[0])
+                        self._set_summary(
+                            number,
+                            self._local_summary({
+                                "session": number, "audio_seconds": launch[1],
+                                "chunks_lost": launch[3], "transcript": launch[5],
+                                "speaker_turns": launch[6],
+                                "s3_ambient_open_intent_frames": 0,
+                            })
+                            + "\nLLM 未配置，无法给出语义判定；环境声按回退门控处理。",
+                        )
                         with self._lock:
-                            self._summary = (
-                                self._local_summary({
-                                    "session": number, "audio_seconds": launch[1],
-                                    "chunks_lost": launch[3], "transcript": launch[5],
-                                    "speaker_turns": launch[6],
-                                    "s3_ambient_open_intent_frames": 0,
-                                })
-                                + "\nLLM 未配置，无法给出语义判定；环境声按回退门控处理。"
-                            )
                             self._task = "等待下一段 S3 候选人声"
                         self._publish_decision(
                             number, "unclear", "close", 0.0,
                             "LLM 未配置，无法做语义判定", "local",
+                            epoch_id=int(launch[7]),
                         )
                 elif launch is not None:
                     # ASR 没有任何有效语音：不浪费一次 LLM 调用，直接判非对话并关环境声。
                     number = int(launch[0])
+                    self._set_summary(
+                        number,
+                        "判定：非对话 · 环境声：关闭 · 置信度 0.90\n"
+                        "依据：ASR 未得到有效语音（噪声/重复幻觉已丢弃）",
+                    )
                     with self._lock:
-                        self._summary = (
-                            "判定：非对话 · 环境声：关闭 · 置信度 0.90\n"
-                            "依据：ASR 未得到有效语音（噪声/重复幻觉已丢弃）"
-                        )
                         self._task = "等待下一段 S3 候选人声"
                     self._publish_decision(
                         number, "no", "close", 0.9,
                         "ASR 未得到有效语音（噪声/重复幻觉已丢弃）", "local",
+                        epoch_id=int(launch[7]),
                     )
             elif kind == "error":
                 with self._lock:
                     self._asr_error = str(message.get("error") or "ASR worker 错误")
                     self._asr_ready = False
+        # stdout 关闭 = worker 退出/崩溃。必须显式把"未就绪"写回状态并关闭未完成的
+        # 事件，否则面板会永远停在"Qwen ASR 正在逐轮转写"。
+        with self._lock:
+            self._asr_ready = False
+            if not self._asr_error:
+                self._asr_error = "ASR worker 已退出"
+            abandoned = [dict(event) for event in self._pending_events.values()]
+            self._pending_events.clear()
+            self._pending.clear()
+        for event in abandoned:
+            self._publish_decision(
+                int(event.get("number", 0)), "unclear", "close", 0.0,
+                "ASR worker 已退出，无法完成本段转写", "local",
+                epoch_id=int(event.get("epoch_id", self._authorization_epoch_id)),
+            )
+        # 即使没有未完成事件，也要作废已经发布的 yes：worker 死了就不该继续执行
+        # 上一段的授权（面板上 task 写着"保持关闭"，授权却还是 allowed 是自相矛盾）。
+        with self._lock:
+            epoch_id = self._authorization_epoch_id
+            number = max(self._decision_number, self._today_sessions)
+        self._publish_decision(
+            number, "unclear", "close", 0.0,
+            "ASR worker 已退出，环境声授权失效", "local", epoch_id=epoch_id,
+        )
+        with self._lock:
+            self._task = "ASR worker 已退出；本轮不转写，环境声保持关闭"
+
+    def _set_summary(self, number: int, text: str) -> None:
+        """摘要也按片段号排序：并发的 LLM 请求旧响应不能覆盖新响应。"""
+        with self._lock:
+            if number < self._summary_number:
+                return
+            self._summary_number = number
+            self._summary = text
 
     def _probe(self) -> None:
         payload = json.dumps({
@@ -293,6 +339,9 @@ class AssistantService:
 
     def recording_started(self, rate: int, seconds: int | None = None) -> None:
         with self._lock:
+            # 连续中继在启动时会调用两次（主机登记 + 设备 capture started），
+            # 第二次不能把已经开始的对话轮次/判定清掉。
+            new_session = not (self._recording and self._continuous_stream and not seconds)
             self._recording = True
             self._capture_started_wall = datetime.now().astimezone().strftime("%H:%M:%S")
             self._continuous_stream = not seconds
@@ -301,6 +350,13 @@ class AssistantService:
             self._session_start_sample = 0
             self._preroll.clear()
             self._session_audio = bytearray()
+            if new_session:
+                # 新一轮采集：任何旧判定（含上一次定时录音）都失效。
+                self._authorization_epoch_id += 1
+                self._decision = None
+                self._decision_number = 0
+            self._authorization_epoch_started_at = None
+            self._new_episode_pending = True
             if self._continuous_stream:
                 self._task = f"正在监听 S3 候选人声 · {rate} Hz"
                 self._transcript = "音频流已连接；等待候选人声片段"
@@ -343,6 +399,23 @@ class AssistantService:
             if self._continuous_stream and has_conversation and not self._conversation_active:
                 self._conversation_active = True
                 self._conversation_started_at = now
+                # 滚动分段（达到 6 s 上限）不是新一轮对话；只有静音后重新开口才推进
+                # 环境声授权轮次，避免旧判定被每 6 s 判一次过期。达到上限后
+                # `_conversation_active` 为 False 时不会走下面的静音分支，所以这里同时
+                # 用"距上一帧对话证据的间隔 >=3 s"识别真正的重新开始。
+                gap_since_last = (
+                    now - self._last_conversation_at
+                    if self._last_conversation_at is not None else None
+                )
+                new_episode = bool(
+                    self._new_episode_pending
+                    or self._authorization_epoch_started_at is None
+                    or (gap_since_last is not None and gap_since_last >= 3.0)
+                )
+                if new_episode:
+                    self._authorization_epoch_id += 1
+                    self._authorization_epoch_started_at = now
+                    self._new_episode_pending = False
                 self._conversation_started_wall = datetime.now().astimezone().strftime("%H:%M:%S")
                 self._last_conversation_at = now
                 self._telemetry = []
@@ -375,6 +448,9 @@ class AssistantService:
             reached_segment_limit = segment_duration >= self._MAX_CONTINUOUS_SEGMENT_S
             if self._continuous_stream and (ended_by_silence or reached_segment_limit):
                 self._conversation_active = False
+                if ended_by_silence:
+                    # 真正的对话结束：下一段重新开口时推进授权轮次。
+                    self._new_episode_pending = True
                 self._today_sessions += 1
                 number = self._today_sessions
                 duration = segment_duration
@@ -401,7 +477,7 @@ class AssistantService:
                     "asr_note": "",
                 })
                 launch = (number, duration, len(telemetry), 0, telemetry, audio,
-                          self._audio_rate, start_sample)
+                          self._audio_rate, start_sample, self._authorization_epoch_id)
         if launch is not None:
             self._spawn_dispatch(*launch)
 
@@ -432,7 +508,8 @@ class AssistantService:
                 "asr_note": "",
             })
         self._spawn_dispatch(session_number, audio_seconds, chunks, chunks_lost,
-                             telemetry, audio, self._audio_rate, start_sample)
+                             telemetry, audio, self._audio_rate, start_sample,
+                             self._authorization_epoch_id)
 
     # ------------------------------------------------------------------ 分段→ASR
 
@@ -448,6 +525,7 @@ class AssistantService:
             self._dispatch_event(*args)
         except Exception as exc:  # noqa: BLE001 - 后台线程必须把失败交回状态
             number = int(args[0]) if args else 0
+            epoch_id = int(args[-1]) if args and isinstance(args[-1], int) else None
             message = f"候选段分析失败：{str(exc)[:120]}"
             with self._lock:
                 if number >= self._transcript_number:
@@ -455,11 +533,20 @@ class AssistantService:
                     self._transcript = message
                 self._task = "等待下一段 S3 候选人声"
                 self._summary = f"判定：不确定 · 环境声：关闭 · 置信度 0.0\n依据：{message}"
-            self._publish_decision(number, "unclear", "close", 0.0, message, "local")
+            self._publish_decision(
+                number, "unclear", "close", 0.0, message, "local", epoch_id=epoch_id
+            )
 
     def _dispatch_event(self, number: int, seconds: float, chunks: int,
                         chunks_lost: int, telemetry: list[dict[str, object]],
-                        audio: bytes, rate: int, start_sample: int = 0) -> None:
+                        audio: bytes, rate: int, start_sample: int = 0,
+                        epoch_id: int | None = None) -> None:
+        if epoch_id is None:
+            # 直接调用（单测/老路径）没有传轮次号：用当前值。
+            with self._lock:
+                epoch_id = self._authorization_epoch_id
+        else:
+            epoch_id = int(epoch_id)
         regions, speech_s, evidence = self._select_speech_regions(
             audio, rate, telemetry, start_sample
         )
@@ -478,14 +565,18 @@ class AssistantService:
                     self._transcript_number = number
                     self._transcript = f"第 {number} 段未检测到有效人声，已跳过转写"
                 self._task = "等待下一段 S3 候选人声"
-                self._summary = f"判定：非对话 · 环境声：关闭 · 置信度 0.90\n依据：{reason}"
                 for item in self._segment_history:
                     if item.get("number") == number:
                         item["transcript"] = "未检测到有效人声（跳过 ASR）"
                         item["asr_note"] = evidence
                         item["speaker"] = "未检测到人声"
                         break
-            self._publish_decision(number, "no", "close", 0.9, reason, "local")
+            self._set_summary(
+                number, f"判定：非对话 · 环境声：关闭 · 置信度 0.90\n依据：{reason}"
+            )
+            self._publish_decision(
+                number, "no", "close", 0.9, reason, "local", epoch_id=epoch_id
+            )
             return
 
         trimmed, trim_start = self._trim_to_speech(audio, rate, regions)
@@ -496,7 +587,8 @@ class AssistantService:
                     self._transcript = f"第 {number} 段语音证据不足，已跳过转写"
                 self._task = "等待下一段 S3 候选人声"
             self._publish_decision(
-                number, "no", "close", 0.8, "语音证据不足，跳过 ASR", "local"
+                number, "no", "close", 0.8, "语音证据不足，跳过 ASR", "local",
+                epoch_id=epoch_id,
             )
             return
 
@@ -507,19 +599,24 @@ class AssistantService:
                 if number >= self._transcript_number:
                     self._transcript_number = number
                     self._transcript = f"ASR 不可用，第 {number} 段未转写"
-                self._summary = f"判定：不确定 · 环境声：关闭 · 置信度 0.0\n依据：{warning}"
                 self._task = "等待 ASR 就绪"
                 for item in self._segment_history:
                     if item.get("number") == number:
                         item["transcript"] = f"ASR 不可用：{warning}"
                         break
+            self._set_summary(
+                number, f"判定：不确定 · 环境声：关闭 · 置信度 0.0\n依据：{warning}"
+            )
             self._publish_decision(
                 number, "unclear", "close", 0.0,
                 f"ASR 未就绪（{warning}），无法获得语义判定", "local",
+                epoch_id=epoch_id,
             )
             return
 
-        segments = self._speaker_segments(trimmed, rate, trim_start)
+        # trim_start 是相对本段音频的偏移；声纹窗口用的是绝对流样本号。
+        # 连续中继里 start_sample 几乎总 >0，漏加它会让所有轮次都归 unknown。
+        segments = self._speaker_segments(trimmed, rate, start_sample + trim_start)
         labels = sorted({speaker for speaker, _ in segments})
         with self._lock:
             for item in self._segment_history:
@@ -532,6 +629,7 @@ class AssistantService:
                 "number": number, "seconds": seconds, "chunks": chunks,
                 "chunks_lost": chunks_lost, "telemetry": telemetry,
                 "remaining": len(segments), "results": {}, "asr_notes": [],
+                "epoch_id": epoch_id,
             }
             self._task = f"Qwen ASR 正在逐轮转写第 {number} 段候选人声"
             self._transcript = "正在本地转写并对齐 self / other / unknown…"
@@ -568,6 +666,7 @@ class AssistantService:
             self._publish_decision(
                 number, "unclear", "close", 0.0,
                 f"ASR worker 写入失败：{exc}", "local",
+                epoch_id=epoch_id,
             )
 
     @classmethod
@@ -777,7 +876,9 @@ class AssistantService:
         collapsed, replaced = loop.subn(lambda match: match.group(1), cleaned)
         collapsed = re.sub(r"(.)\1{3,}", r"\1\1", collapsed)
         removed = base - _cjk_len(collapsed)
-        if removed / max(base, 1) > 0.5:
+        # 长时间片段里的重复循环基本是模型幻觉（噪声/静音）。但很短的强调式重复
+        # （"好的好的好的"）是正常口语：只折叠、不整段丢弃。
+        if removed / max(base, 1) > 0.5 and duration_s >= 3.0:
             return "", "重复幻觉已丢弃"
         effective = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", collapsed)
         if not effective:
@@ -802,9 +903,17 @@ class AssistantService:
     # ------------------------------------------------------------------ 判定
 
     def _publish_decision(self, number: int, dialogue: str, ambient: str,
-                          confidence: float, reason: str, source: str) -> None:
-        """发布环境声授权判定。旧片段的判定不能覆盖新片段（LLM 可能乱序返回）。"""
+                          confidence: float, reason: str, source: str,
+                          epoch_id: int | None = None) -> None:
+        """发布环境声授权判定。
+
+        * 旧片段的判定不能覆盖新片段（LLM 并发请求可能乱序返回）；
+        * 判定绑定派发时的对话轮次 `epoch_id`：上一轮对话/上一次录音的 LLM 后来才回来，
+          也不能给当前轮次授权。
+        """
         with self._lock:
+            if epoch_id is not None and int(epoch_id) != self._authorization_epoch_id:
+                return
             if number < self._decision_number:
                 return
             self._decision_number = max(self._decision_number, number)
@@ -815,6 +924,7 @@ class AssistantService:
                 "confidence": round(max(0.0, min(1.0, float(confidence))), 2),
                 "reason": str(reason or "")[:160],
                 "source": source if source in ("llm", "local") else "local",
+                "epoch_id": self._authorization_epoch_id if epoch_id is None else int(epoch_id),
                 "at": time.monotonic(),
             }
             self._task = "等待下一段 S3 候选人声"
@@ -866,15 +976,15 @@ class AssistantService:
             "source": decision.get("source"),
             "number": decision.get("number"),
         })
-        # 新的一轮对话开始后，上一轮判定不能给这一轮当授权（否则电视/旁人一句就把
-        # 耳边打开）。等这一段自己的判定回来再放行。
+        # 判定与对话轮次/录音会话绑定：旧轮次的判定后来才返回也不能授权当前轮次
+        # （否则电视/旁人一句就把耳边打开）。这比"比较发布时间"可靠：旧片段晚归
+        # 时发布时间反而更晚。
         with self._lock:
-            episode_started = self._conversation_started_at
-            continuous = self._continuous_stream
-        if continuous and episode_started is not None and float(decision["at"]) < episode_started:
+            current_epoch = self._authorization_epoch_id
+        if int(decision.get("epoch_id", -1)) != current_epoch:
             return {
                 **base, "allow": False, "state": "stale",
-                "reason": "当前对话轮次开始于该判定之后，等待本段 ASR/LLM 判定",
+                "reason": "判定属于上一轮对话/上一次录音，等待本轮 ASR/LLM 判定",
             }
         if age > self._DECISION_TTL_S:
             return {
@@ -948,7 +1058,8 @@ class AssistantService:
     def _summarize_event(self, number: int, seconds: float, chunks: int,
                          chunks_lost: int, telemetry: list[dict[str, object]],
                          transcript: str = "",
-                         speaker_turns: list[tuple[str, str]] | None = None) -> None:
+                         speaker_turns: list[tuple[str, str]] | None = None,
+                         epoch_id: int = 0) -> None:
         if not self.configured:
             return
         conversations: dict[str, int] = {}
@@ -1021,23 +1132,27 @@ class AssistantService:
             if parsed is None:
                 raise RuntimeError(f"模型未按 JSON 协议判定：{raw[:80]}")
             decision = {**parsed, "source": "llm"}
+            self._set_summary(number, self._format_decision(decision))
             with self._lock:
-                self._summary = self._format_decision(decision)
                 self._llm_warning = ""
             self._publish_decision(
                 number, str(parsed["dialogue"]), str(parsed["ambient"]),
                 float(parsed["confidence"]), str(parsed["reason"]), "llm",
+                epoch_id=epoch_id,
             )
         except (OSError, ValueError, RuntimeError, urllib.error.HTTPError) as exc:
+            # ASR 与事件账本已经成功，LLM 拒答/超时不应把整段显示为没转写；
+            # 但环境声授权必须 fail-closed：LLM 没给明确判定就不开放。
+            self._set_summary(
+                number, fallback + f"\nLLM 未给出可解析判定，环境声保持关闭：{exc}"
+            )
             with self._lock:
-                # ASR 与事件账本已经成功，LLM 拒答/超时不应把整段显示为没转写；
-                # 但环境声授权必须 fail-closed：LLM 没给明确判定就不开放。
-                self._summary = fallback + f"\nLLM 未给出可解析判定，环境声保持关闭：{exc}"
                 self._llm_warning = f"LLM 判定失败，已回退本地摘要：{exc}"
                 self._task = "等待下一段 S3 候选人声"
             self._publish_decision(
                 number, "unclear", "close", 0.0,
                 f"LLM 未给出可解析判定：{str(exc)[:80]}", "local",
+                epoch_id=epoch_id,
             )
 
     @staticmethod
@@ -1081,13 +1196,14 @@ class AssistantService:
             )
             segments = [dict(item) for item in self._segment_history]
             decision = dict(self._decision) if self._decision is not None else None
+            # 同一把 RLock 内计算授权，避免界面把 decision #N 和 #N+1 的授权拼在一起。
+            authorization = self.ambient_authorization()
         texts = {
             "not_configured": "未配置",
             "checking": f"正在连接 · {self.model}",
             "ready": f"已连接 · {self.model}",
             "error": "连接失败",
         }
-        authorization = self.ambient_authorization()
         decision_snapshot = None
         if decision is not None:
             age = max(0.0, time.monotonic() - float(decision["at"]))

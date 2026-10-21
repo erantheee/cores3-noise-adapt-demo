@@ -2263,6 +2263,9 @@ def test_assistant_filters_asr_noise_hallucinations() -> None:
     check("今晚" in kept, "正常转写不能被过滤")
     kept, _ = service._filter_asr_text("对对对，好的。", 2.0)
     check("好的" in kept, "正常口语重复不能整段丢弃")
+    short_repeat, note = service._filter_asr_text("好的好的好的。", 1.2)
+    check("好的" in short_repeat and "已折叠" in note,
+          "短句强调式重复应折叠保留，不能按噪声丢弃")
     folded, note = service._filter_asr_text(
         "不会被patched，until tomorrow。", 3.0
     )
@@ -2336,13 +2339,52 @@ def test_assistant_llm_decision_authorizes_ambient() -> None:
     episode_service.model = "test-model"
     episode_service._publish_decision(10, "yes", "open", 0.9, "上一轮对话", "llm")
     episode_service._continuous_stream = True
-    episode_service._conversation_started_at = float(episode_service._decision["at"]) + 1.0
+    episode_service._authorization_epoch_id = 1
     episode = episode_service.ambient_authorization()
     check(not episode["allow"] and episode["state"] == "stale",
           "新对话轮次必须等待自己的判定，不能沿用上一轮授权")
-    episode_service._conversation_started_at = float(episode_service._decision["at"]) - 1.0
+    episode_service._authorization_epoch_id = 0
     check(episode_service.ambient_authorization()["allow"],
           "同一轮对话内的新鲜判定必须继续授权")
+
+    # 6 s 滚动分段不推进轮次：上一段的授权在下一段判定回来前仍然有效。
+    rolling = AssistantService()
+    rolling.base_url = "http://127.0.0.1:9"
+    rolling.api_key = "test"
+    rolling.model = "test-model"
+    rolling.recording_started(16000, 0)
+    rolling._publish_decision(3, "yes", "open", 0.9, "滚动对话仍在继续", "llm")
+    check(rolling.ambient_authorization()["allow"],
+          "同一轮滚动分段的上一段判定必须继续授权环境声")
+
+    # 旧轮次的 LLM 晚归：发布时间比新一轮还晚，也不能授权新轮次。
+    delayed = AssistantService()
+    delayed.base_url = "http://127.0.0.1:9"
+    delayed.api_key = "test"
+    delayed.model = "test-model"
+    delayed.recording_started(16000, 0)
+    old_epoch = delayed._authorization_epoch_id - 1
+    delayed._publish_decision(
+        5, "yes", "open", 0.9, "上一轮对话晚归", "llm", epoch_id=old_epoch
+    )
+    check(delayed.snapshot()["decision"] is None,
+          "上一轮对话的判定晚归必须被丢弃，不能写入新轮次")
+    check(not delayed.ambient_authorization()["allow"],
+          "旧轮次判定晚归不得授权环境声")
+
+    # 非连续录音之间同样不能串用判定：新一次录音开始必须清掉上一段录音的 yes。
+    timed = AssistantService()
+    timed.base_url = "http://127.0.0.1:9"
+    timed.api_key = "test"
+    timed.model = "test-model"
+    timed.recording_started(16000, 5)
+    timed._publish_decision(1, "yes", "open", 0.9, "上一段定时录音", "llm")
+    check(timed.ambient_authorization()["allow"],
+          "同一次录音内的新鲜判定必须授权环境声")
+    timed.recording_started(16000, 5)
+    check(timed.snapshot()["decision"] is None, "新一次录音必须清掉上一次录音的判定")
+    check(not timed.ambient_authorization()["allow"],
+          "上一次录音的判定不得授权新一次录音")
 
     service._publish_decision(2, "no", "close", 0.8, "只有单方，且 ASR 重复", "llm")
     closed = service.ambient_authorization()
@@ -2372,6 +2414,136 @@ def test_assistant_llm_decision_authorizes_ambient() -> None:
     eq(AssistantService._asr_token_budget(6.0), 72, "6 s 语音的 ASR token 预算必须按 12 token/s 收紧")
     eq(AssistantService._asr_token_budget(30.0), AssistantService._MAX_ASR_TOKENS,
        "超长语音的 ASR token 预算必须封顶")
+
+
+def test_authorization_epoch_advances_after_rolling_cap_then_silence() -> None:
+    """6 s 上限结束后即使会话处于 inactive，静音后再开口也必须算新一轮对话。"""
+    class Frame:
+        conversation = "LIKELY"
+        environment = "VOICE"
+        ambient_open = False
+        voice_likelihood = 0.9
+        event = "speech"
+
+    service = AssistantService()
+    service.base_url = "http://127.0.0.1:9"
+    service.api_key = "test"
+    service.model = "test-model"
+    service.recording_started(16000, 0)
+    service._spawn_dispatch = lambda *args: None  # type: ignore[method-assign]
+    service.observe_frame(Frame())
+    first_epoch = service._authorization_epoch_id
+    service._publish_decision(1, "yes", "open", 0.9, "第一轮对话", "llm")
+    check(service.ambient_authorization()["allow"],
+          "第一轮对话的判定必须授权环境声")
+
+    # 达到 6 s 上限：会话转为 inactive，但轮次不变（滚动分段）。
+    service._conversation_started_at = time.monotonic() - service._MAX_CONTINUOUS_SEGMENT_S
+    service.observe_frame(Frame())
+    eq(service._authorization_epoch_id, first_epoch,
+       "达到 6 s 上限的滚动分段不得推进授权轮次")
+    service.observe_frame(type("Silent", (), {"conversation": "NONE"})())
+    eq(service._authorization_epoch_id, first_epoch,
+       "滚动分段结束后的静音帧不得推进授权轮次")
+
+    # 静音 4 s 后重新开口：必须推进轮次，上一轮 yes 立即失效。
+    service._last_conversation_at = time.monotonic() - 4.0
+    service.observe_frame(Frame())
+    eq(service._authorization_epoch_id, first_epoch + 1,
+       "静音后重新开口必须推进授权轮次")
+    check(not service.ambient_authorization()["allow"],
+          "上一轮对话的 yes 不得授权静音后的新一轮对话")
+
+
+def test_assistant_rejects_stale_summary_and_fails_closed_on_asr_death() -> None:
+    # 并发 LLM 请求乱序返回：旧摘要不能覆盖新摘要。
+    service = AssistantService()
+    service._set_summary(3, "第三段摘要")
+    service._set_summary(2, "第二段旧摘要")
+    eq(service.snapshot()["summary_state"], "第三段摘要",
+       "旧片段摘要不得覆盖新片段摘要")
+
+    # ASR worker 的 stdout 关闭（崩溃/被杀）：必须把未完成事件关掉并 fail-closed，
+    # 不能永远停在"正在转写"。
+    class FakeProcess:
+        stdout = iter(())
+
+    dying = AssistantService()
+    dying.base_url = "http://127.0.0.1:9"
+    dying.api_key = "test"
+    dying.model = "test-model"
+    dying._asr_ready = True
+    dying._asr_process = FakeProcess()  # type: ignore[assignment]
+    dying._read_asr()
+    snapshot = dying.snapshot()
+    check(not snapshot["asr_ready"], "ASR worker 退出后必须标记为未就绪")
+    check("已退出" in snapshot["task"], "ASR worker 退出必须反映在任务状态里")
+    check("已退出" in (snapshot["decision"] or {}).get("reason", ""),
+          "ASR worker 退出时必须给出失败判定")
+    check(not snapshot["ambient_authorization"]["allow"],
+          "ASR worker 退出后环境声必须保持关闭")
+
+    # 没有 pending 事件、但已经发布过 yes：worker 死亡也必须立刻作废授权。
+    published = AssistantService()
+    published.base_url = "http://127.0.0.1:9"
+    published.api_key = "test"
+    published.model = "test-model"
+    published._publish_decision(2, "yes", "open", 0.9, "刚判为对话", "llm")
+    check(published.ambient_authorization()["allow"], "前置条件：yes 已授权")
+    published._asr_ready = True
+    published._asr_process = FakeProcess()  # type: ignore[assignment]
+    published._read_asr()
+    check(not published.ambient_authorization()["allow"],
+          "ASR worker 死亡必须作废已经发布的 yes 授权")
+    check("已退出" in published.snapshot()["task"], "作废后任务状态必须说明原因")
+
+
+def test_assistant_uses_absolute_sample_offset_for_speakers() -> None:
+    """裁剪后的 ASR 片段仍要按**绝对**流样本号对齐声纹窗口（连续中继 start_sample>0）。"""
+    absolute_start = 100_000
+    # 裁剪后的片段绝对起点 108000，长 1.6 s；声纹窗口前 0.8 s self、后 0.8 s other。
+    trimmed_start = absolute_start + 8000
+    voiceprint = AssistantService(voiceprint_snapshot=lambda: {
+        "ready": True,
+        "history": [
+            {"verdict": "self", "start_sample": trimmed_start,
+             "end_sample": trimmed_start + 12800},
+            {"verdict": "other", "start_sample": trimmed_start + 12800,
+             "end_sample": trimmed_start + 25600},
+        ],
+    })
+    pcm = b"\0\0" * 25600
+    segments = voiceprint._speaker_segments(pcm, 16000, trimmed_start)
+    eq([speaker for speaker, _ in segments], ["self", "other"],
+       "裁剪后必须用绝对样本偏移切分 self/other，而不是相对偏移")
+
+    # 调用点回归：_dispatch_event 传给 _speaker_segments 的必须是 start_sample+trim_start。
+    captured: dict[str, int] = {}
+
+    class FakeStdin:
+        def write(self, data: str) -> None:
+            pass
+
+        def flush(self) -> None:
+            pass
+
+    class FakeProcess:
+        stdin = FakeStdin()
+
+    service = AssistantService()
+    service._asr_ready = True
+    service._asr_process = FakeProcess()  # type: ignore[assignment]
+    service._select_speech_regions = lambda *args: ([(16000, 32000)], 1.0, "test")  # type: ignore[method-assign]
+    service._trim_to_speech = lambda pcm, rate, regions: (pcm, 1234)  # type: ignore[method-assign]
+
+    def capture_segments(audio, rate, start):
+        captured["start"] = int(start)
+        return [("unknown", audio)]
+
+    service._speaker_segments = capture_segments  # type: ignore[method-assign]
+    service._dispatch_event(7, 1.0, 1, 0, [], b"\0\0" * 32000, 16000, 100_000)
+    eq(captured.get("start"), 100_000 + 1234,
+       "ASR 轮次必须按绝对样本号切分（start_sample + trim_start）")
 
 
 def test_llm_ambient_authority_helpers() -> None:
@@ -2479,6 +2651,9 @@ def main() -> int:
         test_assistant_filters_asr_noise_hallucinations,
         test_assistant_gates_asr_on_speech_evidence,
         test_assistant_llm_decision_authorizes_ambient,
+        test_assistant_uses_absolute_sample_offset_for_speakers,
+        test_authorization_epoch_advances_after_rolling_cap_then_silence,
+        test_assistant_rejects_stale_summary_and_fails_closed_on_asr_death,
         test_llm_ambient_authority_helpers,
         test_ambient_requires_fresh_other_voiceprint,
     ]

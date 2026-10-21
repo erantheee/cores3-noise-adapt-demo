@@ -66,8 +66,10 @@ CoreS3 承担耳机仓侧的感知、判断与决策；Mac 承担本次 Demo 的
   静音从"重复 6 次"变成一句话。
 - **LLM 授权环境声（D32）**：每个候选段让 LLM 输出一行结构化判定
   `{"dialogue":"yes|no|unclear","ambient":"open|close",...}`；执行端只在**设备意图 ∧ 新鲜
-  dialogue=yes ∧ 判定未过期（20 s）** 时打开环境声，其余一律 fail-closed。LLM 未配置时回退
-  设备意图/声纹门控；WavLM 声纹降级为"新鲜 self 可否决"，`unknown` 不再把功能锁死。
+  dialogue=yes ∧ 判定未过期（20 s）∧ 判定属于当前对话轮次** 时打开环境声，其余一律
+  fail-closed。6 s 滚动分段不推进轮次（静音 ≥3 s 后重新开口才算新一轮）；上一轮/上一次
+  录音的 LLM 晚归、以及 ASR worker 退出，都会立即失效。LLM 未配置时回退设备意图/声纹门控；
+  WavLM 声纹降级为"新鲜 self 可否决"，`unknown` 不再把功能锁死。
 - **分段 15 s → 6 s**：判定能在对话进行中回来（ASR ~1 s + LLM 3–7 s）；面板把
   **S3 意图 / LLM 判定 / 环境声授权 / 执行端状态** 分成四行显示。
 
@@ -349,7 +351,7 @@ CI 里这一步跑在固件构建**之前**（[`.github/workflows/build.yml`](.g
 上位机（`tools/host/`）另有一套自己的自测，同样是纯 Python、秒级、不需要设备：
 
 ```bash
-python3 tools/host/tests/test_host.py            # 65 组、7688 条断言（连跑 3 次稳定）
+python3 tools/host/tests/test_host.py            # 68 组、7710 条断言（连跑 3 次稳定）
 node tools/host/tests/render_check.js <快照.json> # 可选：用 DOM 桩真跑一遍界面渲染（49 条通过、0 条失败，条数随快照内容略变）
 ```
 
@@ -610,7 +612,7 @@ Mac 的 `applied` / `idle` / `silent` / `bypass` / `unavailable`（有证据：
 ### 上位机自测
 
 ```bash
-python3 tools/host/tests/test_host.py      # 65 组、7688 条断言，不需要设备、不需要串口
+python3 tools/host/tests/test_host.py      # 68 组、7710 条断言，不需要设备、不需要串口
 node tools/host/tests/render_check.js <快照.json>   # 用 DOM 桩真跑一遍 render()：49 条通过、0 条失败（条数随快照内容略变）
 ```
 
