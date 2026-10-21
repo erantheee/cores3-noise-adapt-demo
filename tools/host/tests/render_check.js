@@ -279,8 +279,11 @@ check(htmlOf("events").length > 0, "事件列表已渲染");
 // **正确行为**，不是没渲染。读错属性会让这条断言假失败。
 const raw = text("raw");
 check(raw.length > 0, "原始输出区已渲染");
-check(raw === "—" || raw.includes("{") || raw.includes("I ("),
-      `原始输出内容是行或占位符（实得 ${JSON.stringify(raw.slice(0, 40))}）`);
+// 不再只认 JSON 行：设备也会回非协议文本（例如 `voiceprint ack pending 0.24`）。
+// 断言改成"原样显示快照里的 raw_tail"，既覆盖 JSON 也覆盖真实设备回执。
+const expectedRaw = (snapshot.raw_tail || []).join("\n") || "—";
+check(raw === expectedRaw,
+      `原始输出区必须原样显示 raw_tail（实得 ${JSON.stringify(raw.slice(0, 40))}）`);
 check(text("capture-text") === snapshot.capture.text, "录音状态文案");
 
 // 丢帧必须在界面上留下可见痕迹：告警文字 + 趋势图上的竖线逻辑（后者由代码审查覆盖）。

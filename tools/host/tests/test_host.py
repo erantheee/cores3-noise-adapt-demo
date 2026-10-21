@@ -63,7 +63,12 @@ from host.state import (  # noqa: E402
 )
 from host.ambient import AmbientError, AmbientService, RelayAmbient  # noqa: E402
 from host.assistant import AssistantService  # noqa: E402
-from host.__main__ import DialogueTurnGate, voiceprint_allows_ambient  # noqa: E402
+from host.__main__ import (  # noqa: E402
+    DialogueTurnGate,
+    fresh_self_veto,
+    llm_ambient_authorization,
+    voiceprint_allows_ambient,
+)
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "device_real.log"
 
@@ -85,6 +90,16 @@ def eq(actual, expected, label: str) -> None:
 
 def close(actual: float, expected: float, label: str, tolerance: float = 1e-9) -> None:
     check(abs(actual - expected) <= tolerance, f"{label}（期望 {expected}，实得 {actual}）")
+
+
+def wait_for(predicate, timeout_s: float = 2.0) -> bool:
+    """等待后台线程（ASR 派发、LLM 判定）达到条件；单测不能靠 sleep 猜时序。"""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return bool(predicate())
 
 
 # --------------------------------------------------------------------------- 解析
@@ -1107,6 +1122,7 @@ def test_web_assets_contract() -> None:
     for element in ("chart", "latency-body", "problems", "events", "raw", "stats-body",
                     "capture-text", "btn-rec-start", "btn-rec-stop", "rec-seconds",
                     "llm-state", "llm-task", "llm-transcript", "llm-summary", "llm-sessions",
+                    "llm-decision",
                     "conn-dot", "conn-text", "source-text", "age", "gain", "media",
                     "link", "env", "state", "conf", "seq", "toast", "eq", "control-warn"):
         check(f'id="{element}"' in html, f"界面必须有 #{element}")
@@ -1131,6 +1147,9 @@ def test_web_assets_contract() -> None:
     check("设备录音（控制设备自己的麦克风）" not in html, "主界面不得再把诊断采集当成大块产品功能")
     check("S3 负责录音" in html, "界面要明确 S3 承担 recording")
     check("LLM 工作台" in html, "上位机要显示 LLM 工作状态")
+    check("对话判定 → 环境声授权" in html,
+          "界面必须把 LLM 判定、环境声授权与 S3 意图分开显示（D32）")
+    check("llm-decision" in html, "界面必须显示最近一次对话判定与环境声授权")
 
     # 界面脚本里 $("...") 引用的每个 id 都必须真的存在于 HTML 里。这条纯 Python 也能查，
     # 而且正好挡住最常见的界面故障：改了 id、忘了同步脚本，于是某一块悄悄不再更新。
@@ -2116,7 +2135,12 @@ def test_assistant_snapshot_is_truthful_without_asr() -> None:
     service.recording_finished(audio_seconds=3.2, chunks=50, chunks_lost=0)
     finished = service.snapshot()
     eq(finished["today_sessions"], 1, "S3 完成录音必须计入今日会话")
-    check("声纹窗口" in finished["transcript"], "结束事件必须先进入声纹对齐状态")
+    # 这次录音没有音频证据：后台派发线程必须尽快给出"未检测到有效人声"的真实状态，
+    # 不能停在"正在处理"骗人（旧版会把静音送进 ASR，写出噪声文字）。
+    check(
+        wait_for(lambda: "未检测到有效人声" in service.snapshot()["transcript"]),
+        "没有语音证据时必须如实显示跳过转写，不能停在处理中",
+    )
     eq(finished["segments"][0]["end_reason"], "设备录音结束", "片段必须显示停止原因")
 
     stream = AssistantService()
@@ -2163,12 +2187,13 @@ def test_assistant_rolls_continuous_speech_into_asr_segments() -> None:
     service._conversation_started_at = time.monotonic() - service._MAX_CONTINUOUS_SEGMENT_S
     service.observe_frame(Frame())
 
-    eq(len(dispatched), 1, "连续人声达到分段上限后必须提交 ASR，不能无限等待 3 秒静音")
+    check(wait_for(lambda: len(dispatched) == 1),
+          "连续人声达到分段上限后必须提交 ASR，不能无限等待 3 秒静音")
     check(dispatched[0][5], "滚动提交给 ASR 的片段必须包含实际音频")
     eq(service.snapshot()["today_sessions"], 1, "滚动提交也必须计入候选片段")
     segment = service.snapshot()["segments"][0]
     check(segment["started_at"] and segment["ended_at"], "片段必须显示明确的起止时间")
-    eq(segment["end_reason"], "达到15秒，自动分段", "持续人声必须解释自动停止原因")
+    eq(segment["end_reason"], "达到6秒，自动分段", "持续人声必须解释自动停止原因（6s 才能让判定赶上对话）")
 
 
 def test_assistant_boosts_only_quiet_asr_copy() -> None:
@@ -2214,6 +2239,179 @@ def test_ambient_requires_fresh_other_voiceprint() -> None:
           "LIKELY 保持期里的键盘声必须立即关闭")
     check(not gate.allows(own, Frame(7), now=5.0), "对话中轮到自己时仍要关闭")
     check(not gate.allows(other, Frame(8), now=20.0), "轮次证据过期后不得沿用旧对话")
+
+
+def test_assistant_filters_asr_noise_hallucinations() -> None:
+    service = AssistantService()
+    # 2026-10-21 现场截图：15 s 噪声被放大 +17 dB 后，Qwen3-ASR 吐出一整屏"就是"。
+    screenshot = "当时我们是，" + "，".join(["就是"] * 60)
+    cleaned, note = service._filter_asr_text(screenshot, 15.0)
+    eq(cleaned, "", "满屏重复的 ASR 输出必须整段丢弃，不能把噪声写成文字")
+    check("重复" in note, "丢弃原因必须可解释")
+
+    for noisy in (
+        "嗯。",                       # 只有语气词
+        "嗯。嗯。嗯。",               # 语气词循环
+        "听我儿子讲的。听我儿子讲的。听我儿子讲的。",  # 呼吸/环境音幻觉
+        "这年。这年。这年。",
+        "不会被patched，until tomorrow. 不会被patched，until tomorrow. 不会被patched，until tomorrow.",
+    ):
+        cleaned, _ = service._filter_asr_text(noisy, 15.0)
+        eq(cleaned, "", f"噪声重复幻觉必须丢弃：{noisy}")
+
+    kept, _ = service._filter_asr_text("你今晚几点到家？", 2.0)
+    check("今晚" in kept, "正常转写不能被过滤")
+    kept, _ = service._filter_asr_text("对对对，好的。", 2.0)
+    check("好的" in kept, "正常口语重复不能整段丢弃")
+    folded, note = service._filter_asr_text(
+        "不会被patched，until tomorrow。", 3.0
+    )
+    check("patched" in folded, "单次正常句子必须保留")
+
+
+def test_assistant_gates_asr_on_speech_evidence() -> None:
+    rate = 16000
+    silence = struct.pack("<16000h", *([0] * 16000))
+    regions, seconds, note = AssistantService._select_speech_regions(silence, rate, [], 0)
+    eq(regions, [], "纯静音不得产生语音区间")
+    check(seconds < AssistantService._MIN_SPEECH_S, "纯静音的证据时长必须低于 ASR 门槛")
+
+    # 0.5 s 静音 + 1 s 近场能量 + 0.2 s 静音：能量 VAD 必须找到中间那一段。
+    tone = [8000 if index % 2 else -8000 for index in range(rate)]
+    samples = [0] * int(0.5 * rate) + tone + [0] * int(0.2 * rate)
+    pcm = struct.pack(f"<{len(samples)}h", *samples)
+    regions, seconds, note = AssistantService._select_speech_regions(pcm, rate, [], 0)
+    check(seconds >= AssistantService._MIN_SPEECH_S, "近场能量必须能独立放行 ASR")
+    trimmed, start = AssistantService._trim_to_speech(pcm, rate, regions)
+    check(len(trimmed) < len(pcm), "ASR 副本必须裁掉首尾静音")
+    check(start > 0, "裁剪后必须保留原始样本偏移，声纹窗口才对得上")
+    check(len(trimmed) >= int(0.8 * rate) * 2, "裁剪不能把有效语音裁掉")
+
+    # 设备遥测的连续语音证据也要能放行（音频本身是静音，模拟串口帧先行）。
+    telemetry = [
+        {"voice_likelihood": 0.9, "event": "speech", "sample": int(rate * 0.05 * index)}
+        for index in range(30)
+    ]
+    long_silence = struct.pack("<32000h", *([0] * 32000))
+    _, device_seconds, _ = AssistantService._select_speech_regions(long_silence, rate, telemetry, 0)
+    check(device_seconds >= AssistantService._MIN_SPEECH_S, "设备连续语音证据必须能独立放行 ASR")
+
+    # 单帧尖峰 + 键盘事件不能算语音证据（LIKELY 保持期里最常见的误触发）。
+    spikes = [
+        {"voice_likelihood": 0.95, "event": "keyboard", "sample": int(rate * 0.2)},
+        {"voice_likelihood": 0.95, "event": "keyboard", "sample": int(rate * 0.4)},
+        {"voice_likelihood": 0.95, "event": "wind", "sample": int(rate * 0.6)},
+    ]
+    eq(AssistantService._telemetry_speech_regions(spikes, rate, 0, 32000), [],
+       "键盘/风的单帧尖峰不得成为 ASR 语音证据")
+
+
+def test_assistant_llm_decision_authorizes_ambient() -> None:
+    service = AssistantService()
+    # 不启动真实 LLM/ASR，只验证授权状态机；configured 只在本地置位。
+    service.base_url = "http://127.0.0.1:9"
+    service.api_key = "test"
+    service.model = "test-model"
+
+    waiting = service.ambient_authorization()
+    check(not waiting["allow"] and waiting["state"] == "waiting",
+          "没有 ASR/LLM 判定时环境声必须 fail-closed")
+
+    service._publish_decision(1, "yes", "open", 0.85, "self 与 other 有语义关联的轮流回应", "llm")
+    allowed = service.ambient_authorization()
+    check(allowed["allow"] and allowed["state"] == "allowed",
+          "新鲜 dialogue=yes/open 判定必须授权环境声")
+    check(allowed["age_s"] is not None and allowed["age_s"] <= 1.0, "授权必须带判定年龄")
+    check(allowed["verdict_text"] == "对话", "授权必须回显判定中文口径")
+
+    service._decision["at"] = time.monotonic() - service._DECISION_TTL_S - 1.0
+    stale = service.ambient_authorization()
+    check(not stale["allow"] and stale["state"] == "stale",
+          "过期的 LLM 判定不得继续授权环境声")
+
+    # 新的一轮对话开始后，上一轮判定不能给这一轮当授权。
+    episode_service = AssistantService()
+    episode_service.base_url = "http://127.0.0.1:9"
+    episode_service.api_key = "test"
+    episode_service.model = "test-model"
+    episode_service._publish_decision(10, "yes", "open", 0.9, "上一轮对话", "llm")
+    episode_service._continuous_stream = True
+    episode_service._conversation_started_at = float(episode_service._decision["at"]) + 1.0
+    episode = episode_service.ambient_authorization()
+    check(not episode["allow"] and episode["state"] == "stale",
+          "新对话轮次必须等待自己的判定，不能沿用上一轮授权")
+    episode_service._conversation_started_at = float(episode_service._decision["at"]) - 1.0
+    check(episode_service.ambient_authorization()["allow"],
+          "同一轮对话内的新鲜判定必须继续授权")
+
+    service._publish_decision(2, "no", "close", 0.8, "只有单方，且 ASR 重复", "llm")
+    closed = service.ambient_authorization()
+    check(not closed["allow"] and closed["state"] == "closed",
+          "非对话判定必须关闭环境声")
+
+    # LLM 请求是并发的：旧片段的响应可以晚到，但绝不能覆盖新片段判定。
+    service._publish_decision(1, "yes", "open", 0.99, "旧片段的乱序判定", "llm")
+    check(not service.ambient_authorization()["allow"],
+          "旧片段乱序返回的判定不得重新授权环境声")
+
+    parsed = AssistantService._parse_decision(
+        '{"dialogue":"yes","ambient":"open","confidence":0.8,"reason":"双方来回"}'
+    )
+    eq(parsed["dialogue"], "yes", "结构化 LLM 判定必须可解析")
+    eq(parsed["ambient"], "open", "结构化 LLM 判定必须保留环境声意图")
+    eq(AssistantService._parse_decision("对不起，我需要更多信息"), None,
+       "非 JSON 输出必须触发本地回退")
+    contradictory = AssistantService._parse_decision(
+        '{"dialogue":"no","ambient":"open","confidence":1.0,"reason":"单方"}'
+    )
+    eq(contradictory["ambient"], "close", "非对话判定不得携带开放环境声")
+
+    snapshot = service.snapshot()
+    check(snapshot["decision"] is not None, "最近判定必须进入快照供界面显示")
+    eq(snapshot["ambient_authorization"]["state"], "closed", "快照必须带当前环境声授权状态")
+    eq(AssistantService._asr_token_budget(6.0), 72, "6 s 语音的 ASR token 预算必须按 12 token/s 收紧")
+    eq(AssistantService._asr_token_budget(30.0), AssistantService._MAX_ASR_TOKENS,
+       "超长语音的 ASR token 预算必须封顶")
+
+
+def test_llm_ambient_authority_helpers() -> None:
+    class NoLlm:
+        configured = False
+
+        @staticmethod
+        def ambient_authorization() -> dict:
+            return {"allow": False, "state": "closed", "reason": "不应被采用"}
+
+    check(llm_ambient_authorization(NoLlm())["allow"],
+          "LLM 未配置时必须回退到设备意图/声纹门控")
+    check(llm_ambient_authorization(None)["allow"], "没有 assistant 时不得凭空关闭环境声")
+
+    class Waiting:
+        configured = True
+
+        @staticmethod
+        def ambient_authorization() -> dict:
+            return {"allow": False, "state": "waiting", "reason": "尚无判定"}
+
+    check(not llm_ambient_authorization(Waiting())["allow"],
+          "LLM 已配置但没有判定时必须 fail-closed")
+
+    class Broken:
+        configured = True
+
+    check(not llm_ambient_authorization(Broken())["allow"],
+          "授权接口缺失时必须 fail-closed")
+
+    check(fresh_self_veto({"ready": True, "verdict": "self", "age_s": 0.5}),
+          "新鲜 self 必须能否决环境声")
+    for snapshot in (
+        {"ready": True, "verdict": "other", "age_s": 0.5},
+        {"ready": True, "verdict": "self", "age_s": 3.2},
+        {"ready": False, "verdict": "self", "age_s": 0.1},
+        {"ready": True, "verdict": "self", "age_s": None},
+    ):
+        check(not fresh_self_veto(snapshot),
+              f"other/过期/未就绪都不得触发 self 否决：{snapshot}")
 
 
 def main() -> int:
@@ -2278,6 +2476,10 @@ def main() -> int:
         test_assistant_snapshot_is_truthful_without_asr,
         test_assistant_rolls_continuous_speech_into_asr_segments,
         test_assistant_boosts_only_quiet_asr_copy,
+        test_assistant_filters_asr_noise_hallucinations,
+        test_assistant_gates_asr_on_speech_evidence,
+        test_assistant_llm_decision_authorizes_ambient,
+        test_llm_ambient_authority_helpers,
         test_ambient_requires_fresh_other_voiceprint,
     ]
     for test in tests:

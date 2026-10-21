@@ -812,3 +812,76 @@ own-voice veto）；`ad77572` 已经接上这条链路，但收尾前有三类�
 **文件**：`tools/voiceprint_worker.py`、`tools/host/voiceprint.py`、`tools/host/__main__.py`、
 `main/app_main.cpp`、`main/controller.{hpp,cpp}`、`main/CMakeLists.txt`（`voiceprint_gate.cpp`
 移出固件编译）、`tools/host/state.py`、`tools/host/protocol.py`、`tools/host_up.sh`（help 文案）。
+
+## D32 · 2026-10-21 LLM 对话判定成为环境声执行授权（ASR/LLM 闭环）
+
+**背景**：现场试跑后用户反馈：LLM 工作台在做"第 N 段是否为对话"的判断，但它和环境声执行端
+看起来互不相关；同时设备 `ambient_open` 意图经常为 true，执行端却从未开过。查下来的事实：
+
+- LLM 判定只写进面板（`_summary`），`__main__` 的环境声门控完全不读它；
+- 旧门控 `DialogueTurnGate` 要求 WavLM 先给 `other`、且 12 s 内先有 `self`。现场房间噪声下
+  `voiceprint_worker` 的 `speech_ratio` 长期低于 0.35，判定几乎永远是 `unknown`
+  → 门控从未放行（本次现场 40 段候选、executor opens=0）；
+- ASR 段长为 15 s，LLM 判定回来时对话已经结束，即使接上也只能"事后开"。
+
+**决定（2026-10-21）**：
+
+1. **LLM 判定是环境声执行的授权**：`AssistantService` 对每个候选段输出一行结构化 JSON
+   `{"dialogue":"yes|no|unclear","ambient":"open|close","confidence":...,"reason":...}`；
+   `ambient_authorization()` 给出 20 s TTL 的授权。`__main__` 的环境声执行端要求
+   **S3 意图 ∧ 新鲜授权**；`unclear` / `no` / 过期 / 等待中 / LLM 失败一律关闭（fail-closed）。
+   LLM 未配置时回退旧的设备意图+声纹门控（不伪造语义判定）。
+2. **WavLM 声纹降级为 self 否决**：只有新鲜 `self` 才否决环境声；`unknown` 不再阻断整条功能。
+   `--voiceprint` 仍是实验性、默认关闭。
+3. **分段上限 15 s → 6 s**：让首次判定能在对话进行中回来（ASR 约 1 s + LLM 约 3–7 s）。
+   授权 TTL 20 s 由后续片段刷新；对话结束后 S3 意图先变为 false，执行端立即关闭。
+4. **面板分开显示四件事**：S3 意图、LLM 判定、环境声授权、执行端实际状态。禁止把
+   "S3 意图"或"LLM 授权"写成"已经开放"。
+5. **判定顺序保护**：并发的 LLM 请求可能乱序返回；旧片段号不能覆盖新片段（单测钉住）。
+
+**实测边界（不是产品结论）**：中转 `claude-opus-5-5` 结构化输出 8/8 合法；端到端 LLM 延迟
+p50 5.10 s、范围 2.84–7.04 s（8 次，2026-10-21）；因此"对话开始 → 环境声真正打开"要加
+约 6–12 s。`docs/conversation-prediction.md` §1 的"端侧实时判据不用 LLM"不变：这里 LLM 是
+**候选段的语义确认/授权**，不是预判触发。
+
+**未做**：真机多人对话验收、LLM 成本/限流、离线兜底小模型、执行端 opened/open 回执闭环。
+
+**文件**：`tools/host/assistant.py`、`tools/host/__main__.py`、`tools/host/web/index.html`、
+`tools/host/tests/test_host.py`、`tools/qwen_asr_worker.py`。
+
+## D33 · 2026-10-21 ASR 噪声门控与去幻觉
+
+**背景**：2026-10-21 现场截图：一段 15 s、无人声证据的候选段被提升 +17 dB 后送进
+Qwen3-ASR，模型输出满屏"就是，就是，就是…"；用户反馈"转录非常不准，噪音会被转成文字"。
+离线复现（仓库 `.asr-venv` 的 qwen3-asr-1.7b-int8-mlx）确认三类噪声都会产生重复幻觉：
+
+| 输入 | 旧路径输出（示意） |
+|---|---|
+| 15 s 静音 +18 dB | 空（部分录音仍有"嗯。"） |
+| 15 s 呼吸/嗡嗡声 +18 dB | "这年。这年。这年。" / "听我儿子讲的。"×3 |
+| 3 s 语音 + 12 s 静音 | 同一句重复 6 次（越界的 silence 触发循环） |
+
+**决定（2026-10-21）**：
+
+1. **前置语音证据门（不送 ASR 就不可能有幻觉）**：至少 1 s 证据，两条来源取其一：
+   设备遥测连续 ≥4 帧 `voice_likelihood ≥ 0.65` 且事件不是 keyboard/wind/artifact；
+   或 20 ms 帧能量 VAD（本底+6 dB 阈值、峰值-本底 ≥8 dB、≥0.5 s 连续），稳态噪声不算。
+   二者都没有 → 该段直接 `未检测到有效人声（跳过 ASR）`，本地判非对话、关环境声。
+2. **只裁首尾，不重排时间轴**：保留原始样本偏移，`_speaker_segments` 的声纹窗口才对得上；
+   首尾各留 0.2 s，ASR 副本上限 20 s。
+3. **限制生成预算**：按有效语音时长 `min(160, max(24, 12×秒))` tokens；worker 默认值也从
+   448 改为按音频时长收紧（`tools/qwen_asr_worker.py`）。旧版固定 512，足够让模型写满重复循环。
+4. **输出过滤**：2–40 字重复单元 ≥3 次视为循环；重复字符占比 >50% 整段丢弃；纯语气词、
+   单字噪声丢弃；正常文本保留，单轮最多 240 字。合并同一事件的多轮转写时仍标注 self/other/unknown。
+5. **失败关闭**：ASR 未就绪/写入失败 → 显示真实原因并 fail-closed，不再让旧转写冒充新结果。
+
+**验证**：离线用真实 Qwen3-ASR worker 跑 6 个案例（静音/嗡嗡/呼吸/10 s 语音/3 s 语音+12 s 静音/
+单帧尖峰遥测）：三段噪声全部判为"未识别到有效语音"；3 s 语音+12 s 静音只输出一句
+（裁剪生效，旧版会重复 6 次）。上位机自测 65 组、7688 条断言通过。真机复测（2026-10-21
+16:17–16:18，串口 + `--voiceprint --ambient-executor relay`）：连续 5 段现场噪声里 3 段直接
+跳过 ASR、2 段 ASR 输出被"只有语气词"过滤，面板不再出现噪声转写文字；环境声授权保持关闭。
+
+**边界**：这是"噪声不再被写成文字"，**不是**"远场转写已经准了"。单麦 16 kHz 远场
+转录质量仍未验收；语种混杂（现场出现英文）与真实多人对话需要真机素材。
+
+**文件**：`tools/host/assistant.py`、`tools/qwen_asr_worker.py`、`tools/host/tests/test_host.py`。

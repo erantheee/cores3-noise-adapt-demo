@@ -59,8 +59,50 @@ def voiceprint_allows_ambient(snapshot: dict, max_age_s: float = 3.0) -> bool:
     )
 
 
+def fresh_self_veto(snapshot: dict, max_age_s: float = 3.0) -> bool:
+    """新鲜 self 判定是否应该否决环境声。
+
+    2026-10-21 之后环境声的**主授权**是 LLM 语义判定（D32）；WavLM 声纹降级为
+    只否决"佩戴者自己在说"的一种安全信号：unknown/pending/过期都不阻断，避免
+    声纹在真实房间噪声里一直 unknown 把整条功能锁死（现场实测 speech_ratio 长期
+    低于阈值，旧 DialogueTurnGate 因此从未放行过）。
+    """
+    age = snapshot.get("age_s")
+    return bool(
+        snapshot.get("ready") is True
+        and snapshot.get("verdict") == "self"
+        and isinstance(age, (int, float))
+        and 0.0 <= age <= max_age_s
+    )
+
+
+def llm_ambient_authorization(assistant) -> dict:
+    """环境声执行端看到的语义授权。
+
+    * LLM 未配置 → 放行，让旧的设备意图/声纹门控继续工作（不伪造语义判定）。
+    * LLM 已配置 → 完全以它的新鲜判定为准；没有判定/不确定/非对话/过期都 fail-closed。
+    """
+    if assistant is None or not bool(getattr(assistant, "configured", False)):
+        return {
+            "allow": True,
+            "state": "not_configured",
+            "reason": "LLM 未配置：环境声回退到设备意图/声纹门控",
+        }
+    authorize = getattr(assistant, "ambient_authorization", None)
+    if authorize is None:
+        return {
+            "allow": False,
+            "state": "unavailable",
+            "reason": "LLM 服务没有提供环境声授权接口（fail-closed）",
+        }
+    return dict(authorize())
+
+
 class DialogueTurnGate:
-    """要求 self/other 轮次证据，避免单个环境人声把通透模式顶开。"""
+    """要求 self/other 轮次证据，避免单个环境人声把通透模式顶开。
+
+    仅作为 **LLM 未配置时** 的历史回退门控保留；LLM 配置后授权以 LLM 判定为准。
+    """
 
     def __init__(self, window_s: float = 12.0) -> None:
         self.window_s = window_s
@@ -393,6 +435,7 @@ def main(argv: list[str] | None = None) -> int:
         voiceprint.activity_provider = lambda: state.latest
     state.attach_assistant(assistant)
     assistant.start()
+    assistant_configured = assistant.configured
     # 中继使用的是无结束时间的 S3 音频流；设备若在上一次主机退出后仍处于录音态，
     # 重连时不一定再发 started。主机既然明确启用了 relay，就直接把它登记为持续流，
     # 会话边界随后由 conversation 状态切分。
@@ -553,6 +596,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             print("  注意      中继通路的固有时延约 211–231 ms（蓝牙占 170 ms）；"
                   "这一版只验证预判与开关，不宣称能听清对面")
+            if assistant_configured:
+                print("  授权      环境声还必须由 ASR/LLM 判定为对话且未过期；"
+                      "不确定/非对话/过期一律关闭（D32）")
         elif isinstance(ambient, AmbientService):
             print(
                 f"  环境声    S3 ambient_open 意图 → AirPods「{args.ambient_mode}」"
@@ -560,8 +606,15 @@ def main(argv: list[str] | None = None) -> int:
             )
             if not ambient.available:
                 print("  注意      找不到 airpods-control CLI：意图会显示，但执行端不可用")
+            if assistant_configured:
+                print("  授权      环境声还必须由 ASR/LLM 判定为对话且未过期（D32）")
         else:
             print("  环境声    只显示 S3 意图（--ambient-executor relay|airpods 才执行）")
+        if assistant_configured:
+            print(f"  对话判定  {assistant.model} · Qwen3-ASR 本地转写 · "
+                  f"环境声授权 TTL {assistant._DECISION_TTL_S:g}s")
+        else:
+            print("  对话判定  未配置 LLM（ANTHROPIC_*）：环境声回退到设备意图/声纹门控")
         if isinstance(source, ReplaySource):
             print("  注意      回放只是把历史日志搬到界面上，不代表设备现在的状态")
         if isinstance(source, MockSource):
@@ -697,22 +750,23 @@ def main(argv: list[str] | None = None) -> int:
                 bands = list(latest.tuning.band_gain_db) if latest.tuning else [0.0] * 24
                 player_service.apply_decision(bands, float(latest.media_percent))
         if ambient is not None:
-            # S3 的 ambient_open 意图 → 执行端（relay 门控 / AirPods 聆听模式）。三条安全规则：
+            # S3 的 ambient_open 意图 → 执行端（relay 门控 / AirPods 聆听模式）。安全规则：
             #   * 旧固件（v4 之前）不报 ambient_open → 当成"不开放"，不猜；
             #   * 设备静默/掉线 → 必须关回去，不能把人留在环境声里；
-            #   * 执行端自己异步、失败有 last_error，面板分开显示意图与执行。
+            #   * execution 端自己异步、失败有 last_error，面板分开显示意图与执行。
             want_open = False
             if latest is not None and latest.ambient_open is not None:
                 want_open = bool(latest.ambient_open)
-            # 首个 self/other 判定出来前，不执行任何开放意图：串口刚打开可能还残留
-            # 刷机前的旧命令帧，拿旧帧开麦比不开放更糟。
-            # self：佩戴者这一轮不送进耳机（D28 self-veto；设备侧也会按同一判定不压/
-            # 不抬），等 other 再开，形成按说话人轮流开放的中继；verdict 过期后
-            # worker 不再给新判定，这里按"未就绪"处理（与固件 3 秒过期一致）。
-            if voiceprint is not None:
+            if assistant_configured:
+                # D32：环境声的主授权是 ASR/LLM 的语义判定。设备意图只是"申请"，
+                # 没有新鲜的 dialogue=yes/open 判定就不执行（fail-closed）。
+                authorization = llm_ambient_authorization(assistant)
+                want_open = want_open and bool(authorization.get("allow"))
+                if voiceprint is not None and fresh_self_veto(voiceprint.snapshot()):
+                    want_open = False
+            elif voiceprint is not None:
+                # LLM 未配置时保留历史回退：新鲜 other + 双方轮次证据才放行。
                 voiceprint_state = voiceprint.snapshot()
-                # 环境声是重动作，只允许一个明确且新鲜的 other 判定放行。
-                # self / unknown / pending / stale / worker failure 全部 fail-closed。
                 want_open = want_open and dialogue_turn_gate.allows(voiceprint_state, latest)
             if state.is_stale() or state.is_silent() or not state.connected:
                 want_open = False

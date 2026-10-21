@@ -9,6 +9,8 @@ sdkconfig
 __pycache__/
 *.pyc
 build-host-tests/
+# 临时 cmake 构建目录（如 `cmake -B work/test-build`），不入库
+work/
 记录/
 *.jsonl
 recordings/

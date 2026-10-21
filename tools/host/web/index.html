@@ -297,6 +297,8 @@
         <span class="sub" id="llm-sessions">今日会话 —</span>
       </div>
       <div class="sub" id="llm-task">等待接入 ASR 与 LLM</div>
+      <div class="sub" style="margin-top:8px">对话判定 → 环境声授权（LLM 是执行授权，S3 意图只是申请）</div>
+      <pre class="raw" id="llm-decision">尚无判定</pre>
       <div class="sub" style="margin-top:8px">录音边界与当前说话人</div>
       <pre class="raw" id="llm-recording">采集通道尚未启动</pre>
       <div class="sub" style="margin-top:8px">最近片段</div>
@@ -442,10 +444,14 @@ function renderOwnVoice(f) {
 function renderAmbient(s, f) {
   const intent = f.ambient_open;
   const exec = s.ambient;
+  const auth = (s.assistant || {}).ambient_authorization;
+  const authorization = auth && auth.state && auth.state !== "not_configured"
+    ? ` · 语义授权：${auth.state === "allowed" ? "允许" : "关闭"}`
+    : "";
   if (intent === null || intent === undefined) {
     $("amb").textContent = "—";
     $("amb-raw").textContent = "这一帧没有 ambient_open 字段（v4 之前的固件）";
-    $("amb-note").textContent = "设备上报不出意图，执行端不会自己猜";
+    $("amb-note").textContent = "设备上报不出意图，执行端不会自己猜" + authorization;
     return;
   }
   $("amb").textContent = intent ? "意图：开放" : "意图：关闭";
@@ -457,14 +463,14 @@ function renderAmbient(s, f) {
   }
   if (!exec.available) {
     $("amb-raw").textContent = relay ? "中继不可用" : "执行端不可用（找不到 airpods CLI）";
-    $("amb-note").textContent = exec.last_error || "意图已上报，但没有执行者";
+    $("amb-note").textContent = (exec.last_error || "意图已上报，但没有执行者") + authorization;
     return;
   }
   if (exec.last_error) {
     $("amb-raw").textContent = "执行失败：" + exec.last_error;
-    $("amb-note").textContent = exec.open
+    $("amb-note").textContent = (exec.open
       ? "当前仍处于开放状态；下一个目标变化时会重试"
-      : "意图已上报，但执行端没有动作";
+      : "意图已上报，但执行端没有动作") + authorization;
     return;
   }
   if (relay) {
@@ -472,14 +478,15 @@ function renderAmbient(s, f) {
       ? "中继已开（S3 麦 → 耳机）"
       : "中继已关（音频包在 Mac 端丢弃）";
     $("amb-note").textContent = "已放行 " + (exec.chunks_fed || 0) + " 包 / 丢弃 " +
-      (exec.chunks_dropped || 0) + " 包 · 固有时延约 211–231 ms";
+      (exec.chunks_dropped || 0) + " 包 · 固有时延约 211–231 ms" + authorization;
   } else if (exec.open) {
     $("amb-raw").textContent = "已切到「" + exec.open_mode + "」，切换前是「" +
       (exec.previous_mode || "未知") + "」";
-    $("amb-note").textContent = "关闭时切回切换前的模式";
+    $("amb-note").textContent = "关闭时切回切换前的模式" + authorization;
   } else {
     $("amb-raw").textContent = exec.target ? "正在打开…" : "已关闭（环境声未进入）";
-    $("amb-note").textContent = "S3 只报意图；切聆听模式由 Mac 执行";
+    $("amb-note").textContent =
+      "S3 只报意图；要执行还需要 LLM 判定授权（D32）" + authorization;
   }
 }
 
@@ -901,6 +908,24 @@ function renderAssistant(s) {
   $("llm-state").textContent = (a.state_text || "未接入") + asr;
   $("llm-state").style.color = a.available ? "#3ddc84" : "#f2b84b";
   $("llm-task").textContent = a.task || "等待接入 ASR 与 LLM";
+  const decision = a.decision;
+  const auth = a.ambient_authorization || {};
+  const stateNames = {
+    allowed: "允许（判定对话且未过期）",
+    closed: "关闭（判定非对话/环境声不开放）",
+    stale: "关闭（判定已过期）",
+    waiting: "等待（尚未获得 ASR/LLM 判定）",
+    not_configured: "未配置 LLM，回退设备意图/声纹门控",
+  };
+  const authLine = `环境声授权：${stateNames[auth.state] || "关闭（fail-closed）"}`
+    + (auth.age_s !== null && auth.age_s !== undefined ? ` · 判定 ${auth.age_s}s 前` : "");
+  const decisionLine = decision
+    ? `#${decision.number || "—"} ${decision.verdict_text || "不确定"} · 环境声${decision.ambient_text || "关闭"}`
+      + ` · 置信度 ${Number(decision.confidence || 0).toFixed(2)} · ${decision.source === "llm" ? "LLM" : "本地回退"}`
+      + `\n依据：${decision.reason || "—"}`
+    : "尚无判定（候选片段还没有通过语音证据门控）";
+  $("llm-decision").textContent = `${decisionLine}\n${authLine}`
+    + (auth.reason ? `\n${auth.reason}` : "");
   const channel = a.capture_channel || {};
   const candidate = a.candidate || {};
   const speakerNames = {self: "佩戴者 self", other: "他人 other", unknown: "未知 unknown"};
@@ -918,7 +943,9 @@ function renderAssistant(s) {
     ? segments.map((item) =>
         `#${item.number} ${item.started_at || "—"} → ${item.ended_at || "—"} · ${item.duration_s || 0}s\n` +
         `说话人 ${item.speaker || "unknown"} · 结束：${item.end_reason || "—"}` +
-        `${Number(item.asr_gain_db) > 0 ? ` · ASR远场增益 +${Number(item.asr_gain_db).toFixed(1)}dB` : ""}\n` +
+        `${Number(item.speech_s) > 0 ? ` · 有效语音 ${Number(item.speech_s).toFixed(1)}s` : ""}` +
+        `${Number(item.asr_gain_db) > 0 ? ` · ASR远场增益 +${Number(item.asr_gain_db).toFixed(1)}dB` : ""}` +
+        `${item.asr_note ? `\n证据/过滤：${item.asr_note}` : ""}\n` +
         `${item.transcript || "等待转写"}`
       ).join("\n\n")
     : "尚无片段";

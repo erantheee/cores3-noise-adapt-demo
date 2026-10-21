@@ -22,10 +22,14 @@ CoreS3 双麦克风 → 24频段环境分析 → 对话开始预判 → 端侧�
                                                   EarbudCommand v4
                                                            ↓ USB
                              Mac：歌曲 EQ / 媒体下压 / AirPods 聆听模式 → AirPods Pro
+                                                           ↑
+                             Mac：候选人声 → 语音证据门控 → Qwen3-ASR → LLM 语义判定
+                                  （D32/D33：新鲜 dialogue=yes 才授权执行端打开环境声）
 ```
 
 **对话感知是预判式的（D16）**：附近有人开口的那一刻就先压低媒体，确认对话成立后把
-`ambient_open=true` 发给 Mac 执行端。**当前 demo 走 S3 麦克风中继**（S3 麦 → Mac → 耳机，
+`ambient_open=true` 意图发给 Mac；**2026-10-21 起（D32）Mac 还会要求 ASR/LLM 给出新鲜的
+"是对话、可开放"判定，才真正执行**。**当前 demo 走 S3 麦克风中继**（S3 麦 → Mac → 耳机，
 固有时延约 211–231 ms，先把预判与开关跑通）；后续再拓展成 AirPods 通透模式。对话结束后
 恢复媒体与关闭环境声。**不是**"检测到佩戴者说话才下压"——旧实现只能事后反应，方向已改。
 
@@ -34,7 +38,7 @@ CoreS3 承担耳机仓侧的感知、判断与决策；Mac 承担本次 Demo 的
 完成了目标人声增强；环境声只通过切换聆听模式（通透）实现，不是目标人声提取。真实执行链路尚未
 接通时，协议固定上报 `execution: decision_only`。
 
-## 2026-10-21 收尾变更（本轮）
+## 2026-10-21 收尾变更（上一轮）
 
 - **环境声执行端默认关闭（D30）**：`host_up.sh` 真机默认 `--ambient-executor off`，只显示
   `ambient_open` 意图；要环境声必须显式传 `--ambient-executor relay` 或 `airpods`。
@@ -48,6 +52,31 @@ CoreS3 承担耳机仓侧的感知、判断与决策；Mac 承担本次 Demo 的
 - **上位机修复**：回控回执只在收到**新的** `capture` 事件时才算 `acknowledged`（缓存事件
   不能把"写成功"说成"设备照做"）；`/api/stop` 先执行清理（含 `ambient.stop`）再退出。
 - 本轮未做的 P2 与已知限制见 [`TODOS.md`](TODOS.md)。
+
+## 2026-10-21 现场反馈后的修复（ASR/LLM 闭环，D32/D33）
+
+现场试跑暴露两个问题：**噪声被写成文字**（截图里满屏"就是，就是…"）、**LLM 判定与环境声
+执行互不相关**。本次修复把两条链路接成一条闭环：
+
+- **语音证据门（D33）**：候选段先过设备遥测（连续 ≥4 帧 `voice_likelihood ≥ 0.65`、排除
+  键盘/风/撞击）与 20 ms 能量 VAD；不足 1 s 证据直接显示「未检测到有效人声（跳过 ASR）」。
+  只裁首尾静音，保留原始样本偏移给声纹窗口对齐；ASR 生成预算按语音时长收紧。
+- **ASR 去幻觉（D33）**：重复单元 ≥3 次、重复字符占比 >50%、纯语气词、单字噪声一律丢弃，
+  单轮最多 240 字。离线用真实 Qwen3-ASR 复测：静音/嗡嗡/呼吸不再出文字，3 s 语音+12 s
+  静音从"重复 6 次"变成一句话。
+- **LLM 授权环境声（D32）**：每个候选段让 LLM 输出一行结构化判定
+  `{"dialogue":"yes|no|unclear","ambient":"open|close",...}`；执行端只在**设备意图 ∧ 新鲜
+  dialogue=yes ∧ 判定未过期（20 s）** 时打开环境声，其余一律 fail-closed。LLM 未配置时回退
+  设备意图/声纹门控；WavLM 声纹降级为"新鲜 self 可否决"，`unknown` 不再把功能锁死。
+- **分段 15 s → 6 s**：判定能在对话进行中回来（ASR ~1 s + LLM 3–7 s）；面板把
+  **S3 意图 / LLM 判定 / 环境声授权 / 执行端状态** 分成四行显示。
+
+真机上（2026-10-21 16:17–16:18，串口 + relay 执行端）连续 5 段现场噪声：3 段直接跳过 ASR，
+2 段 ASR 输出被"只有语气词"过滤，面板不再出现噪声转写文字，环境声保持关闭。
+
+**边界**：这不是"远场转写已经准了"，也不是"LLM 可以实时预判"——LLM 只对候选段做语义确认，
+首次开放环境声仍有约 6–12 s 延迟；真实多人对话验收与成本/限流见 TODOS。理由与实测见
+[`docs/decisions.md` D32/D33](docs/decisions.md)。
 
 ## 三笔账的当前状态
 
@@ -152,12 +181,18 @@ v4 = `ambient_open`（环境声开放意图）。`event` / `event_valid`（端�
 **v4 上追加的键**，不涨 schema——与 `latency` 报文追加字段同一条理由：上位机按名读取，
 只增键不破坏旧解析。上位机同时读得懂 v1–v4，旧帧缺字段一律报 `null`，不猜默认值。
 
-**`ambient_open` 是意图，不是执行回执。** S3 决定"对话成立，应该让现实声音进来"，执行端
-由 Mac 选：`--ambient-executor relay`（S3 麦克风中继，S3 说开才放行音频包）或
+**`ambient_open` 是意图，不是执行回执。** S3 决定"对话可能成立，应该让现实声音进来"，
+执行端由 Mac 选：`--ambient-executor relay`（S3 麦克风中继，S3 说开才放行音频包）或
 `--ambient-executor airpods`（兄弟工程 `airpods-control` 切通透模式，关闭切回原模式）。
 **`host_up.sh` 真机模式默认 `--ambient-executor off`（D30）**：默认只显示意图、不执行；
 要环境声必须显式传 `relay` 或 `airpods`。执行结果、失败原因、放行/丢弃包数在面板
 「环境声」卡上单独显示；没有执行端时意图仍然可见，不允许把意图写成已执行。
+
+**2026-10-21 起（D32），有 LLM 时执行端还要过语义授权**：Mac 把候选段的人声送
+Qwen3-ASR 转写，再让 LLM 判"是不是对话、要不要开环境声"；只有**新鲜 `dialogue=yes` 且
+判定未过期（20 s）** 才允许执行端打开，`unclear`/`no`/过期/等待中一律关闭。面板因此把
+**S3 意图 / LLM 判定 / 环境声授权 / 执行端状态** 分成四行显示。LLM 未配置时回退到设备
+意图 + 声纹门控。**仍然不允许把"LLM 授权"写成"已经开放"。**
 
 没有 Mac 执行回执前，`execution` 必须保持 `decision_only`。`eq_gain_db` 按模式区分（D26）：
 **对话成立 / 声纹判定 self** 时保持平直（下压媒体、不抬歌曲中频）；**背景或别人说话但还没构成
@@ -314,7 +349,7 @@ CI 里这一步跑在固件构建**之前**（[`.github/workflows/build.yml`](.g
 上位机（`tools/host/`）另有一套自己的自测，同样是纯 Python、秒级、不需要设备：
 
 ```bash
-python3 tools/host/tests/test_host.py            # 57 组、7594 条断言（连跑 3 次稳定）
+python3 tools/host/tests/test_host.py            # 65 组、7688 条断言（连跑 3 次稳定）
 node tools/host/tests/render_check.js <快照.json> # 可选：用 DOM 桩真跑一遍界面渲染（49 条通过、0 条失败，条数随快照内容略变）
 ```
 
@@ -439,6 +474,13 @@ sh tools/host_up.sh --replay 记录/x.log --speed 4    # 回放历史日志
 
 这一版是**未经增强的现实声音中继**：它用于先测通路和总延迟，还没有完成声纹排除、目标人声
 提取、方向选择或歌曲避让 EQ。不要把听到现实声音写成“已经完成目标人声增强”。
+
+**ASR/LLM 闭环（D32/D33）怎么开**：`sh tools/host_up.sh` 会自动读取仓库根目录
+`.env`（`ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL`，git 忽略），
+并启动常驻的 Qwen3-ASR worker（`.asr-venv/bin/python tools/qwen_asr_worker.py`，首次加载
+约 4 s）。没有 `.env` 时面板显示"未配置"，环境声回退到设备意图/声纹门控。候选段先过语音
+证据门（设备遥测 + 能量 VAD）；没有证据就不转写。当前实测：LLM 结构化判定 8/8 合法、延迟
+p50 5.10 s；完整语义对话的**真机**验收尚未做（见 TODOS 与 D32 边界）。
 
 面板会显示：环境 / 当前动作 / **语音段增益** / **调音（24 频段 EQ 形状）** /
 **环境声（S3 意图 vs Mac 执行结果）** / **中继延迟（实测排队 + 驱动侧输出）** /
@@ -568,7 +610,7 @@ Mac 的 `applied` / `idle` / `silent` / `bypass` / `unavailable`（有证据：
 ### 上位机自测
 
 ```bash
-python3 tools/host/tests/test_host.py      # 57 组、7594 条断言，不需要设备、不需要串口
+python3 tools/host/tests/test_host.py      # 65 组、7688 条断言，不需要设备、不需要串口
 node tools/host/tests/render_check.js <快照.json>   # 用 DOM 桩真跑一遍 render()：49 条通过、0 条失败（条数随快照内容略变）
 ```
 
