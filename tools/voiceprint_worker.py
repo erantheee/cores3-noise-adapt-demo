@@ -8,11 +8,12 @@ stdout 回 JSON 行（ready / verdict / error）。使用仓库 `.venv`（需要
 协议：
   stdin  (每行): {"rate":16000,"pcm_base64":"..."}
   stdout (每行): {"type":"ready","clips":4,"dim":512,"threshold":0.8}
-                 {"type":"verdict","verdict":"self"|"other","score":0.93,"windows":7,"lag_ms":321}
+                 {"type":"verdict","verdict":"self"|"other"|"unknown","score":0.93,...}
                  {"type":"error","error":"..."}
 
 判定：1.5 s 窗、0.75 s 步进；embedding 与佩戴者注册原型（设备录音的均值）
-做 cosine；EMA 平滑后大于阈值判 self，否则 other。结果回传 S3，用双方轮次判断对话。
+做 cosine。当前窗口达到 self 阈值即否决为本人；只有有声且明显低于阈值才判 other，
+静音、边界区和不可靠窗口为 unknown。结果回传 S3，用双方轮次判断对话。
 """
 
 from __future__ import annotations
@@ -98,6 +99,8 @@ def main() -> int:
     parser.add_argument("--window-s", type=float, default=1.5)
     parser.add_argument("--hop-s", type=float, default=0.75)
     parser.add_argument("--smooth", type=float, default=0.6)
+    parser.add_argument("--speech-floor-dbfs", type=float, default=-45.0)
+    parser.add_argument("--unknown-margin", type=float, default=0.15)
     args = parser.parse_args()
 
     emit({"type": "loading"})
@@ -109,6 +112,8 @@ def main() -> int:
     window = int(args.window_s * 16000)
     hop = int(args.hop_s * 16000)
     buffer = np.zeros(0, dtype=np.float32)
+    activity_buffer = np.zeros(0, dtype=np.uint8)
+    buffer_start_sample = 0
     smoothed: float | None = None
     windows = 0
     last_emit = 0.0
@@ -123,32 +128,57 @@ def main() -> int:
                 emit({"type": "error", "error": f"不支持的采样率 {payload.get('rate')}"})
                 continue
             pcm = base64.b64decode(payload["pcm_base64"])
+            speech_active = bool(payload.get("speech_active", False))
         except (ValueError, KeyError, json.JSONDecodeError) as exc:
             emit({"type": "error", "error": f"输入协议错误：{exc}"})
             continue
         samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
         buffer = np.concatenate([buffer, samples])
+        activity_buffer = np.concatenate([
+            activity_buffer, np.full(samples.shape[0], int(speech_active), dtype=np.uint8)
+        ])
         # 处理所有完整窗；如果推理落后太多，丢掉旧样本只保留最新两窗，避免无限积压。
         while buffer.shape[0] >= window:
             if buffer.shape[0] > window * 4:
+                dropped = buffer.shape[0] - window * 2
                 buffer = buffer[-window * 2:]
+                activity_buffer = activity_buffer[-window * 2:]
+                buffer_start_sample += dropped
                 emit({"type": "dropped", "dropped_s": round(float(buffer.shape[0]) / 16000, 2)})
             chunk = buffer[:window]
+            speech_ratio = float(np.mean(activity_buffer[:window]))
+            start_sample = buffer_start_sample
+            end_sample = start_sample + window
             buffer = buffer[hop:]
+            activity_buffer = activity_buffer[hop:]
+            buffer_start_sample += hop
             started = time.monotonic()
             vector = embedder(chunk)
             score = float(vector @ prototype)
+            rms = float(np.sqrt(np.mean(np.square(chunk), dtype=np.float64)))
+            dbfs = 20.0 * np.log10(max(rms, 1e-8))
             smoothed = score if smoothed is None else (
                 args.smooth * smoothed + (1.0 - args.smooth) * score)
             windows += 1
             now = time.monotonic()
-            verdict = "self" if smoothed > args.threshold else "other"
+            if speech_ratio < 0.35 or dbfs < args.speech_floor_dbfs:
+                verdict = "unknown"
+            elif score >= args.threshold:
+                verdict = "self"
+            elif score <= args.threshold - args.unknown_margin:
+                verdict = "other"
+            else:
+                verdict = "unknown"
             if windows == 1 or now - last_emit >= 0.25:
                 last_emit = now
                 emit({"type": "verdict", "verdict": verdict,
                       "score": round(score, 4),
                       "smoothed": round(float(smoothed), 4),
+                      "dbfs": round(float(dbfs), 1),
+                      "speech_ratio": round(speech_ratio, 3),
                       "windows": windows,
+                      "start_sample": start_sample,
+                      "end_sample": end_sample,
                       "latency_ms": round((now - started) * 1000.0, 1)})
     return 0
 

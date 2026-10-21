@@ -22,6 +22,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from .ambient import AmbientService, RelayAmbient
+from .assistant import AssistantService
 from .audio_relay import (
     DEFAULT_DEVICE,
     DEFAULT_TARGET_MS,
@@ -45,6 +46,76 @@ from .sources import (
 from .state import HostState
 
 DEFAULT_WEB_PORT = 8787
+
+
+def voiceprint_allows_ambient(snapshot: dict, max_age_s: float = 3.0) -> bool:
+    """只有 worker 就绪且判定为新鲜 other 时允许环境声执行。"""
+    age = snapshot.get("age_s")
+    return bool(
+        snapshot.get("ready") is True
+        and snapshot.get("verdict") == "other"
+        and isinstance(age, (int, float))
+        and 0.0 <= age <= max_age_s
+    )
+
+
+class DialogueTurnGate:
+    """要求 self/other 轮次证据，避免单个环境人声把通透模式顶开。"""
+
+    def __init__(self, window_s: float = 12.0) -> None:
+        self.window_s = window_s
+        self.last_verdict: str | None = None
+        self.last_self_at: float | None = None
+        self.last_other_at: float | None = None
+        self.last_sequence: int | None = None
+        self.other_speech_frames = 0
+
+    def allows(self, snapshot: dict, frame=None, now: float | None = None) -> bool:
+        now = time.monotonic() if now is None else now
+        age = snapshot.get("age_s")
+        fresh_identity = bool(
+            snapshot.get("ready") is True
+            and snapshot.get("verdict") in ("self", "other")
+            and isinstance(age, (int, float))
+            and 0.0 <= age <= 3.0
+        )
+        if not fresh_identity:
+            self.other_speech_frames = 0
+            self._expire(now)
+            return False
+        verdict = snapshot.get("verdict")
+        if verdict != self.last_verdict:
+            self.last_verdict = verdict
+            if verdict == "self":
+                self.last_self_at = now
+            elif verdict == "other":
+                self.last_other_at = now
+        self._expire(now)
+        # 状态机的 LIKELY 会保持数秒，不能拿旧意图放行当前的键盘/风声。
+        # 必须是三个不同设备帧连续报告强人声，且事件规则没有明确否决。
+        sequence = getattr(frame, "sequence", None)
+        if sequence != self.last_sequence:
+            self.last_sequence = sequence
+            current_other_speech = bool(
+                verdict == "other"
+                and float(getattr(frame, "voice_likelihood", 0.0)) >= 0.65
+                and getattr(frame, "event", None) not in ("keyboard", "wind", "artifact")
+            )
+            self.other_speech_frames = self.other_speech_frames + 1 if current_other_speech else 0
+        return bool(
+            verdict == "other"
+            and voiceprint_allows_ambient(snapshot)
+            and self.last_self_at is not None
+            and self.last_other_at is not None
+            and abs(self.last_other_at - self.last_self_at) <= self.window_s
+            and self.other_speech_frames >= 3
+        )
+
+    def _expire(self, now: float) -> None:
+        if self.last_self_at is not None and now - self.last_self_at > self.window_s:
+            self.last_self_at = None
+        if self.last_other_at is not None and now - self.last_other_at > self.window_s:
+            self.last_other_at = None
 
 
 def default_airpods_cli() -> str:
@@ -310,11 +381,23 @@ def main(argv: list[str] | None = None) -> int:
 
     if base_feed is None and voiceprint is None:
         on_mic_chunk = None
+    assistant = AssistantService(
+        voiceprint_snapshot=voiceprint.snapshot if voiceprint is not None else None
+    )
     state = HostState(
         source=source.name,
         detail=source.detail,
         on_mic_chunk=on_mic_chunk,
     )
+    if voiceprint is not None:
+        voiceprint.activity_provider = lambda: state.latest
+    state.attach_assistant(assistant)
+    assistant.start()
+    # 中继使用的是无结束时间的 S3 音频流；设备若在上一次主机退出后仍处于录音态，
+    # 重连时不一定再发 started。主机既然明确启用了 relay，就直接把它登记为持续流，
+    # 会话边界随后由 conversation 状态切分。
+    if relay is not None:
+        assistant.recording_started(16_000, 0)
     if relay is not None:
         # 中继的数字要进快照：这条通路上原来最缺的就是"现在到底晚了多少"。
         # 顺序要紧：attach 必须发生在 HostState 建好之后（这里曾经写成之前，结果是
@@ -348,7 +431,9 @@ def main(argv: list[str] | None = None) -> int:
     if voiceprint is not None:
         def _send_voiceprint(verdict: str, score: float) -> None:
             try:
-                writer.send_voiceprint(verdict, score)
+                writer.send_voiceprint(
+                    verdict if verdict in ("self", "other") else "pending", score
+                )
                 voiceprint.note_sent()
             except (RuntimeError, OSError):
                 # 串口没打开/刚断开：声纹遥测继续，判定不硬塞。
@@ -357,6 +442,7 @@ def main(argv: list[str] | None = None) -> int:
         voiceprint.on_verdict = _send_voiceprint
 
     stop = threading.Event()
+    dialogue_turn_gate = DialogueTurnGate()
 
     def request_stop(signum=None, frame=None) -> None:  # noqa: ANN001, ARG001
         stop.set()
@@ -625,10 +711,9 @@ def main(argv: list[str] | None = None) -> int:
             # worker 不再给新判定，这里按"未就绪"处理（与固件 3 秒过期一致）。
             if voiceprint is not None:
                 voiceprint_state = voiceprint.snapshot()
-                if voiceprint_state.get("verdict") is None:
-                    want_open = False
-                elif voiceprint_state.get("verdict") == "self":
-                    want_open = False
+                # 环境声是重动作，只允许一个明确且新鲜的 other 判定放行。
+                # self / unknown / pending / stale / worker failure 全部 fail-closed。
+                want_open = want_open and dialogue_turn_gate.allows(voiceprint_state, latest)
             if state.is_stale() or state.is_silent() or not state.connected:
                 want_open = False
             ambient.set_open(want_open)

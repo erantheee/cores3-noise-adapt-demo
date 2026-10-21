@@ -1,10 +1,11 @@
-"""Mac 侧 WavLM self/other 声纹门控（实验性 self-veto）。
+"""Mac 侧 WavLM self/other 声纹门控（环境声严格门控）。
 
 WavLM-SV 模型约 360 MB，只能跑在 Mac/PC 上；上位机本身不依赖 torch/transformers，
 所以这里把重依赖放进子进程 `tools/voiceprint_worker.py`（用仓库 `.venv/bin/python`），
 上位机只负责把 S3 中继的 16 kHz PCM 喂过去、读回判定。
 
-语义（D28 self-veto）：`self` → 设备不压/不抬/不开环境声；`other` → 按 D16 预判逻辑。
+语义：`self` → 不开环境声；只有新鲜 `other` 才允许执行端按设备意图开放。
+unknown / pending / stale / worker failure 一律关闭。
 判定 3 秒没有新值由固件侧自动视为过期；串口关闭/进程退出时上位机发 `voiceprint off`。
 默认关闭，只有显式 `--voiceprint` 才启用。
 """
@@ -16,6 +17,7 @@ import json
 import subprocess
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -36,6 +38,7 @@ class VoiceprintService:
         threshold: float = 0.80,
         enabled: bool = True,
         on_verdict=None,
+        activity_provider=None,
     ) -> None:
         self.python = str(python)
         self.worker = str(worker)
@@ -44,6 +47,7 @@ class VoiceprintService:
         self.enabled = enabled
         #: 判定回调：host 用它把 self/other 回传 S3。
         self.on_verdict = on_verdict
+        self.activity_provider = activity_provider
         self._lock = threading.RLock()
         self._process: subprocess.Popen[str] | None = None
         self._threads: list[threading.Thread] = []
@@ -55,6 +59,8 @@ class VoiceprintService:
         self._verdict: str | None = None
         self._score: float | None = None
         self._smoothed: float | None = None
+        self._dbfs: float | None = None
+        self._speech_ratio: float | None = None
         self._windows = 0
         self._latency_ms: float | None = None
         self._clips = 0
@@ -64,6 +70,7 @@ class VoiceprintService:
         self._dropped_chunks = 0
         self._sent_verdicts = 0
         self._last_sent_verdict: str | None = None
+        self._history: deque[dict] = deque(maxlen=120)
         self._stderr_tail: list[str] = []
 
     # ------------------------------------------------------------------ 生命周期
@@ -138,6 +145,16 @@ class VoiceprintService:
                 "rate": int(getattr(chunk, "rate", 16000)),
                 "pcm_base64": base64.b64encode(bytes(chunk.pcm)).decode("ascii"),
             }
+            if self.activity_provider is not None:
+                try:
+                    frame = self.activity_provider()
+                    payload["speech_active"] = bool(
+                        frame is not None
+                        and getattr(frame, "event", None) == "speech"
+                        and float(getattr(frame, "voice_likelihood", 0.0)) >= 0.6
+                    )
+                except Exception:  # noqa: BLE001 - activity missing must fail closed
+                    payload["speech_active"] = False
             self._process.stdin.write(json.dumps(payload) + "\n")
             self._process.stdin.flush()
             with self._lock:
@@ -201,9 +218,23 @@ class VoiceprintService:
                 self._verdict = str(message.get("verdict"))
                 self._score = message.get("score")
                 self._smoothed = message.get("smoothed")
+                self._dbfs = message.get("dbfs")
+                self._speech_ratio = message.get("speech_ratio")
                 self._windows = int(message.get("windows", self._windows))
                 self._latency_ms = message.get("latency_ms")
                 self._last_sent_verdict = self._verdict
+                start_sample = message.get("start_sample")
+                end_sample = message.get("end_sample")
+                if isinstance(start_sample, int) and isinstance(end_sample, int):
+                    self._history.append({
+                        "verdict": self._verdict,
+                        "score": self._score,
+                        "smoothed": self._smoothed,
+                        "dbfs": self._dbfs,
+                        "speech_ratio": self._speech_ratio,
+                        "start_sample": start_sample,
+                        "end_sample": end_sample,
+                    })
                 callback = self.on_verdict
             elif kind == "dropped":
                 self._dropped_chunks += 1
@@ -231,6 +262,8 @@ class VoiceprintService:
                 "verdict": self._verdict,
                 "score": self._score,
                 "smoothed": self._smoothed,
+                "dbfs": self._dbfs,
+                "speech_ratio": self._speech_ratio,
                 "threshold": self.threshold,
                 "windows": self._windows,
                 "clips": self._clips,
@@ -240,6 +273,7 @@ class VoiceprintService:
                 "dropped_windows": self._dropped_chunks,
                 "sent_verdicts": self._sent_verdicts,
                 "last_sent_verdict": self._last_sent_verdict,
+                "history": list(self._history),
                 "age_s": age,
                 "stderr_tail": list(self._stderr_tail),
                 "mode": "self-veto",

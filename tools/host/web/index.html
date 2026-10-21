@@ -268,29 +268,47 @@
 
   <div class="grid two">
     <div class="card">
-      <h2>设备录音（控制设备自己的麦克风）</h2>
+      <h2>S3 记录状态</h2>
       <div class="row">
-        <input type="number" id="rec-seconds" value="10" min="1" max="3600">
-        <button id="btn-rec-start">开始录音</button>
-        <button id="btn-rec-stop">停止</button>
         <span id="capture-text" class="sub">未在录音</span>
+        <span id="capture-detail" class="sub">—</span>
       </div>
-      <div class="row" style="margin-top:6px">
-        <button id="btn-release">释放串口（交给录音工具/刷机）</button>
-      </div>
-      <div class="sub" id="capture-detail">—</div>
-      <pre class="raw" id="capture-progress" style="margin-top:8px">—</pre>
-      <div class="warnbox" style="margin-top:10px">
-        这里的录音块<b>不会自动落盘</b>——落盘由 <code>tools/record_from_device.py</code> 负责，
-        它同时报告丢块。上位机只负责把状态显示出来，避免两套写盘逻辑各记一半。
-        录音是设备自己的麦克风，与面板上的增益/调音是两条独立通路。
-      </div>
+      <div class="sub">S3 负责录音；上位机只接收状态、转写结果与会话记录。</div>
+      <details style="margin-top:10px">
+        <summary class="sub">采集诊断与设备维护</summary>
+        <div class="row" style="margin-top:8px">
+          <input type="number" id="rec-seconds" value="10" min="1" max="3600">
+          <button id="btn-rec-start">开始诊断采集</button>
+          <button id="btn-rec-stop">停止</button>
+          <button id="btn-release">释放串口</button>
+        </div>
+        <pre class="raw" id="capture-progress" style="margin-top:8px">—</pre>
+      </details>
       <div class="warnbox bad" id="control-warn" style="margin-top:8px; display:none">
         <b>回控处于降级状态</b>：命令能写进串口，但设备没有任何回应。上位机会把每条命令的
         结果如实报出来，不会因为 <code>write()</code> 成功就显示成已执行。
       </div>
       <div id="toast" style="margin-top:8px">—</div>
     </div>
+    <div class="card">
+      <h2>LLM 工作台（Mac）</h2>
+      <div class="row">
+        <span class="value small" id="llm-state">未接入</span>
+        <span class="sub" id="llm-sessions">今日会话 —</span>
+      </div>
+      <div class="sub" id="llm-task">等待接入 ASR 与 LLM</div>
+      <div class="sub" style="margin-top:8px">录音边界与当前说话人</div>
+      <pre class="raw" id="llm-recording">采集通道尚未启动</pre>
+      <div class="sub" style="margin-top:8px">最近片段</div>
+      <pre class="raw" id="llm-segments">尚无片段</pre>
+      <div class="sub" style="margin-top:8px">最近转写</div>
+      <pre class="raw" id="llm-transcript">尚无转写</pre>
+      <div class="sub" style="margin-top:8px">总结状态</div>
+      <div id="llm-summary">尚无会话账本</div>
+    </div>
+  </div>
+
+  <div class="grid two">
     <div class="card">
       <h2>异常与事件</h2>
       <ul class="list" id="problems"></ul>
@@ -609,6 +627,7 @@ function render(s) {
   $("apply-note").textContent = applyNote(s);
   $("receipt").textContent = receiptText(s);
   renderCapture(s);
+  renderAssistant(s);
   renderLists(s);
   renderStats(s);
   drawChart(s.samples || []);
@@ -873,6 +892,42 @@ function renderCapture(s) {
   }
   $("btn-rec-stop").disabled = !s.connected || !s.recording;
   $("btn-rec-start").disabled = !s.connected;
+}
+
+function renderAssistant(s) {
+  const a = s.assistant || {};
+  const asr = a.asr_ready ? ` · ASR ${a.asr_model || "已就绪"}`
+    : (a.asr_error ? ` · ASR 异常` : " · ASR 加载中");
+  $("llm-state").textContent = (a.state_text || "未接入") + asr;
+  $("llm-state").style.color = a.available ? "#3ddc84" : "#f2b84b";
+  $("llm-task").textContent = a.task || "等待接入 ASR 与 LLM";
+  const channel = a.capture_channel || {};
+  const candidate = a.candidate || {};
+  const speakerNames = {self: "佩戴者 self", other: "他人 other", unknown: "未知 unknown"};
+  const channelLine = channel.active
+    ? `采集通道：${channel.mode || "录音"} · ${channel.started_at || "—"} 开始 · 已接收 ${channel.audio_seconds || 0}s`
+    : "采集通道：已停止";
+  const score = Number.isFinite(Number(candidate.speaker_score))
+    ? ` · 相似度 ${Number(candidate.speaker_score).toFixed(2)}` : "";
+  const candidateLine = candidate.active
+    ? `当前片段：${candidate.started_at || "—"} 开始 · 已录 ${candidate.duration_s || 0}s · ${speakerNames[candidate.speaker] || candidate.speaker || "未知"}${score}`
+    : "当前片段：未检测到需要转写的人声";
+  $("llm-recording").textContent = `${channelLine}\n${candidateLine}`;
+  const segments = Array.isArray(a.segments) ? a.segments : [];
+  $("llm-segments").textContent = segments.length
+    ? segments.map((item) =>
+        `#${item.number} ${item.started_at || "—"} → ${item.ended_at || "—"} · ${item.duration_s || 0}s\n` +
+        `说话人 ${item.speaker || "unknown"} · 结束：${item.end_reason || "—"}` +
+        `${Number(item.asr_gain_db) > 0 ? ` · ASR远场增益 +${Number(item.asr_gain_db).toFixed(1)}dB` : ""}\n` +
+        `${item.transcript || "等待转写"}`
+      ).join("\n\n")
+    : "尚无片段";
+  $("llm-transcript").textContent = a.transcript || "尚无转写";
+  $("llm-summary").textContent = (a.summary_state || "尚无会话账本")
+    + (a.llm_warning ? `\n${a.llm_warning}` : "");
+  $("llm-sessions").textContent = a.today_sessions === null || a.today_sessions === undefined
+    ? "今日会话 —"
+    : `今日会话 ${a.today_sessions} 段`;
 }
 
 function renderLists(s) {

@@ -17,6 +17,12 @@
 set -e
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+# 本地密钥只从被 git 忽略的 .env 注入当前进程，不打印、不写入页面。
+if [ -f "$ROOT/.env" ]; then
+    set -a
+    . "$ROOT/.env"
+    set +a
+fi
 WEB_PORT="${CORES3_WEB_PORT:-8787}"
 URL="http://127.0.0.1:$WEB_PORT/"
 LOG="${CORES3_HOST_LOG:-/tmp/cores3host/host.log}"

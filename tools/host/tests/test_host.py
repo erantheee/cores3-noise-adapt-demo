@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import struct
 import sys
 import time
 from pathlib import Path
@@ -61,6 +62,8 @@ from host.state import (  # noqa: E402
     state_text,
 )
 from host.ambient import AmbientError, AmbientService, RelayAmbient  # noqa: E402
+from host.assistant import AssistantService  # noqa: E402
+from host.__main__ import DialogueTurnGate, voiceprint_allows_ambient  # noqa: E402
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "device_real.log"
 
@@ -1103,6 +1106,7 @@ def test_web_assets_contract() -> None:
     html = INDEX_FILE.read_text(encoding="utf-8")
     for element in ("chart", "latency-body", "problems", "events", "raw", "stats-body",
                     "capture-text", "btn-rec-start", "btn-rec-stop", "rec-seconds",
+                    "llm-state", "llm-task", "llm-transcript", "llm-summary", "llm-sessions",
                     "conn-dot", "conn-text", "source-text", "age", "gain", "media",
                     "link", "env", "state", "conf", "seq", "toast", "eq", "control-warn"):
         check(f'id="{element}"' in html, f"界面必须有 #{element}")
@@ -1124,6 +1128,9 @@ def test_web_assets_contract() -> None:
     check('id="nr"' not in html, "不得再有降噪指标格子")
     check('{ key: "n"' not in html, "趋势图不得再画降噪曲线")
     check("调音" in html, "界面要显示调音（24 频段 EQ）")
+    check("设备录音（控制设备自己的麦克风）" not in html, "主界面不得再把诊断采集当成大块产品功能")
+    check("S3 负责录音" in html, "界面要明确 S3 承担 recording")
+    check("LLM 工作台" in html, "上位机要显示 LLM 工作状态")
 
     # 界面脚本里 $("...") 引用的每个 id 都必须真的存在于 HTML 里。这条纯 Python 也能查，
     # 而且正好挡住最常见的界面故障：改了 id、忘了同步脚本，于是某一块悄悄不再更新。
@@ -2092,6 +2099,123 @@ def test_voiceprint_decision_telemetry() -> None:
     )
 
 
+def test_assistant_snapshot_is_truthful_without_asr() -> None:
+    service = AssistantService()
+    snapshot = service.snapshot()
+    check("state_text" in snapshot, "LLM 状态必须可显示")
+    check("asr_ready" in snapshot and "asr_model" in snapshot,
+          "ASR 加载状态和模型名必须进入上位机快照")
+    eq(snapshot["transcript"], "尚无转写", "没接 ASR 时不能伪造转写")
+    eq(snapshot["summary_state"], "尚无可总结会话", "没会话时不能伪造摘要")
+
+    service.recording_started(16000, 5)
+    during = service.snapshot()
+    check("正在接收" in during["task"], "S3 开始录音必须成为 LLM 可见事件")
+    check(during["capture_channel"]["active"], "页面必须明确显示采集通道已经开始")
+    check(during["capture_channel"]["started_at"], "采集通道必须显示开始时间")
+    service.recording_finished(audio_seconds=3.2, chunks=50, chunks_lost=0)
+    finished = service.snapshot()
+    eq(finished["today_sessions"], 1, "S3 完成录音必须计入今日会话")
+    check("声纹窗口" in finished["transcript"], "结束事件必须先进入声纹对齐状态")
+    eq(finished["segments"][0]["end_reason"], "设备录音结束", "片段必须显示停止原因")
+
+    stream = AssistantService()
+    stream.recording_started(16000, 0)
+    eq(stream.snapshot()["task"], "正在监听 S3 候选人声 · 16000 Hz",
+       "无限录音流应被识别为传输通道，不能永远等待 finished")
+
+    attributed = AssistantService(voiceprint_snapshot=lambda: {
+        "ready": True,
+        "history": [
+            {"verdict": "self", "start_sample": 0, "end_sample": 12000},
+            {"verdict": "other", "start_sample": 12000, "end_sample": 24000},
+        ],
+    })
+    segments = attributed._speaker_segments(b"\0\0" * 24000, 16000, 0)
+    eq([speaker for speaker, _ in segments], ["self", "other"],
+       "声纹窗口必须切成带 self/other 身份的 ASR 轮次")
+    unknown = AssistantService()._speaker_segments(b"\0\0" * 12000, 16000, 0)
+    eq(unknown[0][0], "unknown", "缺失声纹证据时不得把转录归给任何人")
+
+    fallback = service._local_summary({
+        "session": 3, "audio_seconds": 4.2, "chunks_lost": 0,
+        "s3_ambient_open_intent_frames": 7, "transcript": "self：你好，这是一段测试。",
+        "speaker_turns": [("self", "你好，这是一段测试。")],
+    })
+    check("ASR：self：你好，这是一段测试。" in fallback, "LLM 拒答时必须保留带身份逐字稿")
+    check("仅检测到佩戴者" in fallback, "只有 self 时不得标成对话")
+    check("不代表实际开放" in fallback, "本地摘要不得把 S3 意图写成执行事实")
+
+
+def test_assistant_rolls_continuous_speech_into_asr_segments() -> None:
+    class Frame:
+        conversation = "LIKELY"
+        environment = "VOICE"
+        voice_likelihood = 0.9
+        ambient_open = False
+
+    service = AssistantService()
+    dispatched = []
+    service._dispatch_event = lambda *args: dispatched.append(args)  # type: ignore[method-assign]
+    service.recording_started(16000, 0)
+    service.observe_frame(Frame())
+    service.feed_audio(type("Chunk", (), {"pcm": b"\0\0" * 1600, "rate": 16000})())
+    service._conversation_started_at = time.monotonic() - service._MAX_CONTINUOUS_SEGMENT_S
+    service.observe_frame(Frame())
+
+    eq(len(dispatched), 1, "连续人声达到分段上限后必须提交 ASR，不能无限等待 3 秒静音")
+    check(dispatched[0][5], "滚动提交给 ASR 的片段必须包含实际音频")
+    eq(service.snapshot()["today_sessions"], 1, "滚动提交也必须计入候选片段")
+    segment = service.snapshot()["segments"][0]
+    check(segment["started_at"] and segment["ended_at"], "片段必须显示明确的起止时间")
+    eq(segment["end_reason"], "达到15秒，自动分段", "持续人声必须解释自动停止原因")
+
+
+def test_assistant_boosts_only_quiet_asr_copy() -> None:
+    quiet = struct.pack("<100h", *([300] * 100))
+    boosted, gain_db = AssistantService._prepare_asr_audio(quiet)
+    check(gain_db > 17.9, "30厘米远场录音应获得受限的 ASR 副本增益")
+    check(max(struct.unpack("<100h", boosted)) > 2000, "远场 PCM 必须实际被提升")
+
+    loud = struct.pack("<100h", *([5000] * 100))
+    unchanged, loud_gain = AssistantService._prepare_asr_audio(loud)
+    eq(unchanged, loud, "足够响的录音不得再次放大")
+    eq(loud_gain, 0.0, "足够响的录音应报告零 ASR 增益")
+
+
+def test_ambient_requires_fresh_other_voiceprint() -> None:
+    class Frame:
+        def __init__(self, sequence, voice=0.9, event="speech"):
+            self.sequence = sequence
+            self.voice_likelihood = voice
+            self.event = event
+
+    check(voiceprint_allows_ambient({"ready": True, "verdict": "other", "age_s": 0.2}),
+          "新鲜 other 才能放行环境声")
+    for snapshot in (
+        {"ready": True, "verdict": "self", "age_s": 0.2},
+        {"ready": True, "verdict": None, "age_s": 0.2},
+        {"ready": False, "verdict": "other", "age_s": 0.2},
+        {"ready": True, "verdict": "other", "age_s": 3.1},
+        {"ready": True, "verdict": "other", "age_s": None},
+    ):
+        check(not voiceprint_allows_ambient(snapshot),
+              f"self/unknown/pending/stale/failure 必须关闭环境声：{snapshot}")
+
+    gate = DialogueTurnGate(window_s=12.0)
+    other = {"ready": True, "verdict": "other", "age_s": 0.2}
+    own = {"ready": True, "verdict": "self", "age_s": 0.2}
+    check(not gate.allows(other, Frame(1), now=1.0), "只有 other 不代表正在对话")
+    check(not gate.allows(own, Frame(2), now=3.0), "自己说话时必须关闭环境声")
+    check(not gate.allows(other, Frame(3), now=4.0), "一帧 other 人声不足以开放")
+    check(not gate.allows(other, Frame(4), now=4.1), "两帧 other 人声不足以开放")
+    check(gate.allows(other, Frame(5), now=4.2), "轮次成立且连续三帧对方人声才开放")
+    check(not gate.allows(other, Frame(6, voice=0.2, event="keyboard"), now=4.3),
+          "LIKELY 保持期里的键盘声必须立即关闭")
+    check(not gate.allows(own, Frame(7), now=5.0), "对话中轮到自己时仍要关闭")
+    check(not gate.allows(other, Frame(8), now=20.0), "轮次证据过期后不得沿用旧对话")
+
+
 def main() -> int:
     tests = [
         test_d2_matches_c_printf,
@@ -2151,6 +2275,10 @@ def main() -> int:
         test_control_ack_requires_a_new_capture_event,
         test_stop_cleanup_is_idempotent_and_runs_before_exit,
         test_voiceprint_decision_telemetry,
+        test_assistant_snapshot_is_truthful_without_asr,
+        test_assistant_rolls_continuous_speech_into_asr_segments,
+        test_assistant_boosts_only_quiet_asr_copy,
+        test_ambient_requires_fresh_other_voiceprint,
     ]
     for test in tests:
         try:

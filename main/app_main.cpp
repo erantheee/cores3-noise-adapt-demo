@@ -99,7 +99,6 @@ bool g_voiceprint_valid = false;
 bool g_voiceprint_self = false;
 float g_voiceprint_score = 0.0f;
 int64_t g_voiceprint_us = 0;
-bool g_voiceprint_pending_reset = false;
 /// 3 s 内没有新判定就当作不可用：既用于 self veto，也用于授权过期。
 constexpr int64_t kVoiceprintHoldUs = 3000000;
 
@@ -359,9 +358,8 @@ bool poll_console_command() {
                     } else if (std::strncmp(value, "other", 5) == 0) {
                         g_voiceprint_self = false;
                     } else if (std::strncmp(value, "pending", 7) == 0) {
-                        // Host 已启用声纹，但首个 embedding 尚未完成：清掉旧判定并让控制器
-                        // 回到干净状态，但**不锁**任何对话动作——pending 不是说话人，
-                        // 锁住它就会在 worker 起不来时把功能永久废掉（HEAD 的教训）。
+                        // Host 已启用声纹，但当前 embedding 没有可靠身份：撤销旧身份。
+                        // pending 不是说话人，也不能重置 EQ、对话状态或控制帧序号。
                         pending = true;
                         g_voiceprint_self = false;
                     } else if (std::strncmp(value, "off", 3) == 0 ||
@@ -372,7 +370,6 @@ bool poll_console_command() {
                         g_voiceprint_self = false;
                         g_voiceprint_score = 0.0f;
                         g_voiceprint_us = 0;
-                        g_voiceprint_pending_reset = true;
                         std::printf("voiceprint ack off\n");
                         handled = true;
                         goto voiceprint_done;
@@ -383,10 +380,9 @@ bool poll_console_command() {
                     g_voiceprint_valid = true;
                     g_voiceprint_score = score;
                     g_voiceprint_us = esp_timer_get_time();
-                    if (pending) {
-                        // pending 不是一个说话人判定：清空旧判定，只触发一次控制器复位。
-                        g_voiceprint_pending_reset = true;
-                    }
+                    // pending 只撤销说话人身份，不得重置持续控制器。worker 在安静环境下会
+                    // 周期性回传 pending；整机 reset 会把控制帧序号、EQ 平滑状态和对话状态
+                    // 一起清零，表现成 8→1/9→1 的假重启以及音量/EQ 抖动。
                     // 非 JSON 行：host 的协议解析器会忽略它，monitor 能看到。
                     std::printf("voiceprint ack %s %.2f\n",
                                 pending ? "pending" : (g_voiceprint_self ? "self" : "other"),
@@ -873,10 +869,6 @@ void processing_task(void*) {
             evaluate_voiceprint(g_voiceprint_valid, g_voiceprint_self,
                                 now_us - g_voiceprint_us, kVoiceprintHoldUs);
         const bool external_self_voice = voiceprint.self_voice;
-        if (g_voiceprint_pending_reset) {
-            controller.reset();
-            g_voiceprint_pending_reset = false;
-        }
         EarbudCommand command =
             controller.update(frame, elapsed_ms, non_voice_event, external_self_voice);
         command.event.valid = sound_event_out.valid;

@@ -267,6 +267,9 @@ class HostState:
         self.latency: LatencyReport | None = None
         #: WavLM 声纹 self-veto 门控（tools/host/voiceprint.py）。None = 本次没启用。
         self.voiceprint: object | None = None
+        #: 上位机的 ASR/LLM 工作流。当前尚未接入；显式保留 None，避免界面把占位状态
+        #: 误报成“正在总结”。后续服务只需实现 snapshot() 即可挂入。
+        self.assistant = None
         self.latency_at: float | None = None
 
         self.capture_state: str | None = None
@@ -359,6 +362,11 @@ class HostState:
         with self.lock:
             self.voiceprint = voiceprint
 
+    def attach_assistant(self, assistant: object | None) -> None:
+        """挂上转写/LLM/会话账本服务；None 表示本次运行未配置。"""
+        with self.lock:
+            self.assistant = assistant
+
     def attach_ambient(self, ambient: object | None) -> None:
         """挂上环境声执行端（tools/host/ambient.py）。
 
@@ -440,6 +448,10 @@ class HostState:
                 self.stats.max_silence_ms = max(self.stats.max_silence_ms, interval_ms)
         self.last_frame_at = now
         self.latest = frame
+        if self.assistant is not None:
+            observe = getattr(self.assistant, "observe_frame", None)
+            if observe is not None:
+                observe(frame)
 
         self.samples.append(
             {
@@ -548,6 +560,10 @@ class HostState:
             )
             self.log("capture", f"设备开始录音（{duration}）", f"{self.capture_rate} Hz")
             self.note("设备进入录音状态：控制节拍放宽到 250 ms，属预期行为")
+            if self.assistant is not None:
+                callback = getattr(self.assistant, "recording_started", None)
+                if callback is not None:
+                    callback(self.capture_rate, self.capture_seconds)
         elif event.state == "stopped":
             self.recording = False
             self.capture_state = "stopped"
@@ -563,6 +579,15 @@ class HostState:
                 if self.capture_rate
                 else "",
             )
+            if self.assistant is not None:
+                callback = getattr(self.assistant, "recording_finished", None)
+                if callback is not None:
+                    callback(
+                        audio_seconds=self.audio_samples / self.capture_rate
+                        if self.capture_rate else 0.0,
+                        chunks=self.stats.chunks,
+                        chunks_lost=self.stats.chunks_lost,
+                    )
         elif event.state == "progress":
             # 设备自报的录音通路计数。这不是给最终用户看的数字，而是"录音为什么不满"
             # 的唯一现场证据：上位机只负责原样呈现，不做解释。
@@ -591,6 +616,10 @@ class HostState:
                     )
             self._expected_chunk = chunk.sequence + 1
         self.audio_samples += chunk.sample_count
+        if self.assistant is not None:
+            callback = getattr(self.assistant, "feed_audio", None)
+            if callback is not None:
+                callback(chunk)
         if self.on_mic_chunk is not None:
             self.on_mic_chunk(chunk)
 
@@ -672,6 +701,15 @@ class HostState:
             #: 设备意图在 frame.ambient_open，两者必须分开读。
             "ambient": self.ambient.snapshot() if self.ambient is not None else None,
             "voiceprint": self.voiceprint.snapshot() if self.voiceprint is not None else None,
+            "assistant": self.assistant.snapshot() if self.assistant is not None else {
+                "available": False,
+                "state": "not_configured",
+                "state_text": "未接入",
+                "task": "等待接入 ASR 与 LLM",
+                "transcript": "尚无转写",
+                "summary_state": "尚无会话账本",
+                "today_sessions": None,
+            },
             "control": {
                 "sent": self.control_sent,
                 "acknowledged": self.control_acknowledged,

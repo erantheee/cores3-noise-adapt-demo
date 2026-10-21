@@ -3,6 +3,9 @@ outputs/
 managed_components/
 sdkconfig
 .DS_Store
+.env
+.env.local
+.asr-venv/
 __pycache__/
 *.pyc
 build-host-tests/
