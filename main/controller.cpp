@@ -371,8 +371,7 @@ float voice_likelihood_from_features(const VoiceFeatures& features) {
 
 EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms,
                                     bool non_voice_event,
-                                    bool external_self_voice,
-                                    bool conversation_authorized) {
+                                    bool external_self_voice) {
     EarbudCommand command;
     command.sequence = ++sequence_;
     command.timestamp_ms = frame.timestamp_ms;
@@ -409,12 +408,13 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms,
         // 若和 EQ 用同一个门槛，键盘/风扇/远处人声都会反复把对话顶起来（2026-10-19 实测
         // 环境声一直开着）。对话是更重的动作，门槛必须更高。
         constexpr float kConversationVoiceThreshold = 0.65f;
-        // self 且尚未观察到 other 轮次时，视为哼唱/自言自语：不触发人声 EQ 或对话。
+        // self 判定（声纹，3 s 内新鲜）视为哼唱/自言自语：不触发人声 EQ 或对话。
+        // other / 没有判定都走 D16 的预判逻辑（D28 step3）。
         const bool speech_active =
             !non_voice_event && !external_self_voice &&
             voice > 0.55f && frame.broadband_dbfs > -58.0f;
         const bool conversation_voice =
-            conversation_authorized && !non_voice_event && !external_self_voice &&
+            !non_voice_event && !external_self_voice &&
             voice > kConversationVoiceThreshold && frame.broadband_dbfs > -58.0f;
 
         // **预判输入**：附近有人开口 = 对话正在开始。这是提前量的唯一来源——"我开口"只能
@@ -486,13 +486,13 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms,
         command.evidence_policy = evidence_policy_;
 
         // 动作是分离的，字段也必须分离：
-        //   * SONG_EQ 是歌曲的 24 段 EQ 建议，也是唯一会写 eq_gain_db 的模式；
-        //   * EXTERNAL_VOICE_INTENT 是现实人声增益意图，只走标量；
+        //   * SONG_EQ 写歌曲的 24 段噪声补偿曲线；
+        //   * EXTERNAL_VOICE_INTENT 写背景/别人说话的 1–3.6 kHz 中频抬升（D26 恢复），
+        //     但现实人声增益本身仍只走标量 `external_voice_gain_db`，不是"用歌曲中频
+        //     假装现实人声增强"——D0 的字段分离不变；
         //   * SAFETY_HOLD 禁止正增益。
-        // 为什么外部人声模式不再写 eq_gain_db：AirPods 执行不了"现实人声增益"，把同一条
-        // 1–4 kHz 曲线加到歌曲上就是"用歌曲中频假装人声增强"——D0 明确禁止，README 也写着
-        // 该模式下 eq_gain_db 必须平直。之前为了让面板动起来写进去过，那是演示便利，
-        // 不是产品行为；这里按契约改回平直。
+        // 已确认的对话（以及 self 判定）走 flat + 下压：这是 D25/D26 的"对话 EQ 全平"，
+        // 不在歌曲上叠任何抬升。
         if (conversation_active || external_self_voice) {
             // 自己说话不算对话：环境声不开、外部人声 EQ 不动；模式保持平直。
             command.environment = EnvironmentKind::voice_likely;
@@ -612,6 +612,15 @@ void AdaptController::reset() {
     awareness_params.duck_floor_percent = static_cast<float>(kDemoMediaFloorPercent);
     awareness_.set_params(awareness_params);
     awareness_.reset();
+}
+
+VoiceprintDecision evaluate_voiceprint(bool valid, bool self_verdict, int64_t age_us,
+                                      int64_t hold_us) {
+    VoiceprintDecision decision;
+    // 负的 hold 是配置错误：当成"永不过期"没有意义，直接视为不激活。
+    decision.active = valid && hold_us > 0 && age_us >= 0 && age_us <= hold_us;
+    decision.self_voice = decision.active && self_verdict;
+    return decision;
 }
 
 const char* adapt_state_name(AdaptState state) {

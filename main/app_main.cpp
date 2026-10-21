@@ -87,6 +87,22 @@ constexpr int64_t kLatencyReportPeriodUs = 10 * 1000 * 1000;
 const char* kTag = "cores3_noise_adapt";
 MacAudioRoute g_mac_route;
 
+// ---- Mac 侧 WavLM 声纹判定（串口回传）----
+// self/other 是**说话人判定**，不是目标人分类：self = 佩戴者自己，other = 别人。
+// D28 step3 的语义：self → 不压媒体、不抬歌曲 EQ、不开环境声；other 与"没有判定"都按
+// D16 的预判逻辑走。
+//
+// 判定超过 kVoiceprintHoldUs 没有新行就视为过期，过期后不再影响任何决策。这是对
+// "worker 挂一次 / 上位机重启后对话被永久锁死"的修复：门控必须能自己退出，而不是
+// 等设备重启。emit_command_json 也读这几个量做 v4 遥测，所以它们定义在它之前。
+bool g_voiceprint_valid = false;
+bool g_voiceprint_self = false;
+float g_voiceprint_score = 0.0f;
+int64_t g_voiceprint_us = 0;
+bool g_voiceprint_pending_reset = false;
+/// 3 s 内没有新判定就当作不可用：既用于 self veto，也用于授权过期。
+constexpr int64_t kVoiceprintHoldUs = 3000000;
+
 /// Emit one frame of EarbudCommand v4.
 ///
 /// v3 adds the own-voice evidence (`own_voice_confidence` / `own_voice_correlation` /
@@ -108,6 +124,15 @@ MacAudioRoute g_mac_route;
 /// Band gains are printed with one decimal on purpose: they only ever hold 0 or a small
 /// per-band value from SONG_EQ, and one decimal keeps a frame near 250 bytes.
 void emit_command_json(const EarbudCommand& command) {
+    // 声纹门控遥测（v4 只增键）：valid 是"当前是否有新鲜判定"而不是"曾经收到过"，
+    // age=-1 表示从未收到。把它报出来，现场才分得清"没人说话"与"声纹判定已过期/停用"。
+    const int64_t voiceprint_age_us =
+        g_voiceprint_us > 0 ? (esp_timer_get_time() - g_voiceprint_us) : -1;
+    const VoiceprintDecision voiceprint =
+        evaluate_voiceprint(g_voiceprint_valid, g_voiceprint_self, voiceprint_age_us,
+                            kVoiceprintHoldUs);
+    const long voiceprint_age_ms =
+        voiceprint_age_us >= 0 ? static_cast<long>(voiceprint_age_us / 1000) : -1L;
     std::printf("{\"type\":\"earbud_command\",\"schema\":%lu,\"sequence\":%lu,"
                 "\"timestamp_ms\":%lu,\"speech_gain_db\":%.2f,"
                 "\"external_voice_gain_db\":%.2f,\"media_percent\":%u,"
@@ -123,6 +148,10 @@ void emit_command_json(const EarbudCommand& command) {
                 "\"own_voice_source\":\"%s\","
                 "\"imu_ok\":%s,\"imu_motion\":%s,\"imu_drops\":%lu,"
                 "\"imu_samples\":%lu,\"own_voice_policy\":\"%s\","
+                // 声纹门控遥测（v4 上追加的键，不涨 schema）：valid = 当前是否有新鲜判定，
+                // self = 当前 verdict，age_ms = -1 表示从未收到。
+                "\"voiceprint_valid\":%s,\"voiceprint_self\":%s,"
+                "\"voiceprint_age_ms\":%ld,"
                 "\"execution\":\"decision_only\",\"link\":\"simulated\","
                 "\"eq_gain_db\":[",
                 static_cast<unsigned long>(command.schema_version),
@@ -152,7 +181,10 @@ void emit_command_json(const EarbudCommand& command) {
                 command.own_voice.motion ? "true" : "false",
                 static_cast<unsigned long>(g_imu_drops),
                 static_cast<unsigned long>(g_imu_samples),
-                evidence_policy_name(command.evidence_policy));
+                evidence_policy_name(command.evidence_policy),
+                voiceprint.active ? "true" : "false",
+                g_voiceprint_self ? "true" : "false",
+                voiceprint_age_ms);
     for (std::size_t band = 0; band < kBandCount; ++band) {
         std::printf("%s%.1f", band == 0 ? "" : ",", static_cast<double>(command.eq_gain_db[band]));
     }
@@ -251,18 +283,6 @@ void emit_latency_report(latency::LatencyProfiler& profiler,
 /// Written by the console poll and read by the audio task.
 volatile int32_t g_record_seconds = -1;
 
-// ---- Mac 侧 WavLM 声纹判定（串口回传）----
-// self/other 不是目标人分类，而是对话轮次证据：双方在短窗口内都说过才算对话。
-bool g_voiceprint_valid = false;
-bool g_voiceprint_self = false;
-float g_voiceprint_score = 0.0f;
-int64_t g_voiceprint_us = 0;
-int64_t g_voiceprint_last_self_us = 0;
-int64_t g_voiceprint_last_other_us = 0;
-bool g_voiceprint_pending_reset = false;
-constexpr int64_t kVoiceprintHoldUs = 3000000;  // 3 s 内没有新判定就当作不可用
-constexpr int64_t kConversationTurnWindowUs = 5000000;  // 双方轮次最多相隔 5 s
-
 constexpr std::size_t kConsoleLineMax = 96;
 char g_console_line[kConsoleLineMax];
 std::size_t g_console_fill = 0;
@@ -339,10 +359,23 @@ bool poll_console_command() {
                     } else if (std::strncmp(value, "other", 5) == 0) {
                         g_voiceprint_self = false;
                     } else if (std::strncmp(value, "pending", 7) == 0) {
-                        // Host 已启用声纹，但首个 embedding 尚未完成。先锁住对话动作，
-                        // 不能用这 1.5 s 空窗按旧逻辑误开环境声。
+                        // Host 已启用声纹，但首个 embedding 尚未完成：清掉旧判定并让控制器
+                        // 回到干净状态，但**不锁**任何对话动作——pending 不是说话人，
+                        // 锁住它就会在 worker 起不来时把功能永久废掉（HEAD 的教训）。
                         pending = true;
                         g_voiceprint_self = false;
+                    } else if (std::strncmp(value, "off", 3) == 0 ||
+                               std::strncmp(value, "none", 4) == 0) {
+                        // Host 明确停用声纹（或重启后不再带 --voiceprint）：立刻退出 veto，
+                        // 回到 D16 的纯预判逻辑，不需要重启设备。
+                        g_voiceprint_valid = false;
+                        g_voiceprint_self = false;
+                        g_voiceprint_score = 0.0f;
+                        g_voiceprint_us = 0;
+                        g_voiceprint_pending_reset = true;
+                        std::printf("voiceprint ack off\n");
+                        handled = true;
+                        goto voiceprint_done;
                     } else {
                         goto voiceprint_done;
                     }
@@ -351,14 +384,8 @@ bool poll_console_command() {
                     g_voiceprint_score = score;
                     g_voiceprint_us = esp_timer_get_time();
                     if (pending) {
-                        // pending 不是一个说话人轮次。
-                        g_voiceprint_last_self_us = 0;
-                        g_voiceprint_last_other_us = 0;
+                        // pending 不是一个说话人判定：清空旧判定，只触发一次控制器复位。
                         g_voiceprint_pending_reset = true;
-                    } else if (g_voiceprint_self) {
-                        g_voiceprint_last_self_us = g_voiceprint_us;
-                    } else {
-                        g_voiceprint_last_other_us = g_voiceprint_us;
                     }
                     // 非 JSON 行：host 的协议解析器会忽略它，monitor 能看到。
                     std::printf("voiceprint ack %s %.2f\n",
@@ -839,25 +866,19 @@ void processing_task(void*) {
              sound_event_out.cls == sound_event::Class::wind ||
              sound_event_out.cls == sound_event::Class::artifact);
 
-        // 双方轮次才是对话。other 单独出现仍可做背景人声 EQ，但不开环境声；
-        // self 单独出现（哼唱/自言自语）连人声 EQ 也不触发。
-        const bool voiceprint_fresh =
-            g_voiceprint_valid && (now_us - g_voiceprint_us) <= kVoiceprintHoldUs;
-        const bool voiceprint_conversation =
-            g_voiceprint_last_self_us > 0 && g_voiceprint_last_other_us > 0 &&
-            (now_us - g_voiceprint_last_self_us) <= kConversationTurnWindowUs &&
-            (now_us - g_voiceprint_last_other_us) <= kConversationTurnWindowUs;
-        const bool external_self_voice =
-            voiceprint_fresh && g_voiceprint_self && !voiceprint_conversation;
-        const bool conversation_authorized =
-            !g_voiceprint_valid || voiceprint_conversation;
+        // 声纹门控（D28 step3）：self → 不压媒体、不抬歌曲 EQ、不开环境声；
+        // other 或没有判定 → 按 D16 的预判逻辑走。判定超过 3 s 没有新行即过期，
+        // 过期后不再影响任何决策——worker 挂掉或上位机重启不会把功能锁死。
+        const VoiceprintDecision voiceprint =
+            evaluate_voiceprint(g_voiceprint_valid, g_voiceprint_self,
+                                now_us - g_voiceprint_us, kVoiceprintHoldUs);
+        const bool external_self_voice = voiceprint.self_voice;
         if (g_voiceprint_pending_reset) {
             controller.reset();
             g_voiceprint_pending_reset = false;
         }
         EarbudCommand command =
-            controller.update(frame, elapsed_ms, non_voice_event, external_self_voice,
-                              conversation_authorized);
+            controller.update(frame, elapsed_ms, non_voice_event, external_self_voice);
         command.event.valid = sound_event_out.valid;
         command.event.class_name = sound_event::class_name(sound_event_out.cls);
         const int64_t decide_done_us = esp_timer_get_time();

@@ -20,10 +20,11 @@ constexpr float kMaxSpeechGainDb = 6.5f;
 /// +10 dB of gain) and from the measured OWS result in the sibling project (speech band +7.8 dB
 /// measured, +9.7 dB peak, hard constraint 10 dB). So:
 ///   * gain swing 0 → kDemoSpeechGainDb (8.0 dB, inside the measured/verified range, 2 dB margin)
-///   * **the 24-band EQ is SONG_EQ only**. External-voice intent is a scalar intent; it must not be
-///     written into the song's speech band, because that is exactly the substitution D0 forbids
-///     (real-voice gain must not be expressed as a 1–4 kHz song EQ). An earlier demo revision did
-///     write it there to make the panel move; that was a contract violation, not a feature.
+///   * **the 24-band EQ has exactly two writers** (D26): SONG_EQ writes the noise-shaped 24-band
+///     suggestion, and EXTERNAL_VOICE_INTENT writes a 1–3.6 kHz hump for background/other speech.
+///     D0's separation still holds where it matters: the scalar `external_voice_gain_db` is the
+///     real-voice intent, and a confirmed conversation / self-voice stays flat (the song EQ is
+///     never used to pretend real-voice gain).
 ///   * media ducks to kDemoMediaFloorPercent (60%): enough to expose dialogue while keeping the
 ///     programme present. The previous 25% floor was a strong demo value, not a model result.
 constexpr float kDemoSpeechGainDb = 8.0f;
@@ -183,6 +184,23 @@ struct OwnVoiceEvidence {
     bool imu_ok = false;
 };
 
+/// Mac 侧 WavLM 声纹判定（串口回传 self / other）对决策的含义。
+///
+/// D28 step3 的语义：**只把 self 当否决**——佩戴者自己说话时，不压媒体、不抬歌曲 EQ、
+/// 不开环境声；other 以及"没有判定"都按 D16 的预判逻辑走。判定超过 hold_us 没有新行即
+/// 过期，过期后不再影响任何决策：这是对"worker 崩一次 / 上位机重启后对话被永久锁死"的
+/// 修复，门控必须 fail-open 到 D16，而不是 fail-closed 到永不动作。
+struct VoiceprintDecision {
+    /// 当前有一个不超过 hold_us 的新鲜判定（valid 且 age_us ∈ [0, hold_us]）。
+    bool active = false;
+    /// 新鲜判定且判定为佩戴者自己；只有它为 true 才否决对话动作。
+    bool self_voice = false;
+};
+
+/// 纯函数，便于主机单测。`age_us < 0` 表示从未收到过判定。
+VoiceprintDecision evaluate_voiceprint(bool valid, bool self_verdict, int64_t age_us,
+                                      int64_t hold_us);
+
 struct EarbudCommand {
     /// v4 加了 `ambient_open`（环境声开放意图）。v3（自身语音证据）已上过机，所以新增
     /// 字段必须涨版本；上位机同时读得懂 v1–v4。
@@ -298,8 +316,7 @@ class AdaptController {
 public:
     EarbudCommand update(const AnalysisFrame& frame, float dt_ms,
                          bool non_voice_event = false,
-                         bool external_self_voice = false,
-                         bool conversation_authorized = true);
+                         bool external_self_voice = false);
     void reset();
 
     /// 最近一次对话感知输出。工具与测试用它读 own_voice / 状态 / 已下压时长，

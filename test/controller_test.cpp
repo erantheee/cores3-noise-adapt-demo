@@ -86,11 +86,13 @@ int main() {
     }
 
     // ---- 预判：第一帧就压，环境声等到确认后才开 ----
+    // external_self_voice 显式给 false：声纹没有 self 判定时，D16 的预判必须照常发生。
     {
         AdaptController predictor;
         // -50 dBFS：比近场代理的门限（-45）更低，所以 own_voice 证据为 0；但对话 cue 的
         // 门限是 -58 起，仍应触发预判。这条就是"预判不依赖我开口"的最小证明。
-        auto first = predictor.update(frame(-50, 0.8f), 150);
+        auto first = predictor.update(frame(-50, 0.8f), 150, /*non_voice_event=*/false,
+                                      /*external_self_voice=*/false);
         check(first.conversation == ConversationState::anticipating,
               "a nearby voice starts anticipating on the first frame");
         check(first.media_percent < 90, "anticipation ducks the media before I speak");
@@ -101,7 +103,10 @@ int main() {
         check(all_bands_flat(first), "anticipation leaves the song EQ flat");
 
         EarbudCommand engaged = first;
-        for (int i = 0; i < 12; ++i) engaged = predictor.update(frame(-50, 0.8f), 150);
+        for (int i = 0; i < 12; ++i) {
+            engaged = predictor.update(frame(-50, 0.8f), 150, /*non_voice_event=*/false,
+                                       /*external_self_voice=*/false);
+        }
         check(engaged.conversation == ConversationState::likely,
               "sustained nearby voice confirms the conversation");
         check(engaged.ambient_open, "confirmed conversation asks for the environment to open");
@@ -195,34 +200,24 @@ int main() {
         check(!any_eq, "self 声纹不得产生正增益");
     }
 
-    // ---- 只有 other、没有 self 轮次：可做背景人声 EQ，但不能当成正在对话 ----
+    // ---- 声纹门控纯函数（D28 step3）：只有 self 是否决，other / 无判定都走 D16 ----
+    // HEAD 的"双方轮次才授权对话"语义已删除；self 的完整否决路径见上一段。
     {
-        AdaptController other_only;
-        EarbudCommand out;
-        for (int i = 0; i < 12; ++i) {
-            out = other_only.update(frame(-45, 0.9f), 150, false, false,
-                                    /*conversation_authorized=*/false);
-        }
-        check(out.conversation == ConversationState::speech_nearby,
-              "other-only speech remains background speech");
-        check(!out.ambient_open && out.media_percent == 100,
-              "other-only speech does not open ambient or duck media");
-        check(out.tuning_mode == TuningMode::external_voice_intent,
-              "other-only speech may still receive background voice EQ");
-    }
+        const VoiceprintDecision fresh_self = evaluate_voiceprint(true, true, 1000, 3000000);
+        check(fresh_self.active && fresh_self.self_voice,
+              "fresh self verdict activates the self veto");
 
-    // ---- self 与 other 都出现：允许对话状态机开放环境声并让媒体 EQ 让位 ----
-    {
-        AdaptController turn_taking;
-        EarbudCommand out;
-        for (int i = 0; i < 12; ++i) {
-            out = turn_taking.update(frame(-45, 0.9f), 150, false, false,
-                                     /*conversation_authorized=*/true);
-        }
-        check(out.conversation == ConversationState::likely && out.ambient_open,
-              "self/other turn taking authorizes conversation");
-        check(out.media_percent <= 61 && all_bands_flat(out),
-              "authorized conversation ducks media and yields the song EQ");
+        const VoiceprintDecision fresh_other = evaluate_voiceprint(true, false, 1000, 3000000);
+        check(fresh_other.active && !fresh_other.self_voice,
+              "fresh other verdict is active but does not veto conversation");
+
+        const VoiceprintDecision stale = evaluate_voiceprint(true, true, 4000000, 3000000);
+        check(!stale.active && !stale.self_voice,
+              "a stale verdict stops affecting decisions (no permanent lock)");
+
+        const VoiceprintDecision never = evaluate_voiceprint(false, false, 0, 3000000);
+        check(!never.active && !never.self_voice,
+              "no verdict never activates the veto");
     }
 
     // ---- 键盘/风/撞击事件不参与对话证据 ----
