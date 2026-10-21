@@ -34,6 +34,21 @@ CoreS3 承担耳机仓侧的感知、判断与决策；Mac 承担本次 Demo 的
 完成了目标人声增强；环境声只通过切换聆听模式（通透）实现，不是目标人声提取。真实执行链路尚未
 接通时，协议固定上报 `execution: decision_only`。
 
+## 2026-10-21 收尾变更（本轮）
+
+- **环境声执行端默认关闭（D30）**：`host_up.sh` 真机默认 `--ambient-executor off`，只显示
+  `ambient_open` 意图；要环境声必须显式传 `--ambient-executor relay` 或 `airpods`。
+- **声纹 self-veto（D28 第 3 步 / D31）**：Mac 侧 WavLM-SV 判定经串口回传给 S3
+  （`voiceprint self` / `other` / `pending`；host 退出时发 `off`）。`self` → 不压媒体、不抬人声 EQ、不开环境声；
+  `other` → 按 D16 的预判逻辑正常动作。判定 **3 秒**没有新行就自动过期，不再永久锁死；
+  host 串口关闭/退出时发 `voiceprint off` 清空 S3 侧状态。`--voiceprint` 仍是**实验性门控**，
+  默认演示不带，也还没有过验收。
+- **固件遥测**：新增 `voiceprint_valid` / `voiceprint_self` / `voiceprint_age_ms`，
+  只增键，schema 仍为 4。
+- **上位机修复**：回控回执只在收到**新的** `capture` 事件时才算 `acknowledged`（缓存事件
+  不能把"写成功"说成"设备照做"）；`/api/stop` 先执行清理（含 `ambient.stop`）再退出。
+- 本轮未做的 P2 与已知限制见 [`TODOS.md`](TODOS.md)。
+
 ## 三笔账的当前状态
 
 **账 1 分段延迟：端侧部分已实测。** 下列数字来自当前在跑的固件（实测日期 2026-10-14：设备在跑，
@@ -74,10 +89,12 @@ CoreS3 承担耳机仓侧的感知、判断与决策；Mac 承担本次 Demo 的
 | 1 | 一小时连续运行的延迟漂移 | 未测 | 需设备在场跑 `tools/drift_capture.py` |
 | 2 | 近场拾音信噪比 vs Mac 的 **0.9 dB** | 未测 | 需录三类音频；双麦是否可用也待验 |
 | 3 | 判据阈值用真实录音标定 | 未做 | 需录安静本底/白噪声/纯音/人声 |
-| 4 | 声纹可分性（类间间距 vs 类内抖动） | 未测 | 需同一人**分次、换距离换音量**录多条 |
+| 4 | 声纹可分性（类间间距 vs 类内抖动） | ✅ **已过止损门**（D28） | WavLM-SV 间距/抖动 **6.41**、EER 0%；素材与代理边界见 D27/D28 |
 
 第 4 项带**止损门**：间距/抖动 ≥ 3 且 EER ≤ 5% 才继续，否则停止声纹路线。工具
-`tools/voice_separability.py` 已就位且判据写死。理由见 [`docs/decisions.md` D7](docs/decisions.md)。
+`tools/voice_separability.py` 已就位且判据写死。2026-10-19 用 WavLM-SV 后端通过
+（**6.41 / EER 0%**），声纹据此进入实验性门控；端侧推理仍未实现，Mac 侧 self/other 判定
+与 S3 门控见下文「2026-10-21 收尾变更」。理由见 [`docs/decisions.md` D7](docs/decisions.md)。
 
 ## 真机踩到的坑（换硬件前请先读）
 
@@ -114,8 +131,10 @@ CoreS3 承担耳机仓侧的感知、判断与决策；Mac 承担本次 Demo 的
 - `控制链路`：Mac 串口是否真实连接
 - 第二页显示 `AirPods Pro`、Mac 控制通道和 Mac 回报的蓝牙输出状态
 - 底部信息行：麦克风正常/异常、处理耗时与剩余内存
-- 声音事件（键盘/风/撞击）**目前只进串口与上位机面板**，屏幕还没这一格；屏幕字库是 115 字
-  子集，加任何标题都要先过 `tools/render_demo_ui.py` 的缺字检查
+- 底部那行右侧：声音事件类别（ASCII 的 `keyboard / wind / speech / artifact / quiet`，
+  窗口没攒满时显示 `--`）；事件同时进串口与上位机面板
+- `感知`：端侧听音情境模型的场景类别，把「固件没报 / 窗没满 / 有判断」三种状态分开显示
+- 屏幕字库是 115 字 CJK 子集，加任何新标题都要先过 `tools/render_demo_ui.py` 的缺字检查
 
 开机不播放任何歌曲，内置扬声器保持静音。
 
@@ -134,14 +153,16 @@ v4 = `ambient_open`（环境声开放意图）。`event` / `event_valid`（端�
 只增键不破坏旧解析。上位机同时读得懂 v1–v4，旧帧缺字段一律报 `null`，不猜默认值。
 
 **`ambient_open` 是意图，不是执行回执。** S3 决定"对话成立，应该让现实声音进来"，执行端
-由 Mac 选：当前 demo 是 `--ambient-executor relay`（S3 麦克风中继，S3 说开才放行音频包）；
-后续是 `--ambient-executor airpods`（兄弟工程 `airpods-control` 切通透模式，关闭切回原模式）。
-`host_up.sh` 真机模式默认 `--ambient-executor airpods`（D24）；也可显式传
-`--ambient-executor relay` 或 `off`。执行结果、失败原因、放行/丢弃包数在面板「环境声」卡上单独显示；没有执行端时意图仍然可见，
-不允许把意图写成已执行。
+由 Mac 选：`--ambient-executor relay`（S3 麦克风中继，S3 说开才放行音频包）或
+`--ambient-executor airpods`（兄弟工程 `airpods-control` 切通透模式，关闭切回原模式）。
+**`host_up.sh` 真机模式默认 `--ambient-executor off`（D30）**：默认只显示意图、不执行；
+要环境声必须显式传 `relay` 或 `airpods`。执行结果、失败原因、放行/丢弃包数在面板
+「环境声」卡上单独显示；没有执行端时意图仍然可见，不允许把意图写成已执行。
 
-没有 Mac 执行回执前，`execution` 必须保持 `decision_only`。现实人声模式下 `eq_gain_db` 必须平直；
-否则就是把现实人声增强错误替换成歌曲中频增强。**`eq_gain_db` 现在只有 `SONG_EQ` 会写非零值。**
+没有 Mac 执行回执前，`execution` 必须保持 `decision_only`。`eq_gain_db` 按模式区分（D26）：
+**对话成立 / 声纹判定 self** 时保持平直（下压媒体、不抬歌曲中频）；**背景或别人说话但还没构成
+对话**（`EXTERNAL_VOICE_INTENT`）允许抬 8–16 段（约 1–3.6 kHz）作为代理；**`SONG_EQ`** 按
+环境谱写稳态噪声 EQ；风时低频抬升压到 1/4。不能把"抬歌曲中频"写成"现实人声已增强"。
 
 `eq_gain_db` 是 S3 给 Mac 的歌曲 EQ 建议，`ambient_band_dbfs` 是
 S3 实测环境谱。**Mac 目前只按 S3 的逐段建议 × 深度倍率执行，没有做歌曲内容分析**——"结合歌曲
@@ -149,11 +170,12 @@ S3 实测环境谱。**Mac 目前只按 S3 的逐段建议 × 深度倍率执行
 人声增益意图，不代表 AirPods 已执行。
 
 v4 还带判据遥测：`broadband_dbfs` / `voice_likelihood` / `vocal_ratio` / `spectral_flatness` /
-`vocal_peakiness` / `excited_vocal_bands`。它们只上报，不参与决策，是对话预判训练与误触发排查的
-数据（见 [docs/conversation-prediction.md](docs/conversation-prediction.md)）。
+`vocal_peakiness` / `excited_vocal_bands`；2026-10-21 又追加了声纹回显
+`voiceprint_valid` / `voiceprint_self` / `voiceprint_age_ms`（只增键，schema 仍 4）。
+前六个只上报、不参与决策，是对话预判训练与误触发排查的数据；后三个是 S3 实际采信的声纹
+判定回显，供面板与排查读（见 [docs/conversation-prediction.md](docs/conversation-prediction.md)）。
 
-`noise_reduction_db` 是**降噪量的大小**，取值 0…+8，不是负值偏移（固件的钳位是
-`std::clamp(noise_reduction_db_, 0.0f, kMaxNoiseReductionDb)`，`main/controller.cpp`）。
+`noise_reduction_db` 是**降噪量的大小**，取值 0…+8，不是负值偏移；它只存在于旧固件。
 
 **本机不做降噪**（2026-10-14 用户明确口径）：动作只有**增益与调音**。这个字段曾是固件里的
 残留——控制器算了它、设备屏幕把它列成「降噪」、JSON 也照发，而它在整条链路里没有任何
@@ -213,12 +235,14 @@ v4 还带判据遥测：`broadband_dbfs` / `voice_likelihood` / `vocal_ratio` / 
 - 旧的"自身语音是唯一触发输入"已删除（它只能事后反应）；`own_voice` 只保留为可选确认。
 
 代价写在 D16：播客、电视、旁边桌说话都可能触发预判；当前没有方向与身份信息，靠轮次归属
-（状态表第 36 项）或声纹收紧。验证脚本的旧 C9 断言与新目标冲突，需按 D16 重写。
+（状态表第 36 项）或声纹收紧。验证脚本的旧 C9 断言与新目标冲突，需按 D16 重写
+（本轮未做，见 [`TODOS.md`](TODOS.md)）。
 
 ### 声音事件判断（键盘 / 风 / 撞击）
 
-9 类情境模型没有 keyboard 类，且真实风判不出来；所以另做一条 **1 秒窗的规则判断**（只上报，
-不参与决策），代码在 `main/sound_event.hpp`，现状与数字见
+9 类情境模型没有 keyboard 类，且真实风判不出来；所以另做一条 **1 秒窗的规则判断**
+（分类只上报，但 keyboard / wind / artifact 会作为对话与环境声的**否决条件**，见 D27；
+风还会驱动风 EQ，见 D21），代码在 `main/sound_event.hpp`，现状与数字见
 [`experiments/sound-events/README.md`](experiments/sound-events/README.md)：
 
 - 输入仍是固件已有的 24 段 dBFS + 宽带电平，**不新增 DSP**；15 维特征（质心、斜率、
@@ -264,9 +288,9 @@ idf.py -p /dev/cu.usbmodemXXX flash monitor
 `main/controller.cpp` 刻意不依赖 ESP-IDF，所以整条决策路径可以在开发机上秒级验证。
 **新增判据或阈值时必须在这里补用例。**
 
-当前 **10 个套件、323 条断言**（2026-10-19 实测全部通过）：
-controller 40、noise_analyzer 46、latency_profiler 40、mic_capture 16、mic_decimator 15、
-voiceprint_gate 60、context_window 23、conversation_awareness 38、bone_voice 19、sound_event 26。
+当前 **11 个套件、365 条断言**（2026-10-21 定稿实测全部通过；明细：controller 80、
+noise_analyzer 46、latency_profiler 40、mic_capture 16、mic_decimator 15、voiceprint_gate 60、
+context_window 23、conversation_awareness 38、bone_voice 19、sound_event 25、speech_gate 3）。
 
 `context_window` 是融合第二轮加的：它拿 `experiments/listening-model/scripts/features.py`
 （训练那一侧的权威实现）在固定配方上的输出当金标准，逐维比对固件里的 92 维窗口构造。
@@ -290,13 +314,16 @@ CI 里这一步跑在固件构建**之前**（[`.github/workflows/build.yml`](.g
 上位机（`tools/host/`）另有一套自己的自测，同样是纯 Python、秒级、不需要设备：
 
 ```bash
-python3 tools/host/tests/test_host.py            # 51 组、7550 条断言
-node tools/host/tests/render_check.js <快照.json> # 可选：用 DOM 桩真跑一遍界面渲染（60 条通过、0 条失败，条数随快照内容略变）
+python3 tools/host/tests/test_host.py            # 57 组、7594 条断言（连跑 3 次稳定）
+node tools/host/tests/render_check.js <快照.json> # 可选：用 DOM 桩真跑一遍界面渲染（49 条通过、0 条失败，条数随快照内容略变）
 ```
 
 `render_check.js` 存在的原因很具体：这台机器上无头浏览器拿不到显示器，系统也不允许截屏，
 所以"打开看一眼"这条路是断的。它把 DOM 换成桩、喂进一份真实快照
 （`curl -s http://127.0.0.1:8787/api/snapshot > /tmp/s.json`），断言 render() 到底写了什么。
+
+CI 还会跑检查器自测 `tools/verify_conversation_awareness.py --selftest`：八个合成场景，
+**8/8 符合预期**。
 
 没有 cmake 时可以直接编译（等价）：
 
@@ -344,9 +371,9 @@ base64 约 128 kB/s，而串口可用吞吐约 92 kB/s（139%，不可用）；1
 把要找的漂移抹掉。
 
 ```bash
-# 采集（需要带 pyserial 的解释器，macOS 自带 python3 通常没有）
-/Users/eranthe/Documents/Codex/2026-10-10/du/work/uv-cache/archive-v0/LSKE5uaT0ygsXUNE/bin/python \
-    tools/drift_capture.py --port /dev/cu.usbmodem1101 --seconds 3600 --out 记录/drift.jsonl
+# 采集（脚本需要 pyserial；macOS 自带 python3 通常没有）
+# 把下面的 python3 换成你本机带 pyserial 的解释器，或先 pip install pyserial
+python3 tools/drift_capture.py --port /dev/cu.usbmodem1101 --seconds 3600 --out 记录/drift.jsonl
 
 # 汇总
 python3 tools/drift_capture.py --summarise 记录/drift.jsonl
@@ -422,10 +449,6 @@ sh tools/host_up.sh --replay 记录/x.log --speed 4    # 回放历史日志
 那一格**不再是「建议媒体音量」**——提交 `eb53704` 已把这张卡片改成「决策模式」。媒体音量现在只
 出现在趋势图的图例里，写作「媒体音量 %（当前固定100）」，不是一格主读数。
 
-**边界**：面板本身正在被另一条工作线改动（本文件成稿时 `tools/host/` 有未提交改动，其中新增了
-Mac 应用侧与播放控制两块卡片）。上面这份清单只保证「建议媒体音量 → 决策模式」这一条与现界面
-一致；等上位机改动落地后需要重新核对整份清单。
-
 **面板上没有"降噪"**：本机的动作只有增益与调音，所以那一格、图例里的那条曲线都删掉了。
 
 **四条口径写死在界面上，不靠人记：**
@@ -437,15 +460,16 @@ Mac 应用侧与播放控制两块卡片）。上面这份清单只保证「建�
 | 序号跳变 | 趋势图上画一条红色竖线，异常列表里写明丢了几帧；曲线不会替设备"连过去" |
 | 数据年龄 | 端口开着但没帧时显示「已连接（无数据）」并告警——节点在 ≠ 设备在 |
 
-**回控是白名单，不是串口终端。** 界面只能发 `rec start [秒数]` 与 `rec stop`
-（设备侧只实现了这两条，见 `main/app_main.cpp`）。别的输入一律拒绝，不做"顺手转发"。
-在 `--mock` / `--replay` 下没有设备可写，回控会明确返回拒绝。
+**回控是白名单，不是串口终端。** 界面回控只允许发 `rec start [秒数]` 与 `rec stop`。
+设备控制台本身另有 `route ...` 与 `voiceprint ...` 等内部命令（见 `main/app_main.cpp`），
+但界面不会转发任意输入，也不做"顺手转发"。回执只在收到**新的** `capture` 事件时才算
+`acknowledged`——写成功不等于设备照做。在 `--mock` / `--replay` 下没有设备可写，回控会明确返回拒绝。
 
-### ⚠️ 这台设备上录音按钮目前**用不了**，而且上位机会如实这么说
+### 录音按钮曾经用不了（已修，留作复盘）
 
-实测（2026-10-14）：命令能写进串口（`write()` 成功、macOS 侧 `out_waiting = 0`、tty 标志
+2026-10-14 实测：命令能写进串口（`write()` 成功、macOS 侧 `out_waiting = 0`、tty 标志
 正常），但**设备没有任何反应**——不会出现 `{"type":"capture","state":"started"}`，
-`mic_chunk` 一个都不来。所以按钮现在返回的是这样一条：
+`mic_chunk` 一个都不来。所以当时按钮返回的是这样一条：
 
 ```
 {"ok": false, "acknowledged": false,
@@ -471,8 +495,12 @@ Mac 应用侧与播放控制两块卡片）。上面这份清单只保证「建�
 ```
 sdkconfig.defaults:
   CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y      # 主控制台 = 内置 USB-Serial/JTAG
-  CONFIG_ESP_CONSOLE_SECONDARY_UART0=y      # UART0 留作次要控制台，接串口适配器仍能看日志
+  CONFIG_ESP_CONSOLE_SECONDARY_NONE=y       # 次要控制台：NONE（v5.4.1 没有 UART0 选项）
 ```
+
+> 注意：ESP-IDF v5.4.1 的 `CONFIG_ESP_CONSOLE_SECONDARY_*` 只有 `NONE` 与 `USB_SERIAL_JTAG`
+> 两个选择，**没有** `CONFIG_ESP_CONSOLE_SECONDARY_UART0`；写未知键不会报错，会被静默忽略。
+> 因此接串口适配器**看不到**日志（不是"还能看"）。
 
 **代价**：设备用充电器供电（不接电脑）时就没有控制台输出了。对这台台架设备可以接受——
 另一个选择是它永远收不到命令。
@@ -540,13 +568,14 @@ Mac 的 `applied` / `idle` / `silent` / `bypass` / `unavailable`（有证据：
 ### 上位机自测
 
 ```bash
-python3 tools/host/tests/test_host.py      # 50 组、6639 条断言，不需要设备、不需要串口
-node tools/host/tests/render_check.js <快照.json>   # 用 DOM 桩真跑一遍 render()：60 条通过、0 条失败
+python3 tools/host/tests/test_host.py      # 57 组、7594 条断言，不需要设备、不需要串口
+node tools/host/tests/render_check.js <快照.json>   # 用 DOM 桩真跑一遍 render()：49 条通过、0 条失败（条数随快照内容略变）
 ```
 
 它自带一份真机日志 `tools/host/tests/fixtures/device_real.log`（**2026-10-15 从当前固件重抓**：
 100 ms 节拍、schema 2、带 24 段 `eq_gain_db`；41 帧连续原文 + 1 条 latency 汇总，对应设备运行
 约 703.1–707.1 s，不是整段会话）。**换固件后要重新抓一份，而不是改测试里的期望值去迁就。**
+当前固件已经是 schema 4，这份 v2 夹具重抓已列入 [`TODOS.md`](TODOS.md)（本轮不动）。
 解析器以后被改动时，必须仍然读得懂这台设备真正吐出来的字节，而不是只读得懂测试里手写的 JSON。
 旧固件（schema 1、只有 `noise_reduction_db`）的帧另用手写样本测，见
 `test_old_firmware_frame_still_reads`。
@@ -563,8 +592,9 @@ sources.py 原本调 read(4096)，而设备每帧只产出几百字节，
 把攒下的几行一次性交给状态归约。
 ```
 
-**这是 `read(4096)` 时期的记录。** 现在节拍 100 ms、`eq_gain_db` 也已下发，一帧约 300 字节
-（`docs/plan-status.md` 第 20 项记录的 301 B），凑满 4096 字节所需的帧数比当时少——但结论不变：
+**这是 `read(4096)` 时期的记录。** 现在节拍 100 ms、`eq_gain_db` 与 `ambient_band_dbfs`
+都已下发，一帧 p50 约 **744 B**（`docs/plan-status.md` 第 20 项），凑满 4096 字节所需的
+帧数比当时少——但结论不变：
 **要与设备自报值比，不要与主机侧到达间隔比。**
 
 当时的症状是 p50 紧贴在读取超时上方、`min ≈ 0.02 ms`（同一批里的第二行）、而设备自报节拍稳定，
@@ -582,9 +612,18 @@ p50 = **100.03 ms**，主机侧到达间隔 p50 = **100.00 ms**。
 - 本版可以验证 ESP32-S3 上的环境分析、判据行为、决策稳定性与故障回退
 - **不能**证明 CoreS3 扬声器等于 OWS 佩戴听感，也**不能**证明耳机已执行这些参数
 - 判据的阈值目前由合成信号标定，**未经真实录音验证**
-- 双麦克风可用性、近场信噪比、声纹可分性：**均未测量**（分段延迟已实测，见上文表格）
+- 双麦克风可用性、近场信噪比：**均未测量**；声纹可分性已过止损门（D28：WavLM-SV
+  间距/抖动 6.41、EER 0%；素材与代理边界见 D27/D28），但 Mac 侧 self/other 门控仍是实验性
+- 端侧声纹推理仍未实现；`embed` 阶段报 0 是因为没有实现（见上文三笔账）
 - 判据改动可能影响 Mac 侧已排练的行为，标定值（如 `mediaLeakDB`）可能需要重跑
 - 上位机显示的是**设备自己报出来的数字**，它不能证明耳机已经执行了这些参数（控制链路仍是 `模拟`）
+
+## 许可
+
+本仓库的代码与文档以 **MIT** 许可发布（见 [`LICENSE`](LICENSE)，Copyright (c) 2026 erantheee）。
+`components/bmi270/` 等第三方组件遵循各自目录下的 LICENSE；公开数据集中已跟踪的
+`audio.wav` 是维护者确认可公开的素材（保留/撤下策略见
+[`experiments/sound-events/data/README.md`](experiments/sound-events/data/README.md)）。
 
 ## 本地连接（macOS）
 

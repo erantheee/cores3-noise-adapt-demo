@@ -3,15 +3,15 @@
 本文件是**计划本身在仓库里的落点**。它记录每一项的状态、卡在哪里、以及下一步由谁做。
 改计划时同步改这里，不要只留在对话里。
 
-最后更新：固件以 `26789ad` 为基线，加上其后两笔改动——`4308366`（控制节拍 150 → **100 ms**）与
-`3b744cc`（demo 放大到 8.0 dB / 25%）——即当前提交 `3b744cc`（真机在跑，schema v2）
-+ 自带上位机 `tools/host/`
+最后更新：2026-10-21（收尾）。当前代码基线为 `ad77572` 叠加 2026-10-21 收尾改动
+（最终 HEAD 见 `git log -1`），协议 **schema 4**；本轮收尾项见第 72 项。
 
 ---
 
 ## 目标
 
-把 CoreS3 做成 **AI OWS 耳机仓原型**：S3 感知和决策，Mac 播放并处理三首固定本地歌曲，
+把 CoreS3 做成 **AI OWS 耳机仓原型**：S3 感知和决策，Mac 播放并处理两首本地歌曲
+（`tools/player/tracks.json`，按需再加），
 AirPods Pro 播放最终输出；分别验证歌曲 EQ、现实人声增益意图、安全不动作与端到端延迟。
 
 给决策者的表述：**同一套补偿逻辑，两个执行者。** 音频链路由播放端负责（这是真实产品的
@@ -30,20 +30,20 @@ AirPods Pro 播放最终输出；分别验证歌曲 EQ、现实人声增益意�
 | 3 | 分段延迟打点 | ✅ **完成** | 真机实测，见下 |
 | 4 | 控制节拍精度 | ✅ **完成** | 真机自报 **100.03 ms**（控制节拍此前为 150 ms，由 `4308366` 改为 100 ms，`main/app_main.cpp` 的 `kControlPeriodMs`） |
 | 5 | 设备端录音通路 | ✅ **完成** | CI 确认可编译；待录真实音频 |
-| 6 | 声纹门控策略 | ✅ **完成** | 60 条断言；**阈值待真实录音标定** |
+| 6 | 声纹门控策略 | ✅ **完成** | 60 条断言；**阈值待真实录音标定**。⚠️ 2026-10-21：设备侧 `main/voiceprint_gate.*` 已不在固件编译（仅保留主机单测）；真正门控在 Mac 侧 WavLM self-veto（D28/D31） |
 | 7 | 主机单测进 CI | ✅ **完成** | 6 套件 221 条断言，先于固件构建 |
 | 8 | 长窗口漂移（1 小时） | ⏸ **未测** | 需设备在场跑 `tools/drift_capture.py` |
 | 9 | 判据阈值用真实录音标定 | ⏸ **未做** | 需录安静本底/白噪声/纯音/人声 |
 | 10 | 近场信噪比 vs Mac 的 0.9 dB | ⏸ **未测** | 需录三类音频 |
 | 11 | 双麦克风可用性与方向性增益 | ⏸ **未验** | 需真机实测，不假设 |
-| 12 | 声纹可分性（止损门） | ⏸ **未测** | 需同一人分次、换条件录多条 |
+| 12 | 声纹可分性（止损门） | ✅ **已测，WavLM-SV 通过**（D28） | 间距/抖动 **6.41**、EER 0%；素材/代理边界见 D27/D28。设备侧推理仍未做 |
 | 13 | 上位机 `ows-earbud-demo` 对接 | ⏸ **未开始** | 需改你已排练的 Mac 工程，待确认 |
 | 14 | 端侧目标人提取（TSE） | ⏸ **不在本轮范围** | 6 GMACs 量级，另一个工程 |
-| 15 | **本仓库自带上位机** | ✅ **完成** | `tools/host/`，50 组 6639 条断言；真机已在跑。第 29 项起面板上有「情境」格 |
+| 15 | **本仓库自带上位机** | ✅ **完成** | `tools/host/`，上位机自测全绿（条数以运行输出为准）；真机已在跑。第 29 项起面板上有「情境」格 |
 | 16 | **串口 DTR 真 bug（三个工具读不到数据）** | ✅ **已修** | 实测 dtr=False 10 秒 0 字节 → dtr=True 10 秒 17115 字节 |
 | 17 | **口径：本机不做降噪，只有增益与调音** | ✅ **已落到上位机** | 面板删掉降噪格与曲线；固件侧的残留见第 19 项 |
 | 18 | 上位机回控（录音）可用性 | ✅ **已修并真机验证** | 控制台改为内置 USB-Serial/JTAG；`rec start` 得到 `capture started` 回执 |
-| 18b | 设备端录音的数据速率 | ✅ **已达标 100%** | 10 秒录音产出 10.03 秒音频、157 块、丢块 0；固件 `26789ad`（其后仅节拍与 demo 上限两笔改动） |
+| 18b | 设备端录音的数据速率 | ✅ **已达标 100%** | 10 秒录音产出 10.03 秒音频、157 块、丢块 0（2026-10-14，固件 `26789ad`；此后已有更多改动，读数只对应那版） |
 | 19 | 固件清理：`noise_reduction_db` 与屏幕「降噪」 | ✅ **已完成** | 字段从 `EarbudCommand` 删除；屏幕改「调音」；字库确认有 `调` `音` |
 | 20 | 调音（24 频段）进串口 JSON | ✅ **已完成** | `eq_gain_db` 随帧下发。**口径更正（2026-10-16 实测）：一帧是 p50 744 B、10 Hz → 约 7.5 kB/s，不是当初写的 301 B / 3 kB/s**（那笔只算了 `eq_gain_db`，没算同样 24 个数的 `ambient_band_dbfs`）。控制台实测能承载，但 USB CDC 的余量比原先以为的小一半 |
 | 21 | 产品链路口径统一 | ✅ **已完成** | `docs/product-alignment.md` 是唯一基准 |
@@ -82,15 +82,15 @@ AirPods Pro 播放最终输出；分别验证歌曲 EQ、现实人声增益意�
 | 38f | ❌ **结构改动尝试：相对本底闸门 —— 已撤销** | 已撤销 | 判据曾改成同时问"语音带比它自己的地板高出多少"。真实录音（**Mac 麦**）上确实有效：办公室本底 49.3% → 13.3%、持续哼 32% → 1.1%。**但参数是照 Mac 麦定的，而 Mac 麦不在产品里**，所以整个改动已完整撤销，`controller.cpp` 回到只剩时域闸门的状态，二进制大小与撤销前逐字节一致（`0xbf6a0` / `0xbb040`），228 条断言全过 |
 | 38g | ⚠️ **教训保留：闸门被"数字静音"静默废掉** | 已记录 | 录制开头有 **1.23 秒纯数字静音**（ffmpeg/avfoundation 预热，23 帧读到 −120 dBFS 填充值）。底噪跟踪器若把 −120 当地板，之后真实音频就是 35 dB 超出量 → **闸门恒开且不报错**。**"无信号被当成信号"这类失效模式不会自己暴露，必须单独防。** |
 | 38h | 🔴 **根因：所有 38 系测量都用了非产品麦克风** | 未解决 | 38/38a–38h 全部基于 **Mac 麦克风**，而判据阈值是在设备 ES7210 上标定的。**这些数字不能用来判定设备，更不能用来改设备判据。** 设备端现状：`record_from_device.py` 只给 16 kHz（判据频段到 13.6 kHz，不够用）；**但 ear-context 固件本来就在推自己 24 个频段的电平**（`context` JSON 的 `bands[]`，10 Hz，`experiments/ear-context/main/app_main.cpp:43-45`）——那才是设备麦的判据输入，**不用改固件、不用刷机**。下一步只能从它取数 |
-| 39 | **Apple「对话感知」迁移**（分支 `feature/apple-conversation-awareness`） | ⚠️ **触发与时序已实现，时序参数待标定** | 新增 `main/conversation_awareness.*`（idle→confirming→engaged→releasing）+ `test/conversation_awareness_test.cpp` 30 条断言；删除旧轮次启发式（它检的是"像不像对话"，不是"我是不是在说话"）。**macOS 侧两轮实测没测到下压**，所以参数是待标定值，不是 Apple 实测值。详见 [apple-conversation-awareness.md](apple-conversation-awareness.md) |
+| 39 | **Apple「对话感知」迁移**（分支 `feature/apple-conversation-awareness`） | ⚠️ **触发与时序已实现，时序参数待标定** | 新增 `main/conversation_awareness.*`（idle→confirming→engaged→releasing）+ `test/conversation_awareness_test.cpp` 30 条断言；删除旧轮次启发式（它检的是"像不像对话"，不是"我是不是在说话"）。**macOS 侧两轮实测没测到下压**，所以参数是待标定值，不是 Apple 实测值。详见 [apple-conversation-awareness.md](apple-conversation-awareness.md)。**已被第 46 项/D16 覆盖**（触发改为预判式 `conversation_cue`） |
 | 40 | **骨传导自身语音证据（IMU 进主工程）**（同分支） | ⚠️ **已实现并编译通过，待真机验证**（IMU 初始化已移到 app_main 同步执行，避免与音频任务争同一条 I2C 总线——ear-context 里两任务同级，主工程音频优先级更高，照搬会交错；IMU 任务栈取 6144 与 ear-context 一致） | **⚠️ 真机数据已给出否定结论**：用 ear-context 的 selfvoice 会话（100 Hz 六轴 + 8 段标签）回放同一份 `bone_voice`，置信度中位全段为 0、振动包络与音频包络相关≈0，且唯一高振动的 self_speech 段在 speech_music 段不复现 → 判据在本设备上不成立；与第 12 项 selfvoice 探针（AUC 0.0508「基本不可分」）结论一致。见 apple-conversation-awareness.md 第 13 节。`components/bmi270` + `main/imu.*` 从 ear-context 搬入主工程；新增 `main/bone_voice.*`（包络相关性判据，18 条断言）。证据优先级：骨传导 > 近场代理。测试抓到两个真 bug（重力基线吸收调制、RMS 丢符号）。真机要看的四项见 [apple-conversation-awareness.md](apple-conversation-awareness.md) 第 11.6 节 |
-| 41 | **对话感知真机验证脚本**（同分支） | ⚠️ 已写好，离线与版本闸门已验，**待烧固件跑完整相** | `tools/verify_conversation_awareness.py`：五相（静置/自己说话/安静/走动/旁人说话）+ C1–C9 断言，报告落 `记录/对话感知验证/`。检查器有 `--selftest`（五个合成场景，已接进 CI），并已抓出检查器自身一个真 bug（C6 提示语不分两种情况）。C1 是闸门：旧固件直接拒跑（对当前 v2 固件实跑已验证）。同时给 v3 遥测补了 `imu_gravity` 与 `imu_drops`。见 [apple-conversation-awareness.md](apple-conversation-awareness.md) 第 12 节 |
-| 42 | **声纹路线工具链已核实**（同分支） | ✅ 前提就绪，❌ **素材为零** | torch 2.14.1 + speechbrain 1.1.2 在 `.venv` 里、ECAPA 模型已缓存，止损门工具可跑；空跑（同一人两段当两类，**非测量**）给出 间距/抖动 0.33、EER 33% → 提示止损门大概率不过。另更正第 10.4 节：设备静音 35/75 拍那条是 16 kHz 素材口径，不能当设备结论，真机由 C5/C9 回答。见 [apple-conversation-awareness.md](apple-conversation-awareness.md) 第 14 节 |
+| 41 | **对话感知真机验证脚本**（同分支） | ⚠️ 已写好，离线与版本闸门已验，**待烧固件跑完整相** | `tools/verify_conversation_awareness.py`：五相（静置/自己说话/安静/走动/旁人说话）+ C1–C9 断言，报告落 `记录/对话感知验证/`。检查器有 `--selftest`（八个合成场景，已接进 CI），并已抓出检查器自身一个真 bug（C6 提示语不分两种情况）。C1 是闸门：旧固件直接拒跑（对旧 v2/v3 固件实跑已验证）。同时给 v3 遥测补了 `imu_gravity` 与 `imu_drops`。见 [apple-conversation-awareness.md](apple-conversation-awareness.md) 第 12 节 |
+| 42 | **声纹路线工具链已核实**（同分支） | ✅ 前提就绪，❌ **素材为零** | torch 2.14.1 + speechbrain 1.1.2 在 `.venv` 里、ECAPA 模型已缓存，止损门工具可跑；空跑（同一人两段当两类，**非测量**）给出 间距/抖动 0.33、EER 33% → 提示止损门大概率不过。另更正第 10.4 节：设备静音 35/75 拍那条是 16 kHz 素材口径，不能当设备结论，真机由 C5/C9 回答。见 [apple-conversation-awareness.md](apple-conversation-awareness.md) 第 14 节。2026-10-21 注：后续第 68/69 项已用现有素材完成首次测量（见 D28） |
 | 43 | **演示模式证据策略**（同分支） | ✅ 已实现并进遥测 | 三态 `bone_only` / `near_field_demo` / `disabled`（用户决定：演示用近场代理）；帧里带 `own_voice_policy`，面板与串口都能看到，避免把代理说成自身语音。**已知代价**：C9（旁人说话不触发）在演示模式下预期失败，检查器自测有 `demo_policy` 与 `source_mismatch` 两个场景覆盖。见 [apple-conversation-awareness.md](apple-conversation-awareness.md) 第 15 节 |
 | 44 | **对话感知迁移·状态交接** | ✅ 已写 | 交付清单 / 已验证数字 / 未完成四件事（各自可复制命令）/ 三条必须记住的结论，见 [apple-conversation-awareness.md](apple-conversation-awareness.md) 第 16 节 |
 | 45 | **真机被动检查（新增工具）** | ⚠️ 6/8 通过，抓到 C4c | `tools/check_device_passive.py` 从面板 `/api/snapshot` 轮询，不独占串口、不需人配合；实测 C1✅ C2✅ C3✅（重力 p50 9.88）C4b✅，**C4c ❌ 30.1 Hz（设计 100 Hz）**、C5b 策略并存待查。见 [apple-conversation-awareness.md](apple-conversation-awareness.md) 第 16.5 节 |
-| 46 | **预判式对话感知 + 环境声开放（D16）** | 🟡 **代码与单测已完成；待烧机实测** | 触发从 `own_voice` 换成 `conversation_cue`（附近有人开口）：`idle → anticipating → engaged → releasing`，第一拍就预下压，确认后 `ambient_open` 意图置 true；协议升到 **v4**。Mac 加 `tools/host/ambient.py`：`--ambient-open airpods` 时经兄弟工程 `airpods-control` 切 AirPods 通透模式、关闭切回原模式，执行失败如实上报。**外部人声模式不再写歌曲 EQ**（D0 契约，单测改为钉平直）。已知代价：播客/电视/旁人说话也会触发预判；旧 C9 断言与新目标冲突，验证脚本待按 D16 重写。见 [decisions.md](decisions.md) D16 |
-| 47 | **端侧声音事件判断（键盘 / 风 / 撞击门控）** | ✅ **已刷机并现场复测**（2026-10-19） | `main/sound_event.hpp`：1 s 窗 × 15 维 + 噪声地板跟踪 + 状态机保持；`mic_valid=false`（撞击/削波）清窗并报 `artifact`。串口帧追加 `event`/`event_valid`（v4 上追加键），面板新增「事件（端侧规则）」卡。离线：keyboard/wind 召回 **83.7%**（keyboard 78% / wind 90%），安静/说话误报 **0.0%**。**真机 v5 复测**：键盘段 81% 帧 keyboard；风段 56% wind 但 **20% 误报 keyboard**；敲桌报 artifact。加「键盘斜率不能太陡（slope > -1.35，质心 > 800 Hz 豁免）」后 **v5b**：键盘 79%、风段 **0 帧误报 keyboard**、敲桌仅 5/60 帧报 keyboard。**卡在**：单键盘单房间、每段只复测一次；"静置"段疑似混入真实击键；跨条件泛化未验证；屏幕还没有这一格。见 [`experiments/sound-events/README.md`](experiments/sound-events/README.md) |
+| 46 | **预判式对话感知 + 环境声开放（D16）** | 🟡 **代码与单测已完成；待烧机实测** | 触发从 `own_voice` 换成 `conversation_cue`（附近有人开口）：`idle → anticipating → engaged → releasing`，第一拍就预下压，确认后 `ambient_open` 意图置 true；协议升到 **v4**。Mac 加 `tools/host/ambient.py`：`--ambient-open airpods` 时经兄弟工程 `airpods-control` 切 AirPods 通透模式、关闭切回原模式，执行失败如实上报。~~**外部人声模式不再写歌曲 EQ**（D0 契约，单测改为钉平直）~~ → **EQ 部分由 D26 覆盖**（`external_voice_intent` 允许抬 8–16 段；对话/self 才平直）。已知代价：播客/电视/旁人说话也会触发预判；旧 C9 断言与新目标冲突，验证脚本待按 D16 重写。见 [decisions.md](decisions.md) D16 |
+| 47 | **端侧声音事件判断（键盘 / 风 / 撞击门控）** | ✅ **已刷机并现场复测**（2026-10-19） | `main/sound_event.hpp`：1 s 窗 × 15 维 + 噪声地板跟踪 + 状态机保持；`mic_valid=false`（撞击/削波）清窗并报 `artifact`。串口帧追加 `event`/`event_valid`（v4 上追加键），面板新增「事件（端侧规则）」卡。离线：keyboard/wind 召回 **83.7%**（keyboard 78% / wind 90%），安静/说话误报 **0.0%**。**真机 v5 复测**：键盘段 81% 帧 keyboard；风段 56% wind 但 **20% 误报 keyboard**；敲桌报 artifact。加「键盘斜率不能太陡（slope > -1.35，质心 > 800 Hz 豁免）」后 **v5b**：键盘 79%、风段 **0 帧误报 keyboard**、敲桌仅 5/60 帧报 keyboard。**卡在**：单键盘单房间、每段只复测一次；"静置"段疑似混入真实击键；跨条件泛化未验证；屏幕事件格已由第 56 项补上。见 [`experiments/sound-events/README.md`](../experiments/sound-events/README.md) |
 | 47a | ├ **刷机脚本漏写分区表（esptool v5 多文件写）** | ✅ 已修 | 三个"地址 文件"对放同一条 `write-flash` 时，日志逐区打印、每区都报 verified，但回读 0x8000 全 0xFF、0x10000 仍是旧固件；启动报 `No bootable app partitions`。`tools/flash.sh` 改成逐区写、逐区校验，并在末尾用 `--after watchdog-reset run` **自动把 app 跑起来**（2026-10-19 重新刷机实测通过） |
 | 47b | └ **刷后停在下载模式** | ✅ 已绕过 | `Hard resetting via RTS pin...` 后设备可能停在下载模式：端口在、0 字节。用 `esptool --after watchdog-reset run` 启动；再不行拔插 USB |
 | 48 | **大模型上机评估（YAMNet 级）** | ⏸ **决定不上，只做主机侧教师** | S3 实测：24 段分析 7.07 ms/100 ms、9 类模型 0.18 ms、事件规则估算 <0.05 ms；YAMNet INT8 社区数据约 500 ms/0.96 s patch（1 Hz 单核 50%、延迟 ≥1.5 s），且要 4 MB 模型 + 1.2 MB arena + 重划分区。真正的瓶颈是真实数据域偏移，不是模型容量。端侧模型准入线见 [`decisions.md` D18](decisions.md)；YAMNet 只在 Mac 侧做自动标注/教师 |
@@ -100,40 +100,37 @@ AirPods Pro 播放最终输出；分别验证歌曲 EQ、现实人声增益意�
 | 52 | **风 = EQ 适配（D21）+ 说话/风混合场景** | 🟡 **方向已修；混合数据待采、接口待拆** | 更正 D20：执行端是 EQ（本 demo 只有增益与调音），1 s 窗慢检测对 EQ 够用，只有降噪才要 <200 ms。混合场景要求语音 gate 与风检测**正交**：输出改为 `speech_gate` + `wind` 两路（学生用共享主干 + 两个头），不允许相互覆盖；EQ 候选为"风时压低频抬升、说话时语音优先且 EQ 平直"。验收线：混合段 speech 召回不低于 speech-only 的 80%、wind 召回不低于 wind-only 的 80%。EQ 只能优化音乐，不能提升风里对方说话的清晰度（后者需耳机侧降噪，本 demo 没有）。见 D21 |
 | 52a | ├ **数字混音：说话被风掩蔽的量化** | ✅ 已做（机制验证，非现场） | 把已有纯风/纯说话两段 16 kHz 音频按 SNR 叠加后过官方 YAMNet：Speech 帧命中率干净说话 79%，SNR −5/0/+5/+10 dB 时降到 20/34/44/51%——风会显著掩蔽说话。设备侧 15 维特征同样被稀释：数字混音下 wind 规则与 speech 规则**从未同时为真**（0%），单输出类别无法表达"说话+风"，证实 D21 的双头设计必要。**这是机制验证，不是现场准确率** |
 | 52b | └ **外放 surrogate 尝试：无效** | ❌ 不可用 | 用 Mac 扬声器播风声 + TTS 说话让 S3 收，因为 ① Mac 当时静音、② 扬声器回放的风在声学上不像真风（教师 wind_mic≈0、设备 wind 规则 0–4%），采到的段不能当混合证据。已恢复静音；混合场景准确率仍需真实环境数据 |
-| 53 | **语音 gate v2（92 维 + TTS 增强）** | ❌ **未过 D19 准入；训练按用户要求暂停** | 用官方 YAMNet 标签训练 92→24→2 学生（multi + TTS 多音色 + 说话会话，共 797 窗）：in-domain 说话段 recall 1.00/误报 0.00，但跨会话 v5 recall 0.60/误报 0.05、v5b（无说话）误报 0.28、A（无说话）误报 0.17。另测固件四判据在同一真机多条件数据上 voice_likelihood 的 AUC 仅 **0.368**（speech 段 p50 0.033、键盘段 p50 0.582）——不是阈值问题，是判据结构不匹配，单纯调阈值救不了。需要真实多说话人/多距离数据后再训。另试"事件规则门控"（keyboard/wind 时不报 speech）：v5b 误报 23%→16%、A 20%→18%，仍不够。'
-'LOO（留一会话）实测：recall 0.40–0.61，说话会话误报 3–5%，'
-'但无说话的 A/v5b 误报 **20–21%**，仍过不了 D19 的 <10% |
+| 53 | **语音 gate v2（92 维 + TTS 增强）** | ❌ **未过 D19 准入；训练按用户要求暂停** | 用官方 YAMNet 标签训练 92→24→2 学生（multi + TTS 多音色 + 说话会话，共 797 窗）：in-domain 说话段 recall 1.00/误报 0.00，但跨会话 v5 recall 0.60/误报 0.05、v5b（无说话）误报 0.28、A（无说话）误报 0.17。另测固件四判据在同一真机多条件数据上 voice_likelihood 的 AUC 仅 **0.368**（speech 段 p50 0.033、键盘段 p50 0.582）——不是阈值问题，是判据结构不匹配，单纯调阈值救不了。需要真实多说话人/多距离数据后再训。另试"事件规则门控"（keyboard/wind 时不报 speech）：v5b 误报 23%→16%、A 20%→18%，仍不够。LOO（留一会话）实测：recall 0.40–0.61，说话会话误报 3–5%，但无说话的 A/v5b 误报 **20–21%**，仍过不了 D19 的 <10% |
 | 53a | ├ **TTS 说话增强采集** | ✅ 已采（自动，无人工） | 4 个 TTS 音色经 Mac 扬声器播 183 s，设备采 1716 帧/182.7 s/0 丢块；教师 YAMNet 判 speech 0.94–0.95。用于补正样本多样性，但仍是"扬声器语音"，不能替代真人远场数据 |
-| 54 | **工程修复批次（2026-10-19）** | ✅ **完成并推送** | ① 事件判断耗时实测并进遥测：p50 269 µs / p95 276 µs / max 319 µs（占 100 ms 节拍 0.27%）；② `tools/flash.sh` 刷完自动 watchdog 复位启动，不再停在下载模式；③ 教师 venv 的 distutils shim 显式补齐（Python 3.12 + TF 2.16 的启动脚本坑）；④ 原始音频与数据快照已入 GitHub（`features/apple-conversation-awareness`，commit d8522b0/1f73c56/c073f2d），CI 两次全绿。**剩余**：设备屏幕没有事件格；风→EQ 策略未定义/未实现；语音 gate 等真实数据后再训 |
+| 54 | **工程修复批次（2026-10-19）** | ✅ **完成并推送** | ① 事件判断耗时实测并进遥测：p50 269 µs / p95 276 µs / max 319 µs（占 100 ms 节拍 0.27%）；② `tools/flash.sh` 刷完自动 watchdog 复位启动，不再停在下载模式；③ 教师 venv 的 distutils shim 显式补齐（Python 3.12 + TF 2.16 的启动脚本坑）；④ 原始音频与数据快照已入 GitHub（`features/apple-conversation-awareness`，commit d8522b0/1f73c56/c073f2d），CI 两次全绿。**当时剩余**：屏幕事件格、风→EQ、语音 gate。前两项已由第 55/56 项完成（本行剩余清单已被 #55/#56 覆盖）；语音 gate 仍等真实数据 |
 | 55 | **风→EQ 落地（D21）** | 🟡 **固件已实现 + 单测通过；听感待真风环境** | `apply_wind_eq()`：仅 song_eq 且无对话时，把前 5 个低频段（70.7–451.7 Hz）的抬升上限压到 +2 dB，中高频与 0/低增益不动；对话优先。单测 4 条覆盖，固件已刷机启动正常。真机听感 A/B 需要真实风，未做 |
 | 56 | **设备屏幕事件格** | ✅ **已上机** | 主页面"麦克风正常"同行右侧新增 ASCII 事件类别（keyboard/wind/speech/artifact/quiet，montserrat_14），颜色区分；`render_demo_ui.py` 宽度校验 'keyboard' 69/88 px 通过。固件已刷机启动 |
-| 57 | **TTS 说话正样本入库** | ✅ **已上传** | 4 音色 183 s 说话（音频 + 10 Hz 24 段 + 教师标签）收入 `experiments/sound-events/data/teacher-20261019-tts/`，数据快照现 14 MB |
-| 58 | **上位机显示事件/感知耗时** | ✅ **已接** | `latency` 报文新增 `context_p50_us`/`event_p50_us`解析进快照，面板备注行显示；真机实测事件 278 µs、感知 193 µs。上位机自测 7552 条通过 |
-| 59 | **说话 gate 学生上机（只遥测）** | 🟡 **已上机、口径已对齐；D19 验收未过** | 92→24→2（2.3k 参数，`main/speech_gate_model.h`），串口 `speech_gate`/`_valid`/`_us`，上位机面板与快照显示。发现训练侧 9 维依赖设备 `broadband_dbfs` 的特征与端侧口径不一致（训练用 24 段功率近似），导致安静房间误报 0.94–1.0；训练/端侧同时清零后设备与离线重算 **corr 0.999**、安静房间 0.004。跨会话仍差：multi→TTS 误报 54%、TTS→multi 61%、汇总模型在真安静采集误报 26%——**不替换四判据**，等真实多说话人/多距离数据再训。金标准 `test/speech_gate_test` 3/3；C++ 11 套件、上位机 52 组 7559 条全绿 |
+| 57 | **TTS 说话正样本入库** | ✅ **已上传** | 4 音色 183 s 说话（音频 + 10 Hz 24 段 + 教师标签）收入 `experiments/sound-events/data/teacher-20261019-tts/`，数据快照约 19 MB（其中 5 个 `audio.wav` 共 15.6 MB，维护者确认可公开，见 `experiments/sound-events/data/README.md`） |
+| 58 | **上位机显示事件/感知耗时** | ✅ **已接** | `latency` 报文新增 `context_p50_us`/`event_p50_us`解析进快照，面板备注行显示；真机实测事件 278 µs、感知 193 µs。上位机自测通过（条数以运行输出为准） |
+| 59 | **说话 gate 学生上机（只遥测）** | 🟡 **已上机、口径已对齐；D19 验收未过** | 92→24→2（2.3k 参数，`main/speech_gate_model.h`），串口 `speech_gate`/`_valid`/`_us`，上位机面板与快照显示。发现训练侧 9 维依赖设备 `broadband_dbfs` 的特征与端侧口径不一致（训练用 24 段功率近似），导致安静房间误报 0.94–1.0；训练/端侧同时清零后设备与离线重算 **corr 0.999**、安静房间 0.004。跨会话仍差：multi→TTS 误报 54%、TTS→multi 61%、汇总模型在真安静采集误报 26%——**不替换四判据**，等真实多说话人/多距离数据再训。金标准 `test/speech_gate_test` 全部通过；C++ 11 套件与上位机自测全绿（具体条数以 CI 输出为准） |
 | 60 | **窗口向量调试通道** | ✅ | 串口 `vector` 打印最近满窗 92 维特征（`tools/dump_window_vector.py`），就是靠它定位到 59 的口径 bug；只用于调试，不参与运行 |
 | 61 | **受控代理场景评估 gate** | 🟡 **已采已评；代理不可用于验收** | Mac 外放 120.7 s（静音/大声/小声/风/键盘/说话+风），设备 1135 帧 0 丢块。教师 speech：大声 98%、小声 76%、说话+风 95%；学生 gate：95%/74%/100%，但安静 0–40%、风 54%、键盘 79% 误报（综合 44%）。加入真机 keyboard/wind 负样本后降到 32%，仍 >10%。代理声学不真实（无湍流/瞬态），不能当验收；真实 LOO 仍 3–22% 误报。数据已入库 `data/gateeval-20261019/`，评估脚本 `evaluate_speech_gate.py` |
 | 62 | **协议 bug：valid=true 却报 artifact** | ✅ **已修 + 回归测试 + 已刷机** | `StateMachine` 把 artifact 当声音类别保持 2 s；撞桌后窗重新有效时把 artifact 带进 valid=true 的帧，上位机连续报“event_valid=true 却报了 artifact”。修法：有效帧恢复即退出 artifact。`sound_event_test` 增加两条回归（25/25 通过）。 |
 | 63 | **调音方向回退 + 风 EQ 真正生效（D23/D25）** | ✅ **已实现、单测、已刷机** | 对话/人声 → 压媒体 + EQ 全平（真机验证 media=60、mode=FLAT、ambient_open=true）；"抬中频"已按用户口径回退。风 EQ 由无效的 +2 dB cap 改为低频抬升×1/4。播放器 denormal 显示修复。 |
-| 64 | **环境声默认执行端（D24）** | ✅ **已默认 + 真机验证** | `host_up.sh` 真机默认 `--ambient-executor airpods`；实测 AirPods 通透模式可切，面板 ambient open=true（首次 AX 读取可能失败一次，3 s 退避后成功）。 |
-| 65 | **"自己哼哼不压"自身语音区分** | 🔲 **未实现；需用户选路线/给数据** | 单麦无法声学区分自身哼鸣与别人说话。候选：①录 10–20 s 哼哼训练稳态/哼鸣拒绝器（最快）；②双人轮次门限（会晚压）；③自身语音传感器（骨传导真机已否定）。当前行为：任何接近人声的语音都会进入对话下压。见 D25。 |
-| 66 | **背景人声 EQ + 场景 EQ 区分（D26）** | ✅ **已实现、单测、已刷机** | external_voice_intent 恢复 8–16 段中频抬升（背景/别人说话）；稳态噪声 song_eq、风低频×1/4、对话 duck+flat、安全保持禁增益 —— 四种场景四种曲线。金标准测试 51/51。 |
+| 64 | **环境声默认执行端（D24）** | ✅ **已默认 + 真机验证** | `host_up.sh` 真机默认 `--ambient-executor airpods`；实测 AirPods 通透模式可切，面板 ambient open=true（首次 AX 读取可能失败一次，3 s 退避后成功）。**已被第 71 项/D30 覆盖**：真机默认已改为 off。 |
+| 65 | **"自己哼哼不压"自身语音区分** | 🟡 **实验性部分覆盖（D31 self-veto）；未验收** | 单麦无法声学区分自身哼鸣与别人说话。2026-10-21 接入 Mac 侧 WavLM self/other 回传 S3 做 self-veto（self 时设备不压/不抬/不开环境声），但判定窗约 1.5 s、素材有限，**只算实验性覆盖，不算验收通过**；`--voiceprint` 默认不开。候选仍未做：①录 10–20 s 哼哼训练稳态/哼鸣拒绝器；②双人轮次门限；③自身语音传感器（骨传导真机已否定）。见 D25/D31。 |
+| 66 | **背景人声 EQ + 场景 EQ 区分（D26）** | ✅ **已实现、单测、已刷机** | external_voice_intent 恢复 8–16 段中频抬升（背景/别人说话）；稳态噪声 song_eq、风低频×1/4、对话 duck+flat、安全保持禁增益 —— 四种场景四种曲线。金标准测试全部通过（条数以 ctest 输出为准）。 |
 | 67 | **环境声切换提速 + 中继修复** | 🟡 **已改；AirPods 音频路由待环境** | host 环境声循环 100→50 ms；中继 160 ms 预缓冲；修复 RelayAmbient.feed 回调 bug（之前每秒重连）。relay 默认、音频目标是 AirPods 但**不控制其聆听模式**；当前 AirPods 未暴露音频路由，relaysink 回落到 MacBook Air 扬声器（pinned=false 如实上报）。 |
-| 68 | **环境声误开的确定性修复 + 声纹止损门** | 🟡 **修复已刷机；声纹止损门不通过** | 事件键盘/风/撞击否决；own_voice 不再作为对话证据；对话门槛 0.65；单帧尖峰不续命。声纹：已有本人录音 enroll + TTS 代理 impostor，间距/抖动 1.34/1.75 <3、不通过（按判据停）。自己说话 vs 别人说话仍无解；下一步要么按正确协议重录声纹（两天×三条件+真人 impostor），要么走双麦方向。 |
-| 69 | **声纹后端 ECAPA→WavLM-SV（D28）** | ✅ **止损门通过；端侧集成待做** | 同一批素材：ECAPA 间距/抖动 1.59 ❌；WavLM-SV 0.947/0.606、抖动 0.053、间距/抖动 **6.41** ✅，EER 0%，类内/类间范围不重叠。模型 360 MB 只能 Mac 侧跑；下一步中继音频算 embedding、串口回传 self/other，S3 做 own-voice veto（先影子遥测）。 |
-| 70 | **WavLM 声纹影子门控接入上位机（D29）** | 🟡 **影子遥测已运行；决策未接** | `--voiceprint` 启用 worker（WavLM-SV 512d，1.5 s 窗，约 45–90 ms/窗）；快照/面板显示 self/other + 分数 + 延迟；不参与决策。下一步串口回传 S3 做 own-voice veto，先验证延迟与稳定性。 |
-| 71 | **环境声执行端默认关闭（D30）** | ✅ **默认 off** | `host_up.sh` 真机默认 `--ambient-executor off`，要环境声必须显式 relay/airpods；上位机/播放器/声纹影子遥测照常。等 self/other 接进 S3 并验证后再讨论恢复默认。 |
+| 68 | **环境声误开的确定性修复 + 声纹止损门** | 🟡 **修复已刷机；声纹止损门不通过** | 事件键盘/风/撞击否决；own_voice 不再作为对话证据；对话门槛 0.65；单帧尖峰不续命。声纹：已有本人录音 enroll + TTS 代理 impostor，间距/抖动 1.34/1.75 <3、不通过（按判据停）。自己说话 vs 别人说话仍无解；下一步要么按正确协议重录声纹（两天×三条件+真人 impostor），要么走双麦方向。**止损门结论已被第 69 项/D28 覆盖**（换 WavLM-SV 后通过）。 |
+| 69 | **声纹后端 ECAPA→WavLM-SV（D28）** | ✅ **止损门通过；端侧门控已接（D31）** | 同一批素材：ECAPA 间距/抖动 1.59 ❌；WavLM-SV 0.947/0.606、抖动 0.053、间距/抖动 **6.41** ✅，EER 0%，类内/类间范围不重叠。模型 360 MB 只能 Mac 侧跑；串口回传 self/other 与 S3 self-veto 已在 HEAD 接入，2026-10-21 修过期/clear/遥测（D31）。 |
+| 70 | **WavLM 声纹门控接入上位机（D29→D31）** | ✅ **已接 S3 self-veto（HEAD）；实验性、默认关闭** | `--voiceprint` 启用 worker（WavLM-SV 512d，1.5 s 窗，约 45–90 ms/窗）；判定经串口回传 S3（`voiceprint self` / `other` / `pending`）。self → 设备不压/不抬/不开环境声；other → 按 D16。2026-10-21 修复：判定 3 s 无新行自动过期、host 退出/串口关闭发 `voiceprint off`、固件遥测补齐（D31）。`--voiceprint` 仍默认不开，未过验收。 |
+| 71 | **环境声执行端默认关闭（D30）** | ✅ **默认 off（D30/D31 后仍不变）** | `host_up.sh` 真机默认 `--ambient-executor off`，要环境声必须显式 relay/airpods；上位机/播放器/声纹遥测照常。self/other 已接进 S3（D31），但门控仍是实验性、未过验收，所以默认保持 off。 |
+| 72 | **2026-10-21 收尾（本轮）** | ✅ **文档与仓库卫生同步** | 声纹 self-veto（3 s 过期、host clear、遥测 `voiceprint_valid` / `voiceprint_self` / `voiceprint_age_ms`）；回控回执只在新的 capture 事件时 acknowledged；`/api/stop` 先清理（含 `ambient.stop`）再退出；README 全量同步、`.gitignore` 音频策略、根 `LICENSE`（MIT）、`TODOS.md` 承接本轮未做的 P2。固件侧 P2（no_data / EQ 平滑 / 忙等）不在本轮。 |
 
 
-**断言计数（2026-10-19 实测）**：主机 C++ 单测 **10 套件合计 323 条**
-（controller 40、noise_analyzer 46、latency_profiler 40、mic_capture 16、mic_decimator 15、
-voiceprint_gate 60、context_window 23、conversation_awareness 38、bone_voice 19、sound_event 26），全部通过。noise_analyzer 从 39 涨到 46 是第 31/32 项加的：
-持续哼唧、静音→哼唧的起始跳变、以及"说话仍能通过"的**成对**断言。context_window 的 23 条是第 29 项
-加的：92 维逐个与 `features.py` 的金标准比对、环形缓冲绕回、三处口径（运动=0、时间基线、
-未过闸门的语音乘积）各钉一条。**旧的 221 / 228 条读数已作废。**
-上位机自测 `python3 tools/host/tests/test_host.py` 输出
-**51 组、7550 条断言**，`node tools/host/tests/render_check.js` 输出 **60 条通过、0 条失败**（条数随快照内容略变）
-（渲染校验现在也断言情境卡与事件卡的三种状态：没报 / 窗没满 / 有判断）。
-这些数字会随代码变化，改完代码要重新跑一遍再同步到 README。
+**断言计数（2026-10-21 定稿实测）**：主机 C++ 单测 **11 套件合计 365 条**
+（controller 80、noise_analyzer 46、latency_profiler 40、mic_capture 16、mic_decimator 15、
+voiceprint_gate 60、context_window 23、conversation_awareness 38、bone_voice 19、
+sound_event 25、speech_gate 3），全部通过。上位机自测 `python3 tools/host/tests/test_host.py`
+输出 **57 组、7594 条断言**（连跑 3 次稳定）；`node tools/host/tests/render_check.js`
+输出 **49 条通过、0 条失败**（条数随快照内容略变，CI 用同款 mock 快照）；
+检查器 `--selftest` **8/8 场景符合预期**。这些数字会随代码变化，改完代码要重新跑一遍
+再同步到 README。
 
 **这条测试自己也有口径风险**：`context_window` 的金标准是生成物
 （`test/context_window_golden.h`，由 `features.py` 在固定配方上算出来）。改
@@ -261,7 +258,7 @@ SHA256 `2ca5420b4b46c464e6f0b73a73376343a6fcc099e5f98e205229f947d26fd19f`），
 ```bash
 sh tools/host_up.sh          # 真机，面板在 http://127.0.0.1:8787/
 sh tools/host_up.sh --mock   # 没有设备也能先把界面跑起来
-python3 tools/host/tests/test_host.py   # 50 组、6639 条断言，不需要设备
+python3 tools/host/tests/test_host.py   # 组数/断言数以运行输出为准，不需要设备
 ```
 
 分工写清楚了：**上位机负责显示与回控（`rec start` / `rec stop`），落盘仍由
@@ -401,9 +398,8 @@ LE Audio 单播输出的支持有限；如果以后换成手机（Android 13+）
 2. **录音素材由谁录**——近场信噪比与声纹可分性都必须由人在设备旁完成
 3. ~~固件侧清掉降噪残留~~ —— ✅ 已完成（第 19 项）
 4. ~~录音回控这条通路修不修~~ —— ✅ 已修并真机验证（第 18 项）
-5. **录音速率要不要继续追**（第 18b 项）——当前约 3.3 k / 16 k 样本每秒。
-   声纹与信噪比那两笔账都需要足量的真实录音，所以这个还没达标之前，`tools/record_from_device.py`
-   录出来的文件时长会是标称的约五分之一。
+5. ~~录音速率要不要继续追~~ —— ✅ 已由第 18b 项解决（10 秒录音产出 10.03 秒、157 块、丢块 0）。
+   2026-10-21 复核：`tools/record_from_device.py` 的时长与丢块口径按该项记录。
 
 ---
 
@@ -429,9 +425,10 @@ SHA256 前缀 `cfe4efba216fbe59`）。
 
 ## 已知的维护风险
 
-- **文档里的数字是手工同步的**：断言总数（主机 297、上位机 6639、渲染校验 49）、真机延迟
-  （节拍 100.03、分析 7.02、决策 0.06）都写在 README 与两份 docs 里。改代码不会自动改它们。
-  目前没有 CI 检查，所以**改完代码要同时搜一遍这几个数字**。
+- **文档里的数字是手工同步的**：断言总数与渲染校验条数**以 CI/运行输出为准**（正文只在
+  2026-10-21 收尾时统一写一次，不追每个中间版本）；真机延迟（节拍 100.03、分析 7.02、
+  决策 0.06）写在 README 与两份 docs 里。改代码不会自动改它们，目前没有 CI 检查，
+  所以**改完代码要同时搜一遍这几个数字**。
 - 真机数字与固件版本绑定：当前实测值对应 **100 ms 节拍**（`4308366` 引入）。换版本后必须重新
   测量并标注出处，否则无法判断某个数字是哪个构建测出来的。
 - **上位机显示的"帧间隔"是主机侧的到达间隔，不是设备节拍。** 这一项曾经明显大于设备自报的

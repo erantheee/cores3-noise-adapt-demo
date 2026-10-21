@@ -1,7 +1,6 @@
 build/
 outputs/
 managed_components/
-dependencies.lock
 sdkconfig
 .DS_Store
 __pycache__/
@@ -26,10 +25,18 @@ experiments/sound-events/.venv-teacher/
 .hf-cache/
 .uv-cache/
 
-# 数据集快照：只提交频段/标签，不提交原始音频（仓库公开，音频含说话声）
+# 数据集快照：默认只入库频段/标签与元信息。已跟踪的 experiments/sound-events/data/**/audio.wav
+# 是维护者 2026-10-19 确认可以公开的素材（含操作者说话声，仓库公开）；新增原始音频默认不入库。
+# 撤下方式见 experiments/sound-events/data/README.md（需要重写 git 历史，不是删文件）。
 !experiments/sound-events/data/
 !experiments/sound-events/data/**
 !experiments/sound-events/data/**/*.jsonl
+
+# 新增原始音频默认不入库（上面已跟踪的 audio.wav 不受影响；确需入库先确认可公开并 git add -f）
+*.wav
+
+# 实验子工程的 lock 不随主工程提交（主工程根 dependencies.lock 由 Lead 统一提交）
+experiments/*/dependencies.lock
 
 # 播放器构建产物（源码是 tools/player/player.swift）
 tools/player/player.new

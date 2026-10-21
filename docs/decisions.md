@@ -316,6 +316,8 @@ g++ -std=c++17 -O2 -I main -o /tmp/voicsweep tools/voice_decision_sweep.cpp main
    意图与执行结果分开上报；执行失败必须显示为失败。没有执行者时意图仍然可见。
 3. **外部人声模式不再写歌曲 EQ**。`eq_gain_db` 只允许 `SONG_EQ` 写；现实人声模式保持平直。
    之前为了让面板动起来把 1–4 kHz 曲线写进歌曲，违反 D0；该行为已删除，单测改为钉"平直"。
+   **（2026-10-21 注：本条的 EQ 部分已被 D26 覆盖——`external_voice_intent` 允许抬 8–16 段；
+   对话成立与声纹判定 self 时才保持平直。）**
 
 **已知代价（必须写清）**：
 
@@ -633,6 +635,8 @@ g++ -std=c++17 -O2 -I main -o /tmp/voicsweep tools/voice_decision_sweep.cpp main
 现在 `host_up.sh` 在真机模式下默认 `--ambient-executor airpods`，没有 AirPods/CLI/AX 权限时
 执行端会如实报不可用；传 `--ambient-executor off` 可退回只显示意图。
 
+**2026-10-21 注：D24 已被 D30 覆盖**（真机默认改回 off）；D30 的默认值在 D31 之后仍保持不变。
+
 
 ---
 
@@ -755,6 +759,9 @@ WavLM 的类内范围 0.8935–0.9686 与类间范围 0.4402–0.6911 **不重�
 通过串口回传 S3 做 own-voice veto；延迟约 1.5 s 窗 + 60 ms 推理 + 串口，需先影子验证
 自说/他人/噪声三类情况下的判定稳定性与延迟，再接决策。
 
+**2026-10-21 注：D29 的"只遥测"边界已被 D31 部分修正**——self/other 已串口回传 S3，
+并作为实验性 self-veto 参与对话/环境声门控（`--voiceprint` 仍默认关闭）。
+
 
 ---
 
@@ -768,3 +775,40 @@ WavLM 的类内范围 0.8935–0.9686 与类间范围 0.4402–0.6911 **不重�
 - 上位机、播放器、WavLM 声纹影子遥测照常运行，只是不执行环境声；
 - 声纹 self/other 通过串口接入 S3、并验证"自己说话不开、别人说话才开"之后，
   再决定是否把默认改回 relay。
+
+**2026-10-21 注：self/other 串口回传与 S3 self-veto 已实现（D31），但门控仍是实验性、
+未过验收；环境声执行端默认 off 保持不变。**
+
+---
+
+## D31 · 2026-10-21 声纹门控收尾：按 D28 第 3 步实现 self-veto
+
+**背景**：D28 确定了后端（WavLM-SV 通过止损门）与"下一步"（串口回传 self/other、S3 做
+own-voice veto）；`ad77572` 已经接上这条链路，但收尾前有三类问题必须处理：
+
+1. **判定过期**：S3 原先把收到的最后一条 voiceprint 判定一直保持，host 退出/串口断开后会
+   永久停在 self 或 other，设备不再接受真实证据。
+2. **状态不清**：host 退出、串口关闭时没有清空 S3 的判定；`--voiceprint` 的语义也容易被读成
+   "参与决策的默认行为"。
+3. **遥测缺口**：面板/串口看不到 S3 实际采信的是哪条判定、是否新鲜。
+
+**决定（2026-10-21）**：
+
+- 采用 D28 第 3 步的 **self-veto**：Mac 侧 WavLM-SV 判定经串口回传 S3
+  （`voiceprint self` / `other` / `pending` / `off`）。**self** → 设备不压媒体、不抬人声 EQ、
+  不开环境声；**other** → 按 D16 的预判逻辑正常动作；`pending` / 无判定不构成说话人轮次。
+- **判定 3 秒无新行自动过期**：超过 3 s 没有收到新判定，S3 视为没有声纹证据，回到 D16 的
+  默认行为，不再被旧判定永久锁死。判定本身按"双方在短窗内都说过"才升级为对话轮次。
+- **host 侧清空**：串口关闭/上位机退出时发送 `voiceprint off`，S3 立即清空判定与"双方轮次"状态。
+- **新增固件遥测**（只增键，schema 仍 4）：`voiceprint_valid` / `voiceprint_self` /
+  `voiceprint_age_ms`，面板与串口都能看到设备实际采信的判定与年龄。
+- **实验性边界不变**：`--voiceprint` 仍默认关闭，默认演示不加载 WavLM；环境声执行端默认仍为
+  `off`（D30）。self-veto 尚未过验收（判定窗约 1.5 s、素材有限、真实多说话人/距离未测），
+  任何对外表述不得写成"自己说话不压已解决"。
+
+**未做（进 TODOS.md）**：`--voiceprint` 的端到端验收（自说/他人/噪声三类）、真机 v4 夹具重抓、
+面板对 self/other 判定的 A/B 展示。
+
+**文件**：`tools/voiceprint_worker.py`、`tools/host/voiceprint.py`、`tools/host/__main__.py`、
+`main/app_main.cpp`、`main/controller.{hpp,cpp}`、`main/CMakeLists.txt`（`voiceprint_gate.cpp`
+移出固件编译）、`tools/host/state.py`、`tools/host/protocol.py`、`tools/host_up.sh`（help 文案）。

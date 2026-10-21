@@ -1,7 +1,7 @@
 # Apple「对话感知」的行为与端侧迁移
 
 状态：**触发与时序已实现（分支 `feature/apple-conversation-awareness`），时序参数待真机标定**
-最后更新：2026-10-16
+最后更新：2026-10-21（第 16.5/17 节为 2026-10-19 追加；第 16.2 节是 2026-10-16 快照）
 
 ---
 
@@ -92,7 +92,7 @@ IMU 也没进主工程。因此 `main/controller.cpp` 的 `own_voice_proxy()` �
 # 1. 戴上 AirPods（两只耳朵），确认「对话感知」= 打开
 # 2. 采样：说话 5 s → 停 8 s → 说话 5 s → 停 8 s → 说话 5 s
 airpods-control/bin/awareness-probe --seconds 150 \
-  --music "/Users/eranthe/Desktop/01.渡口.flac" --out notes/awareness-run3.csv
+  --music "/path/to/本机音乐文件.flac" --out notes/awareness-run3.csv
 ```
 
 分析脚本输出三个数字：**触发延迟 / 下压深度 / 恢复延迟**，写回 `Params` 默认值，
@@ -382,7 +382,7 @@ CORES3_PORT=/dev/cu.usbmodem101 sh tools/flash.sh
 
 ### 12.3 检查器自测（`--selftest`，不需要设备）
 
-检查器本身必须被验证，否则真机那一次跑出来的报告不能用来决策。`--selftest` 用合成帧跑五个场景，
+检查器本身必须被验证，否则真机那一次跑出来的报告不能用来决策。`--selftest` 用合成帧跑八个场景，
 并断言"预期挂哪几条"与"实际挂哪几条"一致：
 
 | 场景 | 预期失败 |
@@ -599,7 +599,7 @@ constexpr EvidencePolicy kEvidencePolicy = EvidencePolicy::near_field_demo;  // 
 | 真机数据回放（骨传导判据） | `tools/bone_real_replay.cpp`、`tools/export_bone_real.py` |
 | Apple 侧实测工具 | `airpods-control/bin/awareness-measure`（含 `--passive`、`--replay`） |
 
-### 16.2 已验证的数字
+### 16.2 已验证的数字（2026-10-16 快照）
 
 | 项 | 结果 |
 |---|---|
@@ -608,6 +608,8 @@ constexpr EvidencePolicy kEvidencePolicy = EvidencePolicy::near_field_demo;  // 
 | 渲染校验 | 49 条 |
 | 检查器自测 | 8/8 场景 |
 | 固件 | 编译 0 错误；`build/cores3_noise_adapt_demo.bin` SHA256 `ee79baf6…`，分区剩 80% |
+
+> 以上是 2026-10-16 的历史快照，**不是当前数字**；当前条数以 CI/运行输出为准，不要从这里抄。
 
 ### 16.3 没做完的四件事（各自的确切下一步）
 
@@ -699,5 +701,6 @@ CLI 不存在时如实报"执行端不可用"，面板上"意图"与"执行结�
 - **环境声执行是 AX 自动化**，不是公开 API；权限/面板渲染失败都可能发生，必须保留错误显示。
 - **旧验证脚本 C9 与新目标冲突**：C9 要求"旁人说话不触发"，但预判式设计的预期行为就是旁人
   开口先压、没人接话再恢复。`tools/verify_conversation_awareness.py` 与 C1–C9 需要按新目标
-  重写（把"触发源"换成 cue、把 C9 改成"无接话时 2.5 s 恢复"）。
+  重写（把"触发源"换成 cue、把 C9 改成"无接话时 2.5 s 恢复"）——**本轮未做，已进
+  [`TODOS.md`](../TODOS.md)**。
 - 参数（cue 门限、200 ms 确认、2.5 s 保持、60%/70%）全部是**待真机标定值**。

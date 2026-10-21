@@ -27,7 +27,7 @@ jobs:
       - name: Host panel self-test
         run: python3 tools/host/tests/test_host.py
       # 对话感知的**检查器**自己也要被测：它要在真机上分辨"证据没来 / 证据来了没下压 /
-      # 不该下压时下压了"。这五种场景是合成数据，不需要设备。
+      # 不该下压时下压了"。这八个场景是合成数据，不需要设备。
       - name: Conversation-awareness checker self-test
         run: python3 tools/verify_conversation_awareness.py --selftest
       - name: Render check against a mock snapshot
