@@ -940,14 +940,18 @@ function renderAssistant(s) {
   $("llm-recording").textContent = `${channelLine}\n${candidateLine}`;
   const segments = Array.isArray(a.segments) ? a.segments : [];
   $("llm-segments").textContent = segments.length
-    ? segments.map((item) =>
-        `#${item.number} ${item.started_at || "—"} → ${item.ended_at || "—"} · ${item.duration_s || 0}s\n` +
-        `说话人 ${item.speaker || "unknown"} · 结束：${item.end_reason || "—"}` +
-        `${Number(item.speech_s) > 0 ? ` · 有效语音 ${Number(item.speech_s).toFixed(1)}s` : ""}` +
-        `${Number(item.asr_gain_db) > 0 ? ` · ASR远场增益 +${Number(item.asr_gain_db).toFixed(1)}dB` : ""}` +
-        `${item.asr_note ? `\n证据/过滤：${item.asr_note}` : ""}\n` +
-        `${item.transcript || "等待转写"}`
-      ).join("\n\n")
+    ? segments.map((item) => {
+        const skipped = /^(未识别|未检测到)/.test(item.transcript || "");
+        return (
+          `#${item.number} ${item.started_at || "—"} → ${item.ended_at || "—"} · ${item.duration_s || 0}s\n` +
+          `说话人 ${item.speaker || "unknown"} · 结束：${item.end_reason || "—"}` +
+          `${Number(item.speech_s) > 0 ? ` · 有效语音 ${Number(item.speech_s).toFixed(1)}s` : ""}` +
+          `${Number(item.asr_gain_db) > 0 ? ` · ASR远场增益 +${Number(item.asr_gain_db).toFixed(1)}dB` : ""}` +
+          `${item.asr_note ? `\n证据/过滤：${item.asr_note}` : ""}` +
+          `${skipped && item.asr_raw ? `\nASR 原始输出：${item.asr_raw}` : ""}\n` +
+          `${item.transcript || "等待转写"}`
+        );
+      }).join("\n\n")
     : "尚无片段";
   $("llm-transcript").textContent = a.transcript || "尚无转写";
   $("llm-summary").textContent = (a.summary_state || "尚无会话账本")

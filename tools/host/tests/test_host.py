@@ -62,7 +62,7 @@ from host.state import (  # noqa: E402
     state_text,
 )
 from host.ambient import AmbientError, AmbientService, RelayAmbient  # noqa: E402
-from host.assistant import AssistantService  # noqa: E402
+from host.assistant import AssistantService, _intervals_seconds  # noqa: E402
 from host.__main__ import (  # noqa: E402
     DialogueTurnGate,
     fresh_self_veto,
@@ -2264,8 +2264,13 @@ def test_assistant_filters_asr_noise_hallucinations() -> None:
     kept, _ = service._filter_asr_text("对对对，好的。", 2.0)
     check("好的" in kept, "正常口语重复不能整段丢弃")
     short_repeat, note = service._filter_asr_text("好的好的好的。", 1.2)
-    check("好的" in short_repeat and "已折叠" in note,
+    check("好的" in short_repeat and note,
           "短句强调式重复应折叠保留，不能按噪声丢弃")
+    for answer in ("好", "对。对。对。", "行", "收到"):
+        kept, _ = service._filter_asr_text(answer, 1.5)
+        check(bool(kept), f"真实短应答不能被当成噪声丢弃：{answer}")
+    dropped, _ = service._filter_asr_text("嗯", 1.5)
+    eq(dropped, "", "单字语气词仍应丢弃")
     folded, note = service._filter_asr_text(
         "不会被patched，until tomorrow。", 3.0
     )
@@ -2299,14 +2304,22 @@ def test_assistant_gates_asr_on_speech_evidence() -> None:
     _, device_seconds, _ = AssistantService._select_speech_regions(long_silence, rate, telemetry, 0)
     check(device_seconds >= AssistantService._MIN_SPEECH_S, "设备连续语音证据必须能独立放行 ASR")
 
-    # 单帧尖峰 + 键盘事件不能算语音证据（LIKELY 保持期里最常见的误触发）。
-    spikes = [
-        {"voice_likelihood": 0.95, "event": "keyboard", "sample": int(rate * 0.2)},
-        {"voice_likelihood": 0.95, "event": "keyboard", "sample": int(rate * 0.4)},
-        {"voice_likelihood": 0.95, "event": "wind", "sample": int(rate * 0.6)},
+    # 连续 4 帧也不能靠键盘/风事件混过语音证据门。
+    for event in ("keyboard", "wind"):
+        rejected = [
+            {"voice_likelihood": 0.95, "event": event, "sample": int(rate * 0.2 * index)}
+            for index in range(6)
+        ]
+        eq(AssistantService._telemetry_speech_regions(rejected, rate, 0, 48000), [],
+           f"连续 {event} 帧不得成为 ASR 语音证据")
+    control = [
+        {"voice_likelihood": 0.95, "event": "speech", "sample": int(rate * 0.2 * index)}
+        for index in range(6)
     ]
-    eq(AssistantService._telemetry_speech_regions(spikes, rate, 0, 32000), [],
-       "键盘/风的单帧尖峰不得成为 ASR 语音证据")
+    check(_intervals_seconds(
+              AssistantService._telemetry_speech_regions(control, rate, 0, 48000), rate
+          ) > 0,
+          "连续 speech 帧必须能通过语音证据门（对照组）")
 
 
 def test_assistant_llm_decision_authorizes_ambient() -> None:
@@ -2498,6 +2511,27 @@ def test_assistant_rejects_stale_summary_and_fails_closed_on_asr_death() -> None
     check("已退出" in published.snapshot()["task"], "作废后任务状态必须说明原因")
 
 
+def test_assistant_splits_unknown_speakers_into_pause_turns() -> None:
+    """声纹全 unknown 时，按静音停顿切轮次，LLM 才能看到"轮次结构"。"""
+    rate = 16000
+    tone = [8000 if index % 2 else -8000 for index in range(int(0.6 * rate))]
+    silence = [0] * int(0.5 * rate)
+    samples = silence + tone + silence + tone + [0] * int(0.2 * rate)
+    pcm = struct.pack(f"<{len(samples)}h", *samples)
+    first = len(silence)
+    second = first + len(tone) + len(silence)
+    regions = [
+        (first, first + len(tone)),
+        (second, second + len(tone)),
+    ]
+    turns = AssistantService._split_unknown_turns(pcm, rate, regions, 0)
+    eq(len(turns), 2, "两个静音分开的语音区间必须切成两个 unknown 轮次")
+    check(all(label == "unknown" for label, _ in turns),
+          "切轮次不能伪造说话人身份")
+    check(all(len(audio) >= int(0.3 * rate) * 2 for _, audio in turns),
+          "每个轮次都必须保留足够 ASR 音频")
+
+
 def test_assistant_uses_absolute_sample_offset_for_speakers() -> None:
     """裁剪后的 ASR 片段仍要按**绝对**流样本号对齐声纹窗口（连续中继 start_sample>0）。"""
     absolute_start = 100_000
@@ -2651,6 +2685,7 @@ def main() -> int:
         test_assistant_filters_asr_noise_hallucinations,
         test_assistant_gates_asr_on_speech_evidence,
         test_assistant_llm_decision_authorizes_ambient,
+        test_assistant_splits_unknown_speakers_into_pause_turns,
         test_assistant_uses_absolute_sample_offset_for_speakers,
         test_authorization_epoch_advances_after_rolling_cap_then_silence,
         test_assistant_rejects_stale_summary_and_fails_closed_on_asr_death,

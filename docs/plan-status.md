@@ -131,7 +131,7 @@ AirPods Pro 播放最终输出；分别验证歌曲 EQ、现实人声增益意�
 （controller 80、noise_analyzer 46、latency_profiler 40、mic_capture 16、mic_decimator 15、
 voiceprint_gate 60、context_window 23、conversation_awareness 38、bone_voice 19、
 sound_event 25、speech_gate 3），全部通过。上位机自测 `python3 tools/host/tests/test_host.py`
-输出 **68 组、7710 条断言**（2026-10-21 D32/D33 后实测通过；连跑 3 次稳定）；
+输出 **69 组、7720 条断言**（2026-10-21 D32/D33 后实测通过；连跑 3 次稳定）；
 `node tools/host/tests/render_check.js` 用同款 mock 快照运行，条数随快照内容略变
 （2026-10-21 修复前记录为 49 条通过、0 条失败）；
 检查器 `--selftest` **8/8 场景符合预期**。这些数字会随代码变化，改完代码要重新跑一遍
