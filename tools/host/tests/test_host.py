@@ -20,6 +20,7 @@ import io
 import json
 import struct
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -63,6 +64,7 @@ from host.state import (  # noqa: E402
 )
 from host.ambient import AmbientError, AmbientService, RelayAmbient  # noqa: E402
 from host.assistant import AssistantService, _intervals_seconds  # noqa: E402
+from host.training import TrainingWriter  # noqa: E402
 from host.__main__ import (  # noqa: E402
     DialogueTurnGate,
     fresh_self_veto,
@@ -1122,7 +1124,7 @@ def test_web_assets_contract() -> None:
     for element in ("chart", "latency-body", "problems", "events", "raw", "stats-body",
                     "capture-text", "btn-rec-start", "btn-rec-stop", "rec-seconds",
                     "llm-state", "llm-task", "llm-transcript", "llm-summary", "llm-sessions",
-                    "llm-decision",
+                    "llm-decision", "llm-context",
                     "conn-dot", "conn-text", "source-text", "age", "gain", "media",
                     "link", "env", "state", "conf", "seq", "toast", "eq", "control-warn"):
         check(f'id="{element}"' in html, f"界面必须有 #{element}")
@@ -1147,8 +1149,9 @@ def test_web_assets_contract() -> None:
     check("设备录音（控制设备自己的麦克风）" not in html, "主界面不得再把诊断采集当成大块产品功能")
     check("S3 负责录音" in html, "界面要明确 S3 承担 recording")
     check("LLM 工作台" in html, "上位机要显示 LLM 工作状态")
-    check("对话判定 → 环境声授权" in html,
-          "界面必须把 LLM 判定、环境声授权与 S3 意图分开显示（D32）")
+    check("快路径 → LLM 迟到否决" in html,
+          "界面必须说明端侧快路径与 LLM 迟到否决的分工（D34）")
+    check("LLM 上下文" in html, "界面必须显示 LLM 跨片段上下文")
     check("llm-decision" in html, "界面必须显示最近一次对话判定与环境声授权")
 
     # 界面脚本里 $("...") 引用的每个 id 都必须真的存在于 HTML 里。这条纯 Python 也能查，
@@ -2322,55 +2325,50 @@ def test_assistant_gates_asr_on_speech_evidence() -> None:
           "连续 speech 帧必须能通过语音证据门（对照组）")
 
 
-def test_assistant_llm_decision_authorizes_ambient() -> None:
+def test_assistant_fast_path_authorization_and_late_veto() -> None:
+    """D34：端侧快路径默认放行；LLM 只有迟到的语义否决权。"""
     service = AssistantService()
-    # 不启动真实 LLM/ASR，只验证授权状态机；configured 只在本地置位。
     service.base_url = "http://127.0.0.1:9"
     service.api_key = "test"
     service.model = "test-model"
 
     waiting = service.ambient_authorization()
-    check(not waiting["allow"] and waiting["state"] == "waiting",
-          "没有 ASR/LLM 判定时环境声必须 fail-closed")
+    check(waiting["allow"] and waiting["state"] == "fast_local",
+          "没有 LLM 判定时不能阻塞端侧快路径")
+    check(not waiting["veto"], "没有判定不能凭空否决")
 
-    service._publish_decision(1, "yes", "open", 0.85, "self 与 other 有语义关联的轮流回应", "llm")
-    allowed = service.ambient_authorization()
-    check(allowed["allow"] and allowed["state"] == "allowed",
-          "新鲜 dialogue=yes/open 判定必须授权环境声")
-    check(allowed["age_s"] is not None and allowed["age_s"] <= 1.0, "授权必须带判定年龄")
-    check(allowed["verdict_text"] == "对话", "授权必须回显判定中文口径")
+    service._publish_decision(1, "yes", "open", 0.85, "双方来回", "llm")
+    confirmed = service.ambient_authorization()
+    check(confirmed["allow"] and confirmed["state"] == "llm_confirmed",
+          "LLM yes 必须确认为对话（不阻塞快路径）")
+    check(confirmed["age_s"] is not None and confirmed["age_s"] <= 1.0,
+          "授权必须带判定年龄")
 
     service._decision["at"] = time.monotonic() - service._DECISION_TTL_S - 1.0
     stale = service.ambient_authorization()
-    check(not stale["allow"] and stale["state"] == "stale",
-          "过期的 LLM 判定不得继续授权环境声")
+    check(stale["allow"] and stale["state"] == "fast_local",
+          "过期 yes 只能被忽略，不能阻塞快路径；也不应冒充新鲜确认")
 
-    # 新的一轮对话开始后，上一轮判定不能给这一轮当授权。
-    episode_service = AssistantService()
-    episode_service.base_url = "http://127.0.0.1:9"
-    episode_service.api_key = "test"
-    episode_service.model = "test-model"
-    episode_service._publish_decision(10, "yes", "open", 0.9, "上一轮对话", "llm")
-    episode_service._continuous_stream = True
-    episode_service._authorization_epoch_id = 1
-    episode = episode_service.ambient_authorization()
-    check(not episode["allow"] and episode["state"] == "stale",
-          "新对话轮次必须等待自己的判定，不能沿用上一轮授权")
-    episode_service._authorization_epoch_id = 0
-    check(episode_service.ambient_authorization()["allow"],
-          "同一轮对话内的新鲜判定必须继续授权")
+    # LLM 迟到否决：即使设备意图为 true，执行端也要关闭。
+    service._publish_decision(2, "no", "close", 0.8, "电视单向人声", "llm")
+    veto = service.ambient_authorization()
+    check((not veto["allow"]) and veto["state"] == "llm_veto" and veto["veto"],
+          "LLM 判定非对话必须形成迟到否决")
+    check(veto["age_s"] is not None and veto["age_s"] <= 1.0,
+          "否决也必须带判定年龄，便于计算误开时长")
 
-    # 6 s 滚动分段不推进轮次：上一段的授权在下一段判定回来前仍然有效。
-    rolling = AssistantService()
-    rolling.base_url = "http://127.0.0.1:9"
-    rolling.api_key = "test"
-    rolling.model = "test-model"
-    rolling.recording_started(16000, 0)
-    rolling._publish_decision(3, "yes", "open", 0.9, "滚动对话仍在继续", "llm")
-    check(rolling.ambient_authorization()["allow"],
-          "同一轮滚动分段的上一段判定必须继续授权环境声")
+    # 本地 unclear 不参与语义否决，快路径继续；本地 no（无有效语音）要否决，
+    # 否则纯噪声里环境声会一直开着（ASR 过滤空时不会调用 LLM 来纠正）。
+    service._publish_decision(3, "unclear", "close", 0.2, "ASR 只输出语气词", "local")
+    local = service.ambient_authorization()
+    check(local["allow"] and local["state"] == "fast_local",
+          "本地 unclear 判定不能否决端侧快路径")
+    service._publish_decision(4, "no", "close", 0.9, "无有效语音", "local")
+    local_veto = service.ambient_authorization()
+    check((not local_veto["allow"]) and local_veto["state"] == "local_veto",
+          "本地无有效语音必须能关闭快路径已经打开的环境声")
 
-    # 旧轮次的 LLM 晚归：发布时间比新一轮还晚，也不能授权新轮次。
+    # 旧轮次判定晚归：不能写入新轮次，快路径继续。
     delayed = AssistantService()
     delayed.base_url = "http://127.0.0.1:9"
     delayed.api_key = "test"
@@ -2378,36 +2376,24 @@ def test_assistant_llm_decision_authorizes_ambient() -> None:
     delayed.recording_started(16000, 0)
     old_epoch = delayed._authorization_epoch_id - 1
     delayed._publish_decision(
-        5, "yes", "open", 0.9, "上一轮对话晚归", "llm", epoch_id=old_epoch
+        5, "no", "close", 0.9, "上一轮否决晚归", "llm", epoch_id=old_epoch
     )
     check(delayed.snapshot()["decision"] is None,
-          "上一轮对话的判定晚归必须被丢弃，不能写入新轮次")
-    check(not delayed.ambient_authorization()["allow"],
-          "旧轮次判定晚归不得授权环境声")
+          "上一轮对话的判定晚归必须被丢弃")
+    check(delayed.ambient_authorization()["allow"],
+          "旧轮次的否决不得关掉新轮次的快路径")
 
-    # 非连续录音之间同样不能串用判定：新一次录音开始必须清掉上一段录音的 yes。
+    # 新一次定时录音必须清掉上一段录音的判定。
     timed = AssistantService()
     timed.base_url = "http://127.0.0.1:9"
     timed.api_key = "test"
     timed.model = "test-model"
     timed.recording_started(16000, 5)
-    timed._publish_decision(1, "yes", "open", 0.9, "上一段定时录音", "llm")
-    check(timed.ambient_authorization()["allow"],
-          "同一次录音内的新鲜判定必须授权环境声")
+    timed._publish_decision(1, "no", "close", 0.9, "上一段录音", "llm")
+    check(timed.ambient_authorization()["state"] == "llm_veto", "前置条件：否决已生效")
     timed.recording_started(16000, 5)
     check(timed.snapshot()["decision"] is None, "新一次录音必须清掉上一次录音的判定")
-    check(not timed.ambient_authorization()["allow"],
-          "上一次录音的判定不得授权新一次录音")
-
-    service._publish_decision(2, "no", "close", 0.8, "只有单方，且 ASR 重复", "llm")
-    closed = service.ambient_authorization()
-    check(not closed["allow"] and closed["state"] == "closed",
-          "非对话判定必须关闭环境声")
-
-    # LLM 请求是并发的：旧片段的响应可以晚到，但绝不能覆盖新片段判定。
-    service._publish_decision(1, "yes", "open", 0.99, "旧片段的乱序判定", "llm")
-    check(not service.ambient_authorization()["allow"],
-          "旧片段乱序返回的判定不得重新授权环境声")
+    check(timed.ambient_authorization()["allow"], "新录音从端侧快路径开始")
 
     parsed = AssistantService._parse_decision(
         '{"dialogue":"yes","ambient":"open","confidence":0.8,"reason":"双方来回"}'
@@ -2423,7 +2409,8 @@ def test_assistant_llm_decision_authorizes_ambient() -> None:
 
     snapshot = service.snapshot()
     check(snapshot["decision"] is not None, "最近判定必须进入快照供界面显示")
-    eq(snapshot["ambient_authorization"]["state"], "closed", "快照必须带当前环境声授权状态")
+    eq(snapshot["ambient_authorization"]["state"], "local_veto",
+       "快照必须带当前环境声授权状态（本地无语音否决）")
     eq(AssistantService._asr_token_budget(6.0), 72, "6 s 语音的 ASR token 预算必须按 12 token/s 收紧")
     eq(AssistantService._asr_token_budget(30.0), AssistantService._MAX_ASR_TOKENS,
        "超长语音的 ASR token 预算必须封顶")
@@ -2446,9 +2433,9 @@ def test_authorization_epoch_advances_after_rolling_cap_then_silence() -> None:
     service._spawn_dispatch = lambda *args: None  # type: ignore[method-assign]
     service.observe_frame(Frame())
     first_epoch = service._authorization_epoch_id
-    service._publish_decision(1, "yes", "open", 0.9, "第一轮对话", "llm")
-    check(service.ambient_authorization()["allow"],
-          "第一轮对话的判定必须授权环境声")
+    service._publish_decision(1, "no", "close", 0.9, "第一轮是电视", "llm")
+    check(service.ambient_authorization()["state"] == "llm_veto",
+          "第一轮对话内的否决必须生效")
 
     # 达到 6 s 上限：会话转为 inactive，但轮次不变（滚动分段）。
     service._conversation_started_at = time.monotonic() - service._MAX_CONTINUOUS_SEGMENT_S
@@ -2459,16 +2446,16 @@ def test_authorization_epoch_advances_after_rolling_cap_then_silence() -> None:
     eq(service._authorization_epoch_id, first_epoch,
        "滚动分段结束后的静音帧不得推进授权轮次")
 
-    # 静音 4 s 后重新开口：必须推进轮次，上一轮 yes 立即失效。
+    # 静音 4 s 后重新开口：推进轮次，上一轮的语义否决不应影响新对话。
     service._last_conversation_at = time.monotonic() - 4.0
     service.observe_frame(Frame())
     eq(service._authorization_epoch_id, first_epoch + 1,
        "静音后重新开口必须推进授权轮次")
-    check(not service.ambient_authorization()["allow"],
-          "上一轮对话的 yes 不得授权静音后的新一轮对话")
+    check(service.ambient_authorization()["allow"],
+          "新一轮对话必须从端侧快路径开始，不继承上一轮否决")
 
 
-def test_assistant_rejects_stale_summary_and_fails_closed_on_asr_death() -> None:
+def test_assistant_asr_death_falls_back_to_fast_path() -> None:
     # 并发 LLM 请求乱序返回：旧摘要不能覆盖新摘要。
     service = AssistantService()
     service._set_summary(3, "第三段摘要")
@@ -2476,39 +2463,23 @@ def test_assistant_rejects_stale_summary_and_fails_closed_on_asr_death() -> None
     eq(service.snapshot()["summary_state"], "第三段摘要",
        "旧片段摘要不得覆盖新片段摘要")
 
-    # ASR worker 的 stdout 关闭（崩溃/被杀）：必须把未完成事件关掉并 fail-closed，
-    # 不能永远停在"正在转写"。
+    # ASR worker 的 stdout 关闭（崩溃/被杀）：退回纯本地快路径，不能永久卡住。
     class FakeProcess:
         stdout = iter(())
 
-    dying = AssistantService()
-    dying.base_url = "http://127.0.0.1:9"
-    dying.api_key = "test"
-    dying.model = "test-model"
-    dying._asr_ready = True
-    dying._asr_process = FakeProcess()  # type: ignore[assignment]
-    dying._read_asr()
-    snapshot = dying.snapshot()
-    check(not snapshot["asr_ready"], "ASR worker 退出后必须标记为未就绪")
-    check("已退出" in snapshot["task"], "ASR worker 退出必须反映在任务状态里")
-    check("已退出" in (snapshot["decision"] or {}).get("reason", ""),
-          "ASR worker 退出时必须给出失败判定")
-    check(not snapshot["ambient_authorization"]["allow"],
-          "ASR worker 退出后环境声必须保持关闭")
-
-    # 没有 pending 事件、但已经发布过 yes：worker 死亡也必须立刻作废授权。
     published = AssistantService()
     published.base_url = "http://127.0.0.1:9"
     published.api_key = "test"
     published.model = "test-model"
     published._publish_decision(2, "yes", "open", 0.9, "刚判为对话", "llm")
-    check(published.ambient_authorization()["allow"], "前置条件：yes 已授权")
     published._asr_ready = True
     published._asr_process = FakeProcess()  # type: ignore[assignment]
     published._read_asr()
-    check(not published.ambient_authorization()["allow"],
-          "ASR worker 死亡必须作废已经发布的 yes 授权")
-    check("已退出" in published.snapshot()["task"], "作废后任务状态必须说明原因")
+    snapshot = published.snapshot()
+    check(not snapshot["asr_ready"], "ASR worker 退出后必须标记为未就绪")
+    check("已退出" in snapshot["task"], "ASR worker 退出必须反映在任务状态里")
+    check(snapshot["ambient_authorization"]["allow"],
+          "ASR 退出只能降级为无 LLM 否决，不能阻塞端侧快路径")
 
 
 def test_assistant_splits_unknown_speakers_into_pause_turns() -> None:
@@ -2530,6 +2501,50 @@ def test_assistant_splits_unknown_speakers_into_pause_turns() -> None:
           "切轮次不能伪造说话人身份")
     check(all(len(audio) >= int(0.3 * rate) * 2 for _, audio in turns),
           "每个轮次都必须保留足够 ASR 音频")
+
+
+def test_training_writer_records_segment_and_llm_context() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        training = TrainingWriter(tmp, audio=True)
+        service = AssistantService(training=training)
+        service.recording_started(16000, 5)
+        # 1 s 静音：没有语音证据，走跳过 ASR 分支；训练记录仍应落盘（负样本）。
+        service._dispatch_event(
+            1, 1.0, 1, 0, [], struct.pack("<16000h", *([0] * 16000)), 16000, 0
+        )
+        lines = (training.session_dir / "segments.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        eq(len(lines), 1, "每个候选片段必须写一条训练记录（含负样本）")
+        record = json.loads(lines[0])
+        eq(record["segment"], 1, "训练记录必须带片段号")
+        check(record["audio"] and record["audio"]["path"], "默认必须保存原始音频")
+        check((training.session_dir / record["audio"]["path"]).exists(),
+              "音频文件必须真的落盘")
+        eq(record["device"]["speech_s"], 0.0, "负样本要记录端侧语音证据为 0")
+        eq(record["labels"]["teacher"]["dialogue"], "no",
+           "跳过 ASR 的片段教师标签应是本地非对话")
+        check("llm_context" in record, "训练记录必须保存 LLM 上下文快照")
+        eq(record["labels"]["human"], None, "人工标签留空，等后续标注")
+        service.recording_started(16000, 5)
+        json.dumps(service.snapshot(), ensure_ascii=False)  # 快照必须可 JSON 序列化
+        training.close()
+
+    # LLM 上下文：同一轮对话内累积轮次与判定；新采集/新轮次清空。
+    service = AssistantService()
+    service.recording_started(16000, 0)
+    epoch = service._authorization_epoch_id
+    service._note_context_turns(1, epoch, [("self", "你几点到？"), ("other", "七点。")])
+    service.recording_started(16000, 0)  # 新会话会推进 epoch
+    epoch = service._authorization_epoch_id
+    service._note_context_turns(2, epoch, [("unknown", "第一句"), ("unknown", "第二句")])
+    facts = service._context_facts()
+    eq(facts["turn_count"], 2, "LLM 上下文必须保存跨片段轮次")
+    service._publish_decision(2, "yes", "open", 0.8, "轮流接话", "llm")
+    check(len(service._context_facts()["previous_verdicts"]) == 1,
+          "LLM 上下文必须保存最近判定，供下一段保持一致")
+    service.recording_started(16000, 0)
+    eq(service._context_facts()["turn_count"], 0, "新一轮采集必须清空 LLM 上下文")
 
 
 def test_assistant_uses_absolute_sample_offset_for_speakers() -> None:
@@ -2684,11 +2699,12 @@ def main() -> int:
         test_assistant_boosts_only_quiet_asr_copy,
         test_assistant_filters_asr_noise_hallucinations,
         test_assistant_gates_asr_on_speech_evidence,
-        test_assistant_llm_decision_authorizes_ambient,
+        test_assistant_fast_path_authorization_and_late_veto,
         test_assistant_splits_unknown_speakers_into_pause_turns,
+        test_training_writer_records_segment_and_llm_context,
         test_assistant_uses_absolute_sample_offset_for_speakers,
         test_authorization_epoch_advances_after_rolling_cap_then_silence,
-        test_assistant_rejects_stale_summary_and_fails_closed_on_asr_death,
+        test_assistant_asr_death_falls_back_to_fast_path,
         test_llm_ambient_authority_helpers,
         test_ambient_requires_fresh_other_voiceprint,
     ]

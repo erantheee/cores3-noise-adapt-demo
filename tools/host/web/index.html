@@ -297,8 +297,10 @@
         <span class="sub" id="llm-sessions">今日会话 —</span>
       </div>
       <div class="sub" id="llm-task">等待接入 ASR 与 LLM</div>
-      <div class="sub" style="margin-top:8px">对话判定 → 环境声授权（LLM 是执行授权，S3 意图只是申请）</div>
+      <div class="sub" style="margin-top:8px">快路径 → LLM 迟到否决（端侧先开，LLM 只纠正）</div>
       <pre class="raw" id="llm-decision">尚无判定</pre>
+      <div class="sub" style="margin-top:8px">LLM 上下文（跨片段轮次 / 最近判定）</div>
+      <pre class="raw" id="llm-context">尚无上下文</pre>
       <div class="sub" style="margin-top:8px">录音边界与当前说话人</div>
       <pre class="raw" id="llm-recording">采集通道尚未启动</pre>
       <div class="sub" style="margin-top:8px">最近片段</div>
@@ -911,11 +913,13 @@ function renderAssistant(s) {
   const decision = a.decision;
   const auth = a.ambient_authorization || {};
   const stateNames = {
-    allowed: "允许（判定对话且未过期）",
-    closed: "关闭（判定非对话/环境声不开放）",
-    stale: "关闭（判定已过期）",
-    waiting: "等待（尚未获得 ASR/LLM 判定）",
-    not_configured: "未配置 LLM，回退设备意图/声纹门控",
+    fast_local: "端侧快路径（LLM 判定未回/不阻塞）",
+    llm_confirmed: "LLM 确认对话",
+    llm_veto: "LLM 迟到否决（关闭环境声）",
+    llm_unclear: "LLM 不确定（保持端侧快路径）",
+    local_veto: "本地证据否决（无有效语音/证据不足）",
+    local_only: "仅本地（未配置 LLM）",
+    not_configured: "仅本地（未配置 LLM）",
   };
   const authLine = `环境声授权：${stateNames[auth.state] || "关闭（fail-closed）"}`
     + (auth.age_s !== null && auth.age_s !== undefined ? ` · 判定 ${auth.age_s}s 前` : "");
@@ -926,6 +930,21 @@ function renderAssistant(s) {
     : "尚无判定（候选片段还没有通过语音证据门控）";
   $("llm-decision").textContent = `${decisionLine}\n${authLine}`
     + (auth.reason ? `\n${auth.reason}` : "");
+  const context = a.llm_context || {};
+  const recentTurns = Array.isArray(context.recent_turns) ? context.recent_turns : [];
+  const recentVerdicts = Array.isArray(context.recent_verdicts) ? context.recent_verdicts : [];
+  $("llm-context").textContent =
+    `轮次 ${context.turn_count || 0} 条 · 最近判定 ${context.verdict_count || 0} 条` +
+    (recentTurns.length
+      ? "\n" + recentTurns.map((turn) =>
+          `#${turn.segment || "—"} ${turn.speaker || "unknown"}：${turn.text || ""}`
+        ).join("\n")
+      : "\n尚无跨片段轮次") +
+    (recentVerdicts.length
+      ? "\n" + recentVerdicts.map((item) =>
+          `#${item.segment || "—"} ${item.dialogue || "unclear"} / ${item.ambient || "close"}`
+        ).join("\n")
+      : "");
   const channel = a.capture_channel || {};
   const candidate = a.candidate || {};
   const speakerNames = {self: "佩戴者 self", other: "他人 other", unknown: "未知 unknown"};

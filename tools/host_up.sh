@@ -74,6 +74,12 @@ case " $* " in
     *" --ambient-executor "*|*" --mock "*|*" --replay "*) : ;;
     *) set -- --ambient-executor off "$@" ;;
 esac
+# 训练数据默认落盘到 gitignore 的 记录/训练数据/（D34）：每个候选片段一条 JSONL +
+# 16 kHz WAV，供端侧蒸馏与人工复盘；不需要时传 --no-training-data 或 --training-dir ""。
+case " $* " in
+    *" --training-dir "*|*" --no-training-data "*|*" --mock "*|*" --replay "*) : ;;
+    *) set -- --training-dir "$ROOT/记录/训练数据" "$@" ;;
+esac
 if [ -n "${CORES3_PORT:-}" ]; then
     case " $* " in
         *" --mock "*|*" --replay "*) : ;;

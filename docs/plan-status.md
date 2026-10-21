@@ -3,9 +3,9 @@
 本文件是**计划本身在仓库里的落点**。它记录每一项的状态、卡在哪里、以及下一步由谁做。
 改计划时同步改这里，不要只留在对话里。
 
-最后更新：2026-10-21（现场反馈修复）。当前代码基线为 2026-10-21 收尾 HEAD 叠加
-ASR/LLM 闭环修复（D32/D33，最终 HEAD 见 `git log -1`），协议 **schema 4**；
-本轮收尾项见第 72 项，现场反馈修复见第 74/75 项。
+最后更新：2026-10-21（快路径 + 训练数据）。当前代码基线为 2026-10-21 收尾 HEAD 叠加
+ASR/LLM 闭环与 D34 快路径修复（最终 HEAD 见 `git log -1`），协议 **schema 4**；
+本轮收尾项见第 72 项，现场反馈修复见第 74/75/76 项。
 
 ---
 
@@ -124,14 +124,15 @@ AirPods Pro 播放最终输出；分别验证歌曲 EQ、现实人声增益意�
 | 72 | **2026-10-21 收尾（本轮）** | ✅ **文档与仓库卫生同步** | 声纹 self-veto（3 s 过期、host clear、遥测 `voiceprint_valid` / `voiceprint_self` / `voiceprint_age_ms`）；回控回执只在新的 capture 事件时 acknowledged；`/api/stop` 先清理（含 `ambient.stop`）再退出；README 全量同步、`.gitignore` 音频策略、根 `LICENSE`（MIT）、`TODOS.md` 承接本轮未做的 P2。固件侧 P2（no_data / EQ 平滑 / 忙等）不在本轮。 |
 | 73 | **声纹 self-veto 真机复测（2026-10-21）** | ✅ **通过** | 固件为 CI artifact `cores3_noise_adapt_demo.bin` SHA256 `0b1a72…`（842,272 B，由收尾 HEAD 构建）。串口实测：`voiceprint pending` 后对话不锁（仍 `LIKELY`）；`voiceprint self 0.93` 后 `conversation=NONE`、`media≈100`、`ambient_open=false`；`voiceprint other 0.10` 恢复 `LIKELY`/60/true；`voiceprint off` 后 `voiceprint_age_ms=-1`；不再有新判定 3 s 后 `voiceprint_valid=false` 且对话恢复。每帧均带 `voiceprint_valid/self/age_ms` 三键。|
 | 74 | **ASR 噪声门控与去幻觉（D33，2026-10-21 现场反馈）** | ✅ **代码/离线/真机噪声段验证；多人对话转写未验收** | 现场 15 s 噪声被 +17 dB 放大后 Qwen3-ASR 吐出满屏"就是"。修复：≥1 s 语音证据（设备连续 4 帧 `voice_likelihood≥0.65` 排除键盘/风/撞击，或 20 ms 能量 VAD）才送 ASR；只裁首尾保留样本偏移；token 预算按语音时长收紧；重复循环/语气词/单字输出丢弃。离线真实 ASR 复测：静音/嗡嗡/呼吸不再出文字，3 s 语音+12 s 静音从重复 6 次变一句话。真机（串口 + `--voiceprint --ambient-executor relay`）2026-10-21 16:17–16:18 连续 5 段现场噪声：3 段"未检测到有效人声（跳过 ASR）"、2 段 ASR 输出被判"只有语气词"丢弃，面板不再出现满屏"就是"。见 D33。 |
-| 75 | **LLM 判定成为环境声执行授权（D32，2026-10-21 现场反馈）** | 🟡 **代码/单测/API 实测完成；真机语义对话待验** | 旧版 LLM 只写面板，环境声门控仍等 WavLM `other`；现场 `speech_ratio` 长期低于阈值 → 40 段候选 opens=0。修复：LLM 对每段输出 `dialogue/ambient/confidence/reason`；执行端要求 S3 意图 ∧ 新鲜 `dialogue=yes`（TTL 20 s）∧ 判定属于当前对话轮次，其余 fail-closed；6 s 滚动分段不推进轮次；旧轮次晚归与 ASR worker 退出立即失效；声纹降级为新鲜 self 否决；分段 15 s→6 s；面板分四行显示。中转 API 8 次结构化输出 8/8 合法、p50 5.10 s。见 D32。 |
+| 75 | **LLM 判定成为环境声执行授权（D32，2026-10-21 现场反馈）** | ⚠️ **已被第 76 项/D34 取代授权方向**；其余（epoch/TTL/上下文/训练）沿用 | 旧版 LLM 只写面板，环境声门控仍等 WavLM `other`；现场 `speech_ratio` 长期低于阈值 → 40 段候选 opens=0。修复：LLM 对每段输出 `dialogue/ambient/confidence/reason`；执行端要求 S3 意图 ∧ 新鲜 `dialogue=yes`（TTL 20 s）∧ 判定属于当前对话轮次，其余 fail-closed；6 s 滚动分段不推进轮次；旧轮次晚归与 ASR worker 退出立即失效；声纹降级为新鲜 self 否决；分段 15 s→6 s；面板分四行显示。中转 API 8 次结构化输出 8/8 合法、p50 5.10 s。见 D32。 |
+| 76 | **D34：端侧快路径先开、LLM 迟到否决 + 训练数据/上下文（2026-10-21）** | 🟡 **已实现并真机跑通；语义验收/蒸馏未做** | 用户约束"不能有延迟"：LLM p50 5.1 s 不能进实时环。执行端立即执行 S3 意图（0.2–0.3 s），LLM 只有迟到否决（no 关闭、yes 确认、unclear 不阻塞）；本地无语音证据也可否决；epoch/TTL 防止旧轮次串扰。`host_up.sh` 默认落训练数据 `记录/训练数据/<会话>/`（每片段 JSONL+WAV、遥测、ASR 原始/清洗轮次、LLM 上下文/原始响应/判定、教师标签+人工留空，events.jsonl 记开关/否决时刻）；LLM 保存跨片段 context（24 轮+4 判定，新对话清空）。真机验证：快路径立即开、约 6 s 后本地证据否决关闭；训练记录与音频已生成。见 D34。 |
 
 
 **断言计数（2026-10-21 定稿实测）**：主机 C++ 单测 **11 套件合计 365 条**
 （controller 80、noise_analyzer 46、latency_profiler 40、mic_capture 16、mic_decimator 15、
 voiceprint_gate 60、context_window 23、conversation_awareness 38、bone_voice 19、
 sound_event 25、speech_gate 3），全部通过。上位机自测 `python3 tools/host/tests/test_host.py`
-输出 **69 组、7720 条断言**（2026-10-21 D32/D33 后实测通过；连跑 3 次稳定）；
+输出 **70 组、7728 条断言**（2026-10-21 D32/D33 后实测通过；连跑 3 次稳定）；
 `node tools/host/tests/render_check.js` 用同款 mock 快照运行，条数随快照内容略变
 （2026-10-21 修复前记录为 49 条通过、0 条失败）；
 检查器 `--selftest` **8/8 场景符合预期**。这些数字会随代码变化，改完代码要重新跑一遍

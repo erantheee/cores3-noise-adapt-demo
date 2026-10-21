@@ -34,6 +34,7 @@ from .audio_relay import (
 from .mac_audio import EXPECTED_TARGET, default_output, route_command
 from .player import DEFAULT_VOLUME_PERCENT, PlayerService
 from .server import Broadcaster, make_server, pick_port
+from .training import TrainingWriter
 from .voiceprint import VoiceprintService
 from .sources import (
     MissingDependency,
@@ -366,6 +367,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "包含判据遥测、环境谱、决策与环境声意图；标签由人另外标（见 docs/conversation-prediction.md）"
         ),
     )
+    parser.add_argument(
+        "--training-dir",
+        default="",
+        help=(
+            "训练数据落盘目录（每个候选片段一条 JSONL + 默认保存 16 kHz WAV）。"
+            "host_up.sh 真机默认指到 记录/训练数据/；传空字符串关闭。"
+        ),
+    )
+    parser.add_argument(
+        "--no-training-audio",
+        action="store_true",
+        help="训练数据只写 JSONL/遥测，不保存原始音频（隐私/磁盘考虑）",
+    )
+    parser.add_argument(
+        "--no-training-data",
+        action="store_true",
+        help="完全不采集训练数据（覆盖 host_up.sh 的默认目录）",
+    )
     return parser.parse_args(argv)
 
 
@@ -423,8 +442,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if base_feed is None and voiceprint is None:
         on_mic_chunk = None
+    training = None
+    if args.training_dir and not args.no_training_data:
+        try:
+            training = TrainingWriter(
+                args.training_dir, audio=not args.no_training_audio
+            )
+        except OSError as exc:
+            print(f"训练数据目录不可写，本次不采集：{exc}", file=sys.stderr)
     assistant = AssistantService(
-        voiceprint_snapshot=voiceprint.snapshot if voiceprint is not None else None
+        voiceprint_snapshot=voiceprint.snapshot if voiceprint is not None else None,
+        training=training,
     )
     state = HostState(
         source=source.name,
@@ -560,6 +588,8 @@ def main(argv: list[str] | None = None) -> int:
     cleanup_steps.append(
         ("逐帧日志", lambda: frames_log.close() if frames_log is not None else None)
     )
+    if training is not None:
+        cleanup_steps.append(("训练数据", training.close))
     cleanup = make_cleanup(cleanup_steps)
 
     httpd = make_server(
@@ -612,9 +642,15 @@ def main(argv: list[str] | None = None) -> int:
             print("  环境声    只显示 S3 意图（--ambient-executor relay|airpods 才执行）")
         if assistant_configured:
             print(f"  对话判定  {assistant.model} · Qwen3-ASR 本地转写 · "
-                  f"环境声授权 TTL {assistant._DECISION_TTL_S:g}s")
+                  f"快路径端侧先开，LLM 迟到否决（D34）")
         else:
             print("  对话判定  未配置 LLM（ANTHROPIC_*）：环境声回退到设备意图/声纹门控")
+        if training is not None:
+            print(f"  训练数据  {training.session_dir}/"
+                  f"（{'含音频' if training.audio_enabled else '仅遥测'}；"
+                  f"上限 {training.max_bytes // (1024 * 1024)} MB）")
+        else:
+            print("  训练数据  未采集（--training-dir 指到目录才开）")
         if isinstance(source, ReplaySource):
             print("  注意      回放只是把历史日志搬到界面上，不代表设备现在的状态")
         if isinstance(source, MockSource):
@@ -702,6 +738,8 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     logged_sequence: int | None = None
     started_monotonic = time.monotonic()
+    last_ambient_open: bool | None = None
+    last_authorization_state: str | None = None
 
     # 主线程只做一件事：按节拍发布快照，并把最新一帧的决策下发给 Mac 执行端。
     # 没有新帧时也发快照，界面才能区分"设备停了"与"浏览器和主机之间的连接断了"——
@@ -757,9 +795,10 @@ def main(argv: list[str] | None = None) -> int:
             want_open = False
             if latest is not None and latest.ambient_open is not None:
                 want_open = bool(latest.ambient_open)
+            authorization: dict = {}
             if assistant_configured:
-                # D32：环境声的主授权是 ASR/LLM 的语义判定。设备意图只是"申请"，
-                # 没有新鲜的 dialogue=yes/open 判定就不执行（fail-closed）。
+                # D34：端侧快路径先开，LLM 只有迟到否决权。任何网络/ASR 延迟都不
+                # 能进入首次响应路径；LLM 判 no 时在这里把已开的环境声关掉。
                 authorization = llm_ambient_authorization(assistant)
                 want_open = want_open and bool(authorization.get("allow"))
                 if voiceprint is not None and fresh_self_veto(voiceprint.snapshot()):
@@ -771,6 +810,23 @@ def main(argv: list[str] | None = None) -> int:
             if state.is_stale() or state.is_silent() or not state.connected:
                 want_open = False
             ambient.set_open(want_open)
+            if training is not None and (
+                want_open != last_ambient_open
+                or str(authorization.get("state") or "") != (last_authorization_state or "")
+            ):
+                training.write_event("ambient", {
+                    "open": bool(want_open),
+                    "device_intent": None if latest is None else latest.ambient_open,
+                    "authorization_state": authorization.get("state"),
+                    "authorization_allow": authorization.get("allow"),
+                    "veto": authorization.get("veto"),
+                    "verdict": authorization.get("verdict_text"),
+                    "decision_age_s": authorization.get("age_s"),
+                    "decision_number": authorization.get("number"),
+                    "reason": authorization.get("reason"),
+                })
+                last_ambient_open = bool(want_open)
+                last_authorization_state = str(authorization.get("state") or "")
         # 50 ms 足够跟上 10 Hz 设备帧，又把"意图→执行"的额外延迟从 100 ms 压到 50 ms。
         time.sleep(0.05)
 
