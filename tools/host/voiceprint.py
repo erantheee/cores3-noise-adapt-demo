@@ -1,10 +1,12 @@
-"""Mac 侧 WavLM self/other 声纹门控。
+"""Mac 侧 WavLM self/other 声纹门控（实验性 self-veto）。
 
 WavLM-SV 模型约 360 MB，只能跑在 Mac/PC 上；上位机本身不依赖 torch/transformers，
 所以这里把重依赖放进子进程 `tools/voiceprint_worker.py`（用仓库 `.venv/bin/python`），
 上位机只负责把 S3 中继的 16 kHz PCM 喂过去、读回判定。
 
-判定会回传 S3；S3 只有观察到 self/other 双方轮次后才确认对话。
+语义（D28 self-veto）：`self` → 设备不压/不抬/不开环境声；`other` → 按 D16 预判逻辑。
+判定 3 秒没有新值由固件侧自动视为过期；串口关闭/进程退出时上位机发 `voiceprint off`。
+默认关闭，只有显式 `--voiceprint` 才启用。
 """
 
 from __future__ import annotations
@@ -66,6 +68,22 @@ class VoiceprintService:
 
     # ------------------------------------------------------------------ 生命周期
 
+    @property
+    def ready(self) -> bool:
+        """worker 是否已经报过 ready（模型 + 注册声纹都加载完）。
+
+        `on_open` 只有在 ready 时才发 `voiceprint pending`：worker 起不来时发出去，
+        设备会进入"等声纹判定"的状态而永远等不到后续判定。
+        """
+        with self._lock:
+            return self._ready
+
+    @property
+    def available(self) -> bool:
+        """解释器/worker 文件是否存在（静态条件，不表示模型已加载）。"""
+        with self._lock:
+            return self._available
+
     def start(self) -> None:
         if not self._available:
             return
@@ -80,10 +98,12 @@ class VoiceprintService:
                 text=True, bufsize=1,
             )
         except OSError as exc:
-            self._available = False
-            self._error = f"声纹 worker 启动失败：{exc}"
+            with self._lock:
+                self._available = False
+                self._error = f"声纹 worker 启动失败：{exc}"
             return
-        self._loading = True
+        with self._lock:
+            self._loading = True
         self._threads = [
             threading.Thread(target=self._read_stdout, name="voiceprint-out", daemon=True),
             threading.Thread(target=self._read_stderr, name="voiceprint-err", daemon=True),

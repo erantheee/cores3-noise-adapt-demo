@@ -195,6 +195,12 @@ class CommandFrame:
     #: 累计采样数。验证脚本用它算真机采样率（Δsamples/Δt 应为 100 Hz）——
     #: "IMU 跑在 100 Hz"这句话必须是量出来的，不能只在实验记录里写着。
     imu_samples: int | None = None
+    #: 设备侧声纹判定遥测（D28 self-veto）。None = 这一帧没报（旧固件）。
+    #: `voiceprint_self=True` = 设备认为刚说话的是佩戴者自己：此时设备不压/不抬/不开
+    #: 环境声。`voiceprint_age_ms=-1` 表示设备从未收到过判定。
+    voiceprint_valid: bool | None = None
+    voiceprint_self: bool | None = None
+    voiceprint_age_ms: int | None = None
     schema_version: int = SCHEMA_VERSION
     #: 越界或无法解释的字段说明。空表示这一帧通过了全部校验。
     problems: tuple[str, ...] = ()
@@ -376,6 +382,13 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
     imu_motion = raw_imu_motion if isinstance(raw_imu_motion, bool) else None
     imu_drops = _as_int(payload, "imu_drops")
     imu_samples = _as_int(payload, "imu_samples")
+    # D28：设备侧 self-veto 判定遥测。三个键一组，缺字段一律 None（旧固件不发），
+    # 不能默认成 False/0——"没报"与"报了 other / age=-1"必须分得开。
+    raw_voiceprint_valid = payload.get("voiceprint_valid")
+    voiceprint_valid = raw_voiceprint_valid if isinstance(raw_voiceprint_valid, bool) else None
+    raw_voiceprint_self = payload.get("voiceprint_self")
+    voiceprint_self = raw_voiceprint_self if isinstance(raw_voiceprint_self, bool) else None
+    voiceprint_age_ms = _as_int(payload, "voiceprint_age_ms")
 
     missing = [
         name
@@ -490,6 +503,18 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
     if speech_gate_us is not None and speech_gate_us < 0:
         problems.append(f"说话 gate 推理耗时 {speech_gate_us} µs 为负数")
 
+    # 声纹判定三键只报一部分时，说不清这一帧到底有没有判定；-1 是"从未收到判定"的合法值。
+    voiceprint_reported = [
+        value is not None for value in (voiceprint_valid, voiceprint_self, voiceprint_age_ms)
+    ]
+    if any(voiceprint_reported) and not all(voiceprint_reported):
+        problems.append(
+            "声纹判定字段只报了一部分"
+            "（voiceprint_valid/voiceprint_self/voiceprint_age_ms 是一组）"
+        )
+    if voiceprint_age_ms is not None and voiceprint_age_ms < -1:
+        problems.append(f"声纹判定年龄 {voiceprint_age_ms} ms 非法（-1 表示从未判定）")
+
     return ParsedLine(
         value=CommandFrame(
             sequence=sequence,
@@ -535,6 +560,9 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
             imu_motion=imu_motion,
             imu_drops=imu_drops,
             imu_samples=imu_samples,
+            voiceprint_valid=voiceprint_valid,
+            voiceprint_self=voiceprint_self,
+            voiceprint_age_ms=voiceprint_age_ms,
             schema_version=schema,
         ),
         json_line=True,

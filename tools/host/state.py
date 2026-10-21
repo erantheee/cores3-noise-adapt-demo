@@ -265,7 +265,7 @@ class HostState:
 
         self.latest: CommandFrame | None = None
         self.latency: LatencyReport | None = None
-        #: WavLM 声纹影子门控（tools/host/voiceprint.py）。None = 本次没启用。
+        #: WavLM 声纹 self-veto 门控（tools/host/voiceprint.py）。None = 本次没启用。
         self.voiceprint: object | None = None
         self.latency_at: float | None = None
 
@@ -276,6 +276,10 @@ class HostState:
         #: 设备在录音期间每 5 秒报一次的内诊断（原样保留，界面负责翻译显示）。
         self.capture_progress: dict[str, int] | None = None
         self.capture_progress_at: float | None = None
+        #: 处理过多少个 capture 事件（started/stopped/finished/encode_failed/progress 都算）。
+        #: 回控回执用它判断"命令发出之后设备有没有产生**新**事件"——只看 capture_state
+        #: 会命中上一段录音留下的粘性值（finished/stopped），把没回应误报成已回应。
+        self.capture_event_seq: int = 0
         self.audio_samples: int = 0
         self.recording = False
 
@@ -351,7 +355,7 @@ class HostState:
             self.player = player
 
     def attach_voiceprint(self, voiceprint: object | None) -> None:
-        """挂上声纹影子门控。只进快照，不参与任何决策。"""
+        """挂上声纹 self-veto 门控。判定只进快照，是否影响执行由 __main__ 决定。"""
         with self.lock:
             self.voiceprint = voiceprint
 
@@ -527,6 +531,9 @@ class HostState:
 
     def feed_capture(self, event: CaptureEvent) -> None:
         self.last_capture_at = time.monotonic()
+        # 任何 capture 事件都算"设备产生了新事件"（含 progress/encode_failed）：
+        # 回执判据只关心"发送之后有没有新事件"，不关心是哪一种。
+        self.capture_event_seq += 1
         if event.state == "started":
             self.recording = True
             self.capture_state = "started"
@@ -691,6 +698,9 @@ class HostState:
             "capture": {
                 "state": self.capture_state,
                 "text": capture_text(self.capture_state),
+                #: 已处理的 capture 事件计数（只增不减）。回控回执的判据是
+                #: "命令发出后这个数变大"，而不是 "state 是 started/stopped/finished"。
+                "event_seq": self.capture_event_seq,
                 "seconds": self.capture_seconds,
                 "rate": self.capture_rate,
                 "chunks": self.stats.chunks,
@@ -738,6 +748,13 @@ class HostState:
                 "imu_motion": frame.imu_motion,
                 "imu_drops": frame.imu_drops,
                 "imu_samples": frame.imu_samples,
+                # 设备侧声纹判定（D28 self-veto）。三个字段都是 None 表示这一帧没报
+                #（旧固件）；`age_ms=-1` 表示设备从未收到过判定。
+                "voiceprint_decision": {
+                    "valid": frame.voiceprint_valid,
+                    "self": frame.voiceprint_self,
+                    "age_ms": frame.voiceprint_age_ms,
+                },
                 "context": frame.context,
                 "context_text": context_text(frame.context),
                 "context_score": frame.context_score,

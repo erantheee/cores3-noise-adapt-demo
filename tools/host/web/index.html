@@ -155,7 +155,7 @@
       <h2>事件（端侧规则）</h2>
       <div class="value small" id="evt">—</div>
       <div class="sub" id="evt-raw">—</div>
-      <div class="sub" id="evt-note">键盘 / 风 / 撞击 · 只显示，不参与决策</div>
+      <div class="sub" id="evt-note">键盘 / 风 / 撞击 · 作为对话/环境声的否决条件</div>
     </div>
     <!--
       自身语音证据 = 这一拍"谁在说话"的依据。source 必须显示出来：
@@ -513,7 +513,7 @@ function renderVoiceprint(s) {
   const score = vp.smoothed !== null && vp.smoothed !== undefined ? vp.smoothed : vp.score;
   const scoreText = typeof score === "number" ? fmt(score, 2) : "—";
   const latency = typeof vp.latency_ms === "number" ? ` · ${fmt(vp.latency_ms, 0)} ms` : "";
-  el.textContent = `声纹 · ${vp.verdict || "—"} ${scoreText}${latency} · 影子遥测`;
+  el.textContent = `声纹 · ${vp.verdict || "—"} ${scoreText}${latency} · self veto（实验）`;
 }
 
 function renderEvent(f) {
@@ -533,13 +533,13 @@ function renderEvent(f) {
     } else {
       $("evt").textContent = "攒窗中…";
       $("evt-raw").textContent = "窗口未满 1 秒";
-      $("evt-note").textContent = "键盘 / 风 / 撞击 · 只显示，不参与决策";
+      $("evt-note").textContent = "键盘 / 风 / 撞击 · 作为对话/环境声的否决条件";
     }
     return;
   }
   $("evt").textContent = f.event_text;
   $("evt-raw").textContent = f.event;
-  $("evt-note").textContent = "1 s 窗规则 · 只显示，不参与决策";
+  $("evt-note").textContent = "1 s 窗规则 · 作为对话/环境声的否决条件";
 }
 
 function render(s) {
@@ -565,7 +565,7 @@ function render(s) {
     $("vp").textContent = "声纹 · 还没有设备帧";
     $("evt").textContent = "—";
     $("evt-raw").textContent = "还没有设备帧";
-    $("evt-note").textContent = "键盘 / 风 / 撞击 · 只显示，不参与决策";
+    $("evt-note").textContent = "键盘 / 风 / 撞击 · 作为对话/环境声的否决条件";
   } else {
     $("env").textContent = f.environment_text;
     $("env").className = "value env-" + f.environment;

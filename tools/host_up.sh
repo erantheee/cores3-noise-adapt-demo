@@ -6,7 +6,7 @@
 #   sh tools/host_up.sh --status        # 只看它是否在运行
 #   sh tools/host_up.sh --mock          # 没有设备时先把界面跑起来
 #   sh tools/host_up.sh --relay-audio   # S3 麦克风实时送到 Mac 默认输出/AirPods
-#   sh tools/host_up.sh --voiceprint    # WavLM 声纹影子遥测（只显示，不参与决策）
+#   sh tools/host_up.sh --voiceprint    # 实验性 self-veto 声纹门控（self 不压/不抬/不开环境声）
 #   sh tools/host_up.sh --replay 记录/x.log --speed 4
 #
 # 覆盖项：

@@ -758,7 +758,7 @@ def test_snapshot_sections_are_stable() -> None:
         check(key in snapshot, f"快照必须含 {key} 段")
     for key in ("commands", "gaps", "frames_lost", "bad_lines", "interval"):
         check(key in snapshot["stats"], f"statistics 段必须含 {key}")
-    for key in ("state", "text", "chunks", "chunks_lost", "audio_seconds"):
+    for key in ("state", "text", "event_seq", "chunks", "chunks_lost", "audio_seconds"):
         check(key in snapshot["capture"], f"capture 段必须含 {key}")
 
 
@@ -1902,6 +1902,196 @@ def test_relay_ambient_gate() -> None:
           "面板快照里要能看到中继执行端")
 
 
+# --------------------------------------------------------------------------- 收尾修复
+
+
+def test_capture_event_seq_is_in_snapshot() -> None:
+    """capture 事件计数必须进快照：回控回执的判据就靠它。"""
+    state = HostState(source="serial")
+    eq(state.snapshot()["capture"]["event_seq"], 0, "还没事件时计数为 0")
+    state.feed_capture(CaptureEvent(state="started", seconds=5, rate=16000))
+    eq(state.snapshot()["capture"]["event_seq"], 1, "started 事件计数 +1")
+    state.feed_capture(CaptureEvent(state="progress", progress={"chunks": 3}))
+    state.feed_capture(CaptureEvent(state="finished", chunks=157))
+    eq(state.snapshot()["capture"]["event_seq"], 3, "progress/finished 也都算新事件")
+
+
+def test_control_ack_requires_a_new_capture_event() -> None:
+    """回执必须有"发送之后的新事件"：粘性的 finished/stopped 不算。
+
+    旧实现只看 capture_state in (started/stopped/finished)，于是第一次录音结束后，
+    之后每条命令都会被立即回 ok:true——无论设备有没有收到。这里既测 ①（无新事件 →
+    502/ack=false），也测 ②（发送后真来了新事件 → ack=true）。
+    """
+    import json as _json
+    import threading
+    import urllib.error
+    import urllib.request
+
+    from host.server import make_server
+
+    state = HostState(source="serial")
+    broadcaster = Broadcaster(state, min_interval=0.0)
+
+    # 前置：已经有一段录音结束，粘性状态停在 finished（旧判据会把它当成已回应）。
+    state.feed_capture(CaptureEvent(state="started", seconds=5, rate=16000))
+    state.feed_capture(CaptureEvent(state="finished", chunks=157))
+    eq(state.snapshot()["capture"]["state"], "finished", "前置：capture_state 停在 finished")
+
+    writes: list[bytes] = []
+    port = pick_port(18960)
+    httpd = make_server(state, broadcaster, port, writer=lambda data: writes.append(data))
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{port}"
+    result: dict = {}
+    try:
+        # ① 写成功，但没有任何新 capture 事件 → 必须如实报未获应答。
+        request = urllib.request.Request(
+            f"{base}/api/command",
+            data=_json.dumps({"command": "rec stop"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(request, timeout=10)
+        except urllib.error.HTTPError as exc:
+            eq(exc.code, 502, "粘性 capture_state 不得被当成设备回应")
+            result = _json.loads(exc.read())
+        else:
+            check(False, "粘性 capture_state 不得被当成设备回应")
+        check(not result.get("ok") and result.get("acknowledged") is False,
+              "没有新事件时必须明说未获应答")
+        eq(writes, [b"rec stop\r\n"], "命令仍然要真的写进串口")
+
+        # ② 设备在命令发出后真的产生了新事件 → acknowledged=true。
+        def event_writer(data: bytes) -> None:
+            writes.append(data)
+            state.feed_capture(CaptureEvent(state="started", seconds=5, rate=16000))
+
+        httpd.writer = event_writer
+        request2 = urllib.request.Request(
+            f"{base}/api/command",
+            data=_json.dumps({"command": "rec start 5"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request2, timeout=10) as response:
+            result2 = _json.loads(response.read())
+        check(result2.get("ok") is True and result2.get("acknowledged") is True,
+              "发送之后出现的新 capture 事件必须让回执成立")
+        eq(state.snapshot()["capture"]["event_seq"], 3, "新事件继续累加")
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=3)
+
+
+def test_stop_cleanup_is_idempotent_and_runs_before_exit() -> None:
+    """/api/stop 的退出路径必须先跑收尾，收尾本身幂等且动作互相隔离。"""
+    import contextlib
+    import io as _io
+
+    from host.__main__ import make_cleanup
+    from host.server import Handler
+
+    calls: list[str] = []
+
+    def step_a() -> None:
+        calls.append("a")
+
+    def step_b() -> None:
+        calls.append("b")
+        raise RuntimeError("模拟停止失败")
+
+    def step_c() -> None:
+        calls.append("c")
+
+    cleanup = make_cleanup([("a", step_a), ("b", step_b), ("c", step_c)])
+    cleanup()
+    cleanup()  # 第二次必须是 no-op（两条退出路径可能各调一次）
+    eq(calls, ["a", "b", "c"], "每个收尾动作只执行一次，一次失败不影响后面的动作")
+    check(len(cleanup.errors) == 1 and "模拟停止失败" in cleanup.errors[0],
+          "收尾失败必须被记录而不是抛出去")
+    check(cleanup.done(), "cleanup 完成后要标记为已执行")
+
+    # /api/stop 的退出体：先 on_stop()，再 exit_fn(0)；on_stop 抛异常也照样退出。
+    exits: list[int] = []
+    Handler._delayed_exit(delay=0, on_stop=cleanup, exit_fn=exits.append)
+    eq(exits, [0], "on_stop 之后必须调用 exit_fn")
+
+    calls.clear()
+    with contextlib.redirect_stderr(_io.StringIO()):
+        Handler._delayed_exit(
+            delay=0,
+            on_stop=lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+            exit_fn=exits.append,
+        )
+    eq(exits, [0, 0], "on_stop 抛异常也必须退出（异常被吞掉并记录）")
+    check(calls == [], "第二次 cleanup 不得重复执行动作")
+
+
+# --------------------------------------------------------------------------- 声纹判定
+
+
+def test_voiceprint_decision_telemetry() -> None:
+    """D28：设备侧 self-veto 判定的三个可选键要能解析、缺字段不猜默认值、快照带出来。"""
+    base = {
+        "type": "earbud_command",
+        "schema": 4,
+        "sequence": 1,
+        "timestamp_ms": 100,
+        "speech_gain_db": 0.0,
+        "external_voice_gain_db": 0.0,
+        "media_percent": 60,
+        "state": "ADJUSTING",
+        "environment": "VOICE",
+        "mode": "FLAT",
+        "conversation": "LIKELY",
+        "confidence": 0.9,
+        "execution": "decision_only",
+        "link": "simulated",
+    }
+    with_decision = dict(
+        base, voiceprint_valid=True, voiceprint_self=True, voiceprint_age_ms=42
+    )
+    frame = parse_line(json.dumps(with_decision)).value
+    check(frame is not None and frame.voiceprint_valid is True, "voiceprint_valid 要解析进帧")
+    check(frame is not None and frame.voiceprint_self is True, "voiceprint_self 要解析进帧")
+    eq(frame.voiceprint_age_ms, 42, "voiceprint_age_ms 要解析进帧")
+
+    old = parse_line(json.dumps(base)).value
+    check(old is not None and old.voiceprint_valid is None,
+          "旧固件不发三个键：必须是 None，不能猜成 False")
+    check(old is not None and old.voiceprint_self is None and old.voiceprint_age_ms is None,
+          "旧固件缺字段必须留空")
+
+    partial = parse_line(json.dumps(dict(base, voiceprint_valid=True)))
+    check(any("声纹判定字段只报了一部分" in p for p in partial.problems),
+          "只报一部分必须记异常")
+    negative_age = parse_line(
+        json.dumps(dict(base, voiceprint_valid=False, voiceprint_self=False,
+                        voiceprint_age_ms=-2))
+    )
+    check(any("声纹判定年龄" in p for p in negative_age.problems),
+          "age_ms < -1 非法必须记异常")
+
+    state = HostState(source="mock")
+    state.feed_line(json.dumps(with_decision))
+    decision = state.snapshot()["frame"]["voiceprint_decision"]
+    eq(decision["valid"], True, "快照要带 voiceprint_decision.valid")
+    eq(decision["self"], True, "快照要带 voiceprint_decision.self")
+    eq(decision["age_ms"], 42, "快照要带 voiceprint_decision.age_ms")
+
+    state2 = HostState(source="mock")
+    state2.feed_line(json.dumps(base))
+    decision2 = state2.snapshot()["frame"]["voiceprint_decision"]
+    check(
+        decision2["valid"] is None and decision2["self"] is None and decision2["age_ms"] is None,
+        "没报时 voiceprint_decision 必须是三个 None，不能猜默认值",
+    )
+
+
 def main() -> int:
     tests = [
         test_d2_matches_c_printf,
@@ -1957,6 +2147,10 @@ def main() -> int:
         test_serial_source_survives_transient_read_errors,
         test_sse_endpoint_streams,
         test_server_refuses_control_without_device,
+        test_capture_event_seq_is_in_snapshot,
+        test_control_ack_requires_a_new_capture_event,
+        test_stop_cleanup_is_idempotent_and_runs_before_exit,
+        test_voiceprint_decision_telemetry,
     ]
     for test in tests:
         try:

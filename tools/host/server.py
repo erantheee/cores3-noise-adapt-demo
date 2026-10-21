@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import sys
 import threading
 import time
 from http import HTTPStatus
@@ -134,7 +135,7 @@ class HostHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
     def __init__(self, address, handler, state: HostState, broadcaster: Broadcaster, writer=None,
-                 releaser=None, player=None):
+                 releaser=None, player=None, on_stop=None, exit_fn=None):
         super().__init__(address, handler)
         self.state = state
         self.broadcaster = broadcaster
@@ -144,6 +145,11 @@ class HostHTTPServer(ThreadingHTTPServer):
         #: Mac 播放与执行端（tools/host/player.py）。为 None 表示本次没启用播放器，
         #: 面板上的播放控件要明确禁用而不是假装点过了。
         self.player = player
+        #: /api/stop 的收尾回调（正常退出路径也复用同一个幂等 cleanup）。None = 没有。
+        #: 必须在 os._exit 之前跑，否则 AirPods 聆听模式、子进程、日志都不会被收掉。
+        self.on_stop = on_stop
+        #: 真正结束进程的函数。注入点只给测试用，生产走 os._exit(0)。
+        self.exit_fn = exit_fn or os._exit
         self.started_at = time.monotonic()
 
 
@@ -211,17 +217,28 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
                     return
             self._send_json({"ok": True, "released_port": released, "note": "进程即将退出"})
-            threading.Thread(target=self._delayed_exit, daemon=True).start()
+            # on_stop/exit_fn 由 server 持有：生产是幂等 cleanup + os._exit，
+            # 测试注入假实现，不需要真的结束进程。
+            on_stop = getattr(self.server, "on_stop", None)
+            exit_fn = getattr(self.server, "exit_fn", os._exit)
+            threading.Thread(target=self._delayed_exit, args=(on_stop, exit_fn), daemon=True).start()
         elif path == "/events":
             self._serve_events()
         else:
             self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain; charset=utf-8")
 
     @staticmethod
-    def _delayed_exit() -> None:
+    def _delayed_exit(on_stop=None, exit_fn=None, delay: float = 0.3) -> None:
         # 先让响应发出去，再退出——否则浏览器只会看到连接被重置。
-        time.sleep(0.3)
-        os._exit(0)
+        time.sleep(delay)
+        # 收尾（切回 AirPods 聆听模式 / 停子进程 / 关日志）必须在 os._exit 之前跑：
+        # os._exit 不执行 finally/atexit，跳过它就会把用户留在通透模式里。
+        if on_stop is not None:
+            try:
+                on_stop()
+            except Exception as exc:  # noqa: BLE001 - 收尾失败不能阻止进程退出
+                print(f"/api/stop 收尾失败：{exc}", file=sys.stderr)
+        (exit_fn or os._exit)(0)
 
     def _serve_index(self) -> None:
         if not INDEX_FILE.exists():
@@ -346,6 +363,10 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        # 回执判据：只认**发送之后新产生的 capture 事件**。capture_state 是粘性的
+        # （一次录音结束后会一直停在 stopped/finished），拿它比对会把"设备没有回应"
+        # 误报成"设备已回应"——那正是这里最不该撒的谎。
+        before_seq = self.state.snapshot()["capture"]["event_seq"]
         self.state.note_control_sent(command)
         try:
             writer(command.encode("ascii") + b"\r\n")
@@ -353,18 +374,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": f"写入设备失败：{exc}"}, HTTPStatus.BAD_GATEWAY)
             return
 
-        # 写成功 != 设备照做。这里等一下设备进录音态的**可观测证据**（capture 事件），
+        # 写成功 != 设备照做。这里等一个**发送之后**才出现的 capture 事件，
         # 拿不到就如实报降级，而不是回一个 ok:true 让按钮看起来点过了。
         acknowledged = False
         deadline = time.monotonic() + CONTROL_ACK_TIMEOUT_S
         while time.monotonic() < deadline:
-            snapshot_capture = self.state.snapshot()["capture"]
-            if snapshot_capture["state"] in ("started", "stopped", "finished"):
+            current_seq = self.state.snapshot()["capture"]["event_seq"]
+            if current_seq > before_seq:
                 acknowledged = True
-                break
-            if command == "rec stop" and not self.state.recording:
-                # rec stop 之后设备不再录音（或从未录过）也算设备侧状态一致。
-                acknowledged = self.state.capture_state in ("stopped", "finished")
                 break
             time.sleep(0.1)
 
@@ -401,8 +418,12 @@ def make_server(
     writer=None,
     releaser=None,
     player=None,
+    on_stop=None,
+    exit_fn=None,
 ) -> HostHTTPServer:
-    return HostHTTPServer((host, port), Handler, state, broadcaster, writer, releaser, player)
+    return HostHTTPServer(
+        (host, port), Handler, state, broadcaster, writer, releaser, player, on_stop, exit_fn
+    )
 
 
 def pick_port(preferred: int, host: str = "127.0.0.1") -> int:

@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import webbrowser
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from .ambient import AmbientService, RelayAmbient
@@ -54,6 +55,36 @@ def default_airpods_cli() -> str:
     """
     repo_root = Path(__file__).resolve().parents[2]
     return str(repo_root.parent / "airpods-control" / "bin" / "airpods")
+
+
+def make_cleanup(steps: Sequence[tuple[str, Callable[[], None]]]) -> Callable[[], None]:
+    """把多个收尾动作包装成**幂等、异常隔离**的一次性清理函数。
+
+    两条退出路径共用它：/api/stop（HTTP 线程的 on_stop）与正常退出（主线程）。
+    两个约束都不是洁癖：
+      * 幂等：/api/stop 之后进程还会被 os._exit 结束，cleanup 可能被两条路径各调一次；
+      * 异常隔离：单个服务停不下来不能阻止"把 AirPods 切回原聆听模式"这类更要紧的动作。
+
+    返回的函数带 `.errors`（字符串列表，供退出报告）与 `.done()`（是否已经执行过）。
+    """
+    lock = threading.Lock()
+    state = {"done": False}
+    errors: list[str] = []
+
+    def cleanup() -> None:
+        with lock:
+            if state["done"]:
+                return
+            state["done"] = True
+        for label, step in steps:
+            try:
+                step()
+            except Exception as exc:  # noqa: BLE001 - 收尾动作之间必须互相隔离
+                errors.append(f"{label}: {exc}")
+
+    cleanup.errors = errors  # type: ignore[attr-defined]
+    cleanup.done = lambda: state["done"]  # type: ignore[attr-defined]
+    return cleanup
 
 
 class DeviceWriter:
@@ -187,8 +218,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--voiceprint",
         action="store_true",
         help=(
-            "启用 WavLM self/other 声纹门控：用双方轮次区分对话与自己哼唱。"
-            "判定回传 S3 参与对话决策；需要仓库 .venv 里的 torch/transformers。"
+            "实验性 self-veto 声纹门控：self → 设备不压/不抬/不开环境声；"
+            "other → 按 D16 预判逻辑。判定回传 S3，默认关闭；"
+            "需要仓库 .venv 里的 torch/transformers。"
         ),
     )
     parser.add_argument(
@@ -300,13 +332,26 @@ def main(argv: list[str] | None = None) -> int:
         state.attach_voiceprint(voiceprint)
     broadcaster = Broadcaster(state)
     writer = DeviceWriter()
+
+    def send_voiceprint_off() -> None:
+        """尽力告诉设备「声纹判定已失效」，避免它沿用上一轮判定。
+
+        串口没打开/已断开就算了：这只是清理动作，不能反过来阻断退出。
+        """
+        if voiceprint is None:
+            return
+        try:
+            writer.send_voiceprint("off", 0.0)
+        except (RuntimeError, OSError):
+            pass
+
     if voiceprint is not None:
         def _send_voiceprint(verdict: str, score: float) -> None:
             try:
                 writer.send_voiceprint(verdict, score)
                 voiceprint.note_sent()
-            except RuntimeError:
-                # 串口没打开/刚断开：影子遥测继续，判定不硬塞。
+            except (RuntimeError, OSError):
+                # 串口没打开/刚断开：声纹遥测继续，判定不硬塞。
                 pass
 
         voiceprint.on_verdict = _send_voiceprint
@@ -324,12 +369,19 @@ def main(argv: list[str] | None = None) -> int:
     if can_control:
         def _attach_writer(connection) -> None:
             writer.attach(connection)
-            if voiceprint is not None:
-                # 首个 1.5 s embedding 产生前先让 S3 锁住对话动作，避免启动即误开环境声。
+            # 只有 worker 真的 ready 才发 pending：worker 不可用时发出去，设备会进入
+            # "等声纹判定"的状态而永远等不到后续判定（旧实现就是这么把对话门控锁死的）。
+            # 现在的固件对 pending 只做重置、判定 3 秒过期，但不在源头发无意义的 pending 更干净。
+            if voiceprint is not None and voiceprint.ready:
                 writer.send_voiceprint("pending", 0.0)
 
+        def _detach_writer() -> None:
+            # 串口断开/退出前尽力告诉设备判定已失效，再把回控句柄摘掉（顺序不能反）。
+            send_voiceprint_off()
+            writer.detach()
+
         source.on_open = _attach_writer
-        source.on_close = writer.detach
+        source.on_close = _detach_writer
 
     def release_port() -> bool:
         """释放串口：把录音工具或刷机需要的独占权让出去。
@@ -357,6 +409,27 @@ def main(argv: list[str] | None = None) -> int:
         player_service = PlayerService(volume_percent=args.player_volume)
         state.attach_player(player_service)
 
+    # 逐帧日志（--frames-jsonl）稍后才打开，但要把变量先定下来：收尾 cleanup 会引用它。
+    frames_log = None
+
+    # 收尾只有一份：/api/stop（on_stop）与正常退出（主线程）共用。
+    # 顺序有讲究：**先**把 AirPods 从通透模式切回去（ambient.stop 的唯一入口），
+    # 再停播放/声纹/中继，最后关日志；单个服务失败不影响其余动作（make_cleanup 隔离异常）。
+    cleanup_steps: list[tuple[str, Callable[[], None]]] = []
+    if ambient is not None:
+        cleanup_steps.append(("环境声执行端", ambient.stop))
+    if player_service is not None:
+        cleanup_steps.append(("Mac 播放器", player_service.stop))
+    if voiceprint is not None:
+        cleanup_steps.append(("声纹 off 回执", send_voiceprint_off))
+        cleanup_steps.append(("声纹 worker", voiceprint.stop))
+    if relay is not None:
+        cleanup_steps.append(("音频中继", relay.stop))
+    cleanup_steps.append(
+        ("逐帧日志", lambda: frames_log.close() if frames_log is not None else None)
+    )
+    cleanup = make_cleanup(cleanup_steps)
+
     httpd = make_server(
         state,
         broadcaster,
@@ -364,6 +437,7 @@ def main(argv: list[str] | None = None) -> int:
         writer=writer if can_control else None,
         releaser=release_port,
         player=player_service,
+        on_stop=cleanup,
     )
     url = f"http://127.0.0.1:{web_port}/"
 
@@ -478,7 +552,6 @@ def main(argv: list[str] | None = None) -> int:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
 
     # 可选：逐帧落盘，作为对话预判的训练/复盘数据（对齐主机单调时钟，便于和录音对齐）。
-    frames_log = None
     if args.frames_jsonl:
         try:
             frames_log = open(args.frames_jsonl, "a", encoding="utf-8", buffering=1)
@@ -542,15 +615,16 @@ def main(argv: list[str] | None = None) -> int:
             want_open = False
             if latest is not None and latest.ambient_open is not None:
                 want_open = bool(latest.ambient_open)
-            # 串口刚打开可能还残留刷机前的旧命令帧。首个 embedding 判定出来前，
-            # 不执行任何开放意图；否则 pending 已锁住 S3，新上位机却会执行旧帧。
+            # 首个 self/other 判定出来前，不执行任何开放意图：串口刚打开可能还残留
+            # 刷机前的旧命令帧，拿旧帧开麦比不开放更糟。
+            # self：佩戴者这一轮不送进耳机（D28 self-veto；设备侧也会按同一判定不压/
+            # 不抬），等 other 再开，形成按说话人轮流开放的中继；verdict 过期后
+            # worker 不再给新判定，这里按"未就绪"处理（与固件 3 秒过期一致）。
             if voiceprint is not None:
                 voiceprint_state = voiceprint.snapshot()
                 if voiceprint_state.get("verdict") is None:
                     want_open = False
                 elif voiceprint_state.get("verdict") == "self":
-                    # 对话可以继续保持，但佩戴者这一轮不能送进耳机。等 other 再开，
-                    # 形成按说话人轮流开放的中继，而不是整段对话一直开麦。
                     want_open = False
             if state.is_stale() or state.is_silent() or not state.connected:
                 want_open = False
@@ -558,20 +632,17 @@ def main(argv: list[str] | None = None) -> int:
         # 50 ms 足够跟上 10 Hz 设备帧，又把"意图→执行"的额外延迟从 100 ms 压到 50 ms。
         time.sleep(0.05)
 
-    if frames_log is not None:
-        frames_log.close()
+    # 收尾只有一份：与 /api/stop 的 on_stop 是同一个幂等 cleanup。
+    # 先停 HTTP 线程不再接新请求，再跑收尾；收尾必须在 source_thread 退出前跑——
+    # 串口还连着，才能把 `voiceprint off` 发给设备。
+    # （cleanup 内部按 ambient → player → voiceprint off → worker → relay → 日志 的顺序。）
     httpd.shutdown()
+    cleanup()
+    for error in cleanup.errors:  # type: ignore[attr-defined]
+        print(f"退出收尾失败：{error}", file=sys.stderr)
     source_thread.join(timeout=3.0)
-    if player_service is not None:
-        player_service.stop()
-    if voiceprint is not None:
-        voiceprint.stop()
-    if ambient is not None:
-        # 退出时必须把人从通透模式切回去；stop() 内部会先做这一步再停线程。
-        ambient.stop()
     if relay is not None:
         live = relay.live() or {}
-        relay.stop()
         stats = relay.stats()
         if relay.failure:
             thread_error.append(RelayError(relay.failure))
