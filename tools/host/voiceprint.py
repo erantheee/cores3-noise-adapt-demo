@@ -242,5 +242,5 @@ class VoiceprintService:
                 "last_sent_verdict": self._last_sent_verdict,
                 "age_s": age,
                 "stderr_tail": list(self._stderr_tail),
-                "mode": "conversation-gate",
+                "mode": "self-veto",
             }

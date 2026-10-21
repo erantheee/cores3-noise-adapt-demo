@@ -1709,7 +1709,7 @@ def test_voiceprint_shadow_snapshot_is_harmless() -> None:
     """self/other 对话门控：未启用/缺依赖时必须安全，不得影响主链路。"""
     disabled = VoiceprintService(enabled=False)
     snap = disabled.snapshot()
-    check(snap["mode"] == "conversation-gate", "声纹应是对话门控模式")
+    check(snap["mode"] == "self-veto", "声纹应是 self-veto 模式")
     check(snap["enabled"] is False and snap["ready"] is False, "未启用时不得 ready")
     check(snap["verdict"] is None and snap["windows"] == 0, "没有结果时不能编造判定")
     check(snap["threshold"] == 0.80, "默认阈值")
@@ -1719,12 +1719,12 @@ def test_voiceprint_shadow_snapshot_is_harmless() -> None:
 
     class Fake:
         def snapshot(self):
-            return {"ready": True, "verdict": "self", "score": 0.93, "mode": "conversation-gate"}
+            return {"ready": True, "verdict": "self", "score": 0.93, "mode": "self-veto"}
 
     state = HostState(source="test", detail={}, on_mic_chunk=None)
     state.attach_voiceprint(Fake())
     section = state.snapshot()["voiceprint"]
-    check(section["verdict"] == "self" and section["mode"] == "conversation-gate", "声纹进快照")
+    check(section["verdict"] == "self" and section["mode"] == "self-veto", "声纹进快照")
 
 
 def test_ambient_executor_and_intent_parsing() -> None:

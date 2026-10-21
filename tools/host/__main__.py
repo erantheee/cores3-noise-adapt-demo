@@ -391,6 +391,9 @@ def main(argv: list[str] | None = None) -> int:
         """
         if not isinstance(source, SerialSource):
             return False
+        # /api/stop 会先走到这里再跑 cleanup；串口马上要关，先尽力把 off 发出去。
+        # 正常退出走 cleanup 时也发一次，重复发送是幂等的（设备侧清空判定）。
+        send_voiceprint_off()
         source.requested_stop.set()
         # 等它真的关掉，最多 3 秒，然后把结果如实回报给调用者。
         for _ in range(30):
