@@ -3,9 +3,9 @@
 本文件是**计划本身在仓库里的落点**。它记录每一项的状态、卡在哪里、以及下一步由谁做。
 改计划时同步改这里，不要只留在对话里。
 
-最后更新：2026-10-21（快路径 + 训练数据）。当前代码基线为 2026-10-21 收尾 HEAD 叠加
-ASR/LLM 闭环与 D34 快路径修复（最终 HEAD 见 `git log -1`），协议 **schema 4**；
-本轮收尾项见第 72 项，现场反馈修复见第 74/75/76 项。
+最后更新：2026-10-21（快路径 + 训练数据；当晚耳机 TWS/OWS 双设备兼容，D35/D36）。当前代码基线为
+2026-10-21 收尾 HEAD 叠加 ASR/LLM 闭环与 D34 快路径修复（最终 HEAD 见 `git log -1`），
+协议 **schema 4**；本轮收尾项见第 72 项，现场反馈修复见第 74/75/76 项，耳机见第 77 项，播放器设备切换见第 78 项，用户记忆见第 79 项。
 
 ---
 
@@ -13,12 +13,28 @@ ASR/LLM 闭环与 D34 快路径修复（最终 HEAD 见 `git log -1`），协议
 
 把 CoreS3 做成 **AI OWS 耳机仓原型**：S3 感知和决策，Mac 播放并处理两首本地歌曲
 （`tools/player/tracks.json`，按需再加），
-AirPods Pro 播放最终输出；分别验证歌曲 EQ、现实人声增益意图、安全不动作与端到端延迟。
+耳机（自动识别 OWS 耳夹 Xiaomi 耳夹式耳机 / TWS 对照 AirPods Pro，D35/D36）
+播放最终输出；分别验证歌曲 EQ、现实人声增益意图、安全不动作与端到端延迟。
 
 给决策者的表述：**同一套补偿逻辑，两个执行者。** 音频链路由播放端负责（这是真实产品的
 分工），端侧负责常开感知、判断与决策。唯一变量是"谁在做决策"。
 
 完整论证见 [`edge-feasibility.md`](edge-feasibility.md)，决策理由见 [`decisions.md`](decisions.md)。
+
+---
+
+## 2026-10-21 晚：耳机 TWS/OWS 双设备兼容（D35/D36）
+
+- **设备**：同一版本同时支持 OWS 耳夹（Xiaomi 耳夹式耳机：开放、无 ANC、无聆听模式）与
+  TWS 对照（AirPods Pro）；按 macOS 默认输出自动识别。感知与决策链路不变（S3 仍是"耳机仓"）。
+- **代码**：`EXPECTED_TARGET` 硬编码已去掉。`--earphone MATCH=LABEL`（可重复，默认
+  `Xiaomi=Xiaomi OWS`、`AirPods=AirPods Pro`，大小写不敏感子串匹配）决定识别与 S3 显示名
+  （必须 ASCII）；中继 `--relay-device` 默认空 = 跟随系统默认输出，戴哪副送哪副。
+- **环境声**：`--ambient-executor airpods` 仅 TWS 可用；OWS 物理开放，`ambient_open` 退为
+  意图/遥测 + 中继门控，默认仍 `off`（D30 不变）。
+- **已实测**：Xiaomi 耳夹驱动侧 **324.8 ms**（44.1 kHz，2026-10-21），中继总时延约
+  **385–405 ms**；AirPods Pro 仍为 170.7 / 211–231 ms。两副都 ≥150 ms，A2 判据不变。
+  歌曲 EQ 低频段收益需分 TWS/OWS 记。
 
 ---
 
@@ -108,7 +124,7 @@ AirPods Pro 播放最终输出；分别验证歌曲 EQ、现实人声增益意�
 | 56 | **设备屏幕事件格** | ✅ **已上机** | 主页面"麦克风正常"同行右侧新增 ASCII 事件类别（keyboard/wind/speech/artifact/quiet，montserrat_14），颜色区分；`render_demo_ui.py` 宽度校验 'keyboard' 69/88 px 通过。固件已刷机启动 |
 | 57 | **TTS 说话正样本入库** | ✅ **已上传** | 4 音色 183 s 说话（音频 + 10 Hz 24 段 + 教师标签）收入 `experiments/sound-events/data/teacher-20261019-tts/`，数据快照约 19 MB（其中 5 个 `audio.wav` 共 15.6 MB，维护者确认可公开，见 `experiments/sound-events/data/README.md`） |
 | 58 | **上位机显示事件/感知耗时** | ✅ **已接** | `latency` 报文新增 `context_p50_us`/`event_p50_us`解析进快照，面板备注行显示；真机实测事件 278 µs、感知 193 µs。上位机自测通过（条数以运行输出为准） |
-| 59 | **说话 gate 学生上机（只遥测）** | 🟡 **已上机、口径已对齐；D19 验收未过** | 92→24→2（2.3k 参数，`main/speech_gate_model.h`），串口 `speech_gate`/`_valid`/`_us`，上位机面板与快照显示。发现训练侧 9 维依赖设备 `broadband_dbfs` 的特征与端侧口径不一致（训练用 24 段功率近似），导致安静房间误报 0.94–1.0；训练/端侧同时清零后设备与离线重算 **corr 0.999**、安静房间 0.004。跨会话仍差：multi→TTS 误报 54%、TTS→multi 61%、汇总模型在真安静采集误报 26%——**不替换四判据**，等真实多说话人/多距离数据再训。金标准 `test/speech_gate_test` 全部通过；C++ 11 套件与上位机自测全绿（具体条数以 CI 输出为准） |
+| 59 | **说话 gate 学生上机（只遥测）** | 🟡 **已上机、口径已对齐；D19 验收未过** | 92→24→2（2.3k 参数，`main/speech_gate_model.h`），串口 `speech_gate`/`_valid`/`_us`，上位机面板与快照显示。发现训练侧 9 维依赖设备 `broadband_dbfs` 的特征与端侧口径不一致（训练用 24 段功率近似），导致安静房间误报 0.94–1.0；训练/端侧同时清零后设备与离线重算 **corr 0.999**、安静房间 0.004。跨会话仍差：multi→TTS 误报 54%、TTS→multi 61%、汇总模型在真安静采集误报 26%——**不替换四判据**，等真实多说话人/多距离数据再训。金标准 `test/speech_gate_test` 全部通过；C++ 12 套件与上位机自测全绿（具体条数以运行输出为准） |
 | 60 | **窗口向量调试通道** | ✅ | 串口 `vector` 打印最近满窗 92 维特征（`tools/dump_window_vector.py`），就是靠它定位到 59 的口径 bug；只用于调试，不参与运行 |
 | 61 | **受控代理场景评估 gate** | 🟡 **已采已评；代理不可用于验收** | Mac 外放 120.7 s（静音/大声/小声/风/键盘/说话+风），设备 1135 帧 0 丢块。教师 speech：大声 98%、小声 76%、说话+风 95%；学生 gate：95%/74%/100%，但安静 0–40%、风 54%、键盘 79% 误报（综合 44%）。加入真机 keyboard/wind 负样本后降到 32%，仍 >10%。代理声学不真实（无湍流/瞬态），不能当验收；真实 LOO 仍 3–22% 误报。数据已入库 `data/gateeval-20261019/`，评估脚本 `evaluate_speech_gate.py` |
 | 62 | **协议 bug：valid=true 却报 artifact** | ✅ **已修 + 回归测试 + 已刷机** | `StateMachine` 把 artifact 当声音类别保持 2 s；撞桌后窗重新有效时把 artifact 带进 valid=true 的帧，上位机连续报“event_valid=true 却报了 artifact”。修法：有效帧恢复即退出 artifact。`sound_event_test` 增加两条回归（25/25 通过）。 |
@@ -126,17 +142,23 @@ AirPods Pro 播放最终输出；分别验证歌曲 EQ、现实人声增益意�
 | 74 | **ASR 噪声门控与去幻觉（D33，2026-10-21 现场反馈）** | ✅ **代码/离线/真机噪声段验证；多人对话转写未验收** | 现场 15 s 噪声被 +17 dB 放大后 Qwen3-ASR 吐出满屏"就是"。修复：≥1 s 语音证据（设备连续 4 帧 `voice_likelihood≥0.65` 排除键盘/风/撞击，或 20 ms 能量 VAD）才送 ASR；只裁首尾保留样本偏移；token 预算按语音时长收紧；重复循环/语气词/单字输出丢弃。离线真实 ASR 复测：静音/嗡嗡/呼吸不再出文字，3 s 语音+12 s 静音从重复 6 次变一句话。真机（串口 + `--voiceprint --ambient-executor relay`）2026-10-21 16:17–16:18 连续 5 段现场噪声：3 段"未检测到有效人声（跳过 ASR）"、2 段 ASR 输出被判"只有语气词"丢弃，面板不再出现满屏"就是"。见 D33。 |
 | 75 | **LLM 判定成为环境声执行授权（D32，2026-10-21 现场反馈）** | ⚠️ **已被第 76 项/D34 取代授权方向**；其余（epoch/TTL/上下文/训练）沿用 | 旧版 LLM 只写面板，环境声门控仍等 WavLM `other`；现场 `speech_ratio` 长期低于阈值 → 40 段候选 opens=0。修复：LLM 对每段输出 `dialogue/ambient/confidence/reason`；执行端要求 S3 意图 ∧ 新鲜 `dialogue=yes`（TTL 20 s）∧ 判定属于当前对话轮次，其余 fail-closed；6 s 滚动分段不推进轮次；旧轮次晚归与 ASR worker 退出立即失效；声纹降级为新鲜 self 否决；分段 15 s→6 s；面板分四行显示。中转 API 8 次结构化输出 8/8 合法、p50 5.10 s。见 D32。 |
 | 76 | **D34：端侧快路径先开、LLM 迟到否决 + 训练数据/上下文（2026-10-21）** | 🟡 **已实现并真机跑通；语义验收/蒸馏未做** | 用户约束"不能有延迟"：LLM p50 5.1 s 不能进实时环。执行端立即执行 S3 意图（0.2–0.3 s），LLM 只有迟到否决（no 关闭、yes 确认、unclear 不阻塞）；本地无语音证据也可否决；epoch/TTL 防止旧轮次串扰。`host_up.sh` 默认落训练数据 `记录/训练数据/<会话>/`（每片段 JSONL+WAV、遥测、ASR 原始/清洗轮次、LLM 上下文/原始响应/判定、教师标签+人工留空，events.jsonl 记开关/否决时刻）；LLM 保存跨片段 context（24 轮+4 判定，新对话清空）。真机验证：快路径立即开、约 6 s 后本地证据否决关闭；训练记录与音频已生成。见 D34。 |
+| 77 | **耳机 TWS/OWS 双设备兼容（D35/D36，2026-10-21 晚）** | ✅ **代码/文档已改；两副均可识别；延迟已实测** | `EXPECTED_TARGET` 改为 `--earphone MATCH=LABEL` 注册表（默认 `Xiaomi=Xiaomi OWS`、`AirPods=AirPods Pro`，子串匹配）；中继 `--relay-device` 默认空 = 跟随系统默认输出。`--ambient-executor airpods` 仅 TWS 可用；OWS 无聆听模式，`ambient_open` 退为意图/遥测 + 中继门控，默认仍 off（D30）。实测：Xiaomi 耳夹驱动侧 324.8 ms（44.1 kHz，总≈385–405 ms），AirPods Pro 170.7 ms（总≈211–231 ms）。见 D35/D36。 |
+| 79 | **用户记忆 memo（D38，2026-10-21 用户要求）** | 🟡 **存档+注入已实现；进入决策待验收** | 新增 `tools/host/memo.py`：rolling 事件（判定/环境声开关/纠正，保留 14 天、上限 240 条）+ `sessions.jsonl` 会话摘要 + 场景×时段 profile（半衰期 7 天），目录 `记录/memo/`（gitignore）。assistant 调 LLM 时注入 ≤300 字弱先验，并写明"与本段证据冲突时以本段为准"。当前只注入、不直接进执行；影子建议/受限执行（上限+TTL+可关）列为下一步。见 D38。 |
+| 78 | **输出设备切换后播放器"假运行"（D37，2026-10-21 现场）** | ✅ **已修复并真机验证** | 现象：点播放后 `playing=true` 但位置恒 0、耳机无声。根因：AVAudioEngine 未处理 `AVAudioEngineConfigurationChange`，设备切换后停止渲染但 `isRunning` 仍为 true。修复：重启引擎并**从最后已知位置**重排、play 锚点/墙钟校验（防位置从 1.9 s 跳到 26 s）、暂停中切设备保留位置、1.5 s 位置不动看门狗；`recoveries` 进播放器状态。真机在 MacBook 扬声器与 Xiaomi 耳夹间来回切：每次切换 recoveries +1、位置连续。见 D37。 |
+| 85 | **说话人归属聚合 + 工作台拆分（D45，2026-10-22 用户复测）** | ✅ **已实现/单测/离线 A/B；真机待复测** | 用户仍见同一句 self+unknown，且 UI 内容过多。查证：`_speaker_segments` 自 e96b309 未改；13 个会话约 1580 轮里 self 仅 6 条，无"之前大规模分清"记录。修复：① 逐片判定 + 短 unknown 片边界平滑（只挨一侧身份就并入；self/other 边界不猜）；② LLM 工作台拆为「ASR 转写」与「判定窗口」，判定/上下文/录音收进 details，去掉重复最近转写。离线 A/B：1035 self 3.0→3.7s、1036 0.8→1.0s，电视段仍 other；host 75 组/7779 条、渲染 58/0。见 D45。 |
+| 84 | **声纹 unknown 根因修复（D44，2026-10-22 用户对着说话仍 unknown）** | ✅ **已实现/单测/端到端验证；待真机复测** | 转写正确但说话人 unknown。根因两层：设备 voice_likelihood 仅 0.21；host 只在 S3 判 speech≥0.6 时才发 `speech_active=true`，worker 的 `speech_ratio=0` 直接回 unknown，WavLM 没参与。离线重放 `seg1035` 得 self 0.9527。修复：voiceprint 加能量兜底（块 RMS ≥ 近 20 s 本底 +6 dB 也算说话），阈值不动。验证：activity_chunks=5 / speech_ratio=1.0 / 连续 self 0.82–0.97。见 D44。 |
+| 83 | **转写可读性四项（D43，2026-10-22 用户疑问）** | ✅ **已实现并重启验证** | ASR 不慢（0.3–2.1 s/段），但 15 段只有 2 段通过；面板只留 8 段。修复：短应答词表扩充（对啊/是的/行吧…）、VAD 合并 0.35→0.5 s（轮次切分保持 0.35）、面板保留 24 段、ASR 延迟与通过率进 `asr_stats` 并在面板顶部显示。重启后首段 1/1 通过、ASR p50 352 ms。见 D43。 |
+| 82 | **执行门：背景人声不执行环境声、也不压媒体（D42，2026-10-22 现场）** | 🟡 **已实现并真机初验；真人验收待做** | 掩蔽后用户仍看到背景人声把环境声顶开 2 s：`fast_local` 授权下 S3 意图直接执行，LLM 迟到否决来不及。Mac 新增 `--ambient-gate off|llm|voice`：voice=voiceprint self（接话）或 LLM 确认才执行，门栓保持到 S3 意图消失 2.5 s；self 不回传 S3（避免 D31 self-veto 把对话关掉）；voiceprint 不可用退化为 llm。真机：背景人声帧 `EXTERNAL_VOICE_INTENT`、`ambient_open=false`、`opens=0`；现场追加媒体门槛后，S3 报 75/86/94% 下压而播放器保持 100%（全程未开口）。待真人复测：背景不让位/不开门、接话后才让位开门。见 D42。 |
+| 81 | **背景人声改掩蔽（D41，2026-10-22 用户口径）** | 🟡 **已实现/单测；待烧机真机复验** | 用户把场景拆成三种（无关背景/简单回两句/长段对话），指出旧行为在"背景无关人说话"场景方向相反。本轮只改动作：`EXTERNAL_VOICE_INTENT` 改为掩蔽——全频段 +1 dB、1–4 kHz 抬到单段上限，Mac ×2.5 后语音段约 +8 dB；不压媒体、不开环境声；对话仍 flat+下压。面板卡片改名"掩蔽推量（背景人声）"，写明 ≠ 降噪 ≠ 人声增强。`controller_test` 锁定语音段 ≥3 dB、全频段 ≥0.8 dB。待烧机确认真机面板/听感。见 D41。 |
+| 80 | **调音重做 + 对话确认改为持续证据（D39/D40，2026-10-21 深夜现场反馈）** | ✅ **已实现、单测、已烧机真机复验；真人对话首响待验收** | 用户现场："环境很嘈杂，调音一般般；该凸显的没凸显"。量化：旧 SONG_EQ 在实测低频谱下最大建议 0.34 dB（×2.5 复合 ≤0.7 dB、1–4 kHz 恒 0）；同时 87–95% 时间卡在 FLAT+media60%（断续噪声连续段 p50 110 ms、最长 640 ms 被 200 ms 确认+2 帧续命积分成常驻对话）。修复：① 歌曲 EQ 改为有符号内容曲线 `clamp(C·N·(1−k·D), −4,+4)`（低频/人声 presence/空气为正、346–842 Hz 去糊为负；风只压正增益；safety_hold 只保留削减）；② 协议/面板/播放器支持负值（0 dB 零线；applied=clamp(suggest×2.5, −12,+10)）；③ 模式路由改用 250 ms 平滑电平；④ 对话确认：0.5 s 连续证据预下压、0.8 s 确认、engaged 续命≥0.8 s、releasing 内重新确认。真机复验（同一嘈杂现场）：media=100%、SONG_EQ≈84%、EXTERNAL_VOICE_INTENT≈5%、ambient=false；SONG_EQ 设备建议低频+1.4/去糊−1.2/presence+1.6/空气+1.8 dB，Mac applied ×2.5 后低频+3.7/+3.9、去糊−3.2、presence+2.7…4.0、空气+4.7 dB。代价：真人对话首响 0.2–0.3 s → 0.5 s 预览/0.8 s 确认。见 D39/D40。 |
 
 
-**断言计数（2026-10-21 定稿实测）**：主机 C++ 单测 **11 套件合计 365 条**
-（controller 80、noise_analyzer 46、latency_profiler 40、mic_capture 16、mic_decimator 15、
-voiceprint_gate 60、context_window 23、conversation_awareness 38、bone_voice 19、
-sound_event 25、speech_gate 3），全部通过。上位机自测 `python3 tools/host/tests/test_host.py`
-输出 **70 组、7728 条断言**（2026-10-21 D32/D33 后实测通过；连跑 3 次稳定）；
-`node tools/host/tests/render_check.js` 用同款 mock 快照运行，条数随快照内容略变
-（2026-10-21 修复前记录为 49 条通过、0 条失败）；
-检查器 `--selftest` **8/8 场景符合预期**。这些数字会随代码变化，改完代码要重新跑一遍
-再同步到 README。
+**断言计数（2026-10-23 实测）**：主机 C++ 单测 **12 套件**（`ctest` 12/12 全部通过；
+新增 D47 的 `dual_mic_test`；条数以 ctest 输出为准，不在此手工维护）。上位机自测
+`python3 tools/host/tests/test_host.py` 输出 **88 组、7914 条断言**；
+`node tools/host/tests/render_check.js <快照.json>` 用真实快照运行 **80 条通过、0 条失败**
+（条数随快照内容略变）；检查器 `--selftest` **8/8 场景符合预期**。
+这些数字会随代码变化，改完代码要重新跑一遍再同步到 README。
 
 **这条测试自己也有口径风险**：`context_window` 的金标准是生成物
 （`test/context_window_golden.h`，由 `features.py` 在固定配方上算出来）。改
@@ -368,6 +390,11 @@ python3 tools/voice_separability.py --enroll 甲A.wav 甲B.wav 甲C.wav \
 **这条预期是用户 2026-10-15 提出的："demo 用的是 AirPods Pro，之后用自己的耳机这块应该更快。"
 方向对，但必须说准：快的是链路，不是"自己的"。** 决定这一段的是**链路制式与接收端抖动缓冲**：
 
+**2026-10-21 补（已实测）**：换上的 Xiaomi 耳夹仍走 A2DP（LHDC 5.0 只有部分安卓手机支持，
+Mac 上只有 AAC/SBC），`output_latency.swift` 实测驱动侧 **324.8 ms**（44.1 kHz），比 AirPods Pro
+的 170.7 ms 还慢 154 ms。所以"更快"不仅不成立，**换成一副第三方 OWS 耳机反而更慢**——这次换的
+是开放耳夹形态，不是输出腿。中继总时延按同拓扑约 385–405 ms（D36）。
+
 | 路线 | 音频通路量级 | 在本项目里的含义 |
 |---|---|---|
 | A2DP（SBC/AAC，经典蓝牙） | 一两百毫秒起，差的能到 300 ms | **自研耳机走这条路不会更快，可能更差**——AirPods 那 170.7 ms 已经是 Apple 自家栈调过的结果，很多 TWS 比它更晚 |
@@ -387,7 +414,7 @@ swiftc -O -o /tmp/outlat tools/host/output_latency.swift && /tmp/outlat
 |---|---|
 | ≤ 60 ms | 值得重新评估 **D2**（"不做音频回传注入"）与 **D3**（"不追 LE Audio 直连"）——那时"混音发生在出声设备上"第一次真正可行 |
 | 60–150 ms | 通道可用，但"听清对面说话"仍不成立；继续按 D2 只做端侧感知与决策 |
-| ≥ 150 ms | 与今天的 AirPods Pro 同档，**"自己的耳机更快"这个说法不成立**，要如实纠正 |
+| ≥ 150 ms | 与 AirPods Pro 同档，**"自己的耳机更快"这个说法不成立**，要如实纠正 |
 
 **另外一条前提容易被漏掉**：快的是链路，但**宿主也得支持那条链路**。Mac 这一侧对第三方
 LE Audio 单播输出的支持有限；如果以后换成手机（Android 13+）当宿主，同一副耳机的结果可能
@@ -409,22 +436,17 @@ LE Audio 单播输出的支持有限；如果以后换成手机（Android 13+）
 
 ---
 
-## 固件构建（本机没有 ESP-IDF）
+## 固件构建（本机已装 ESP-IDF；CI 作备用）
 
-本机**没有 ESP-IDF**（`idf.py` 不在 PATH，`~/esp` 是空的），且 GitHub/espressif 直连只有
-约 11 kB/s（清华、南大、SJTU、gitee 镜像均不可用），在本机装 IDF 不现实。因此固件改动走
-**CI 构建**，用 `gh` 取产物后本地刷写：
+本机已装 **ESP-IDF v5.4.1**（`~/esp/esp-idf` + python3.12 env），固件可直接本地编译：
 
 ```bash
-git push origin main                                  # 触发 CI（host-tests → firmware，约 7-8 分钟）
-gh run watch                                           # 或 gh run list
-gh run download <run-id> -n cores3-noise-adapt-firmware -D /tmp/ci
-python3 -m esptool --chip esp32s3 --port /dev/cu.usbmodem1101 --baud 460800 \
-    write-flash --flash-mode dio --flash-freq 80m --flash-size 16MB \
-    0x0 /tmp/ci/bootloader/bootloader.bin \
-    0x8000 /tmp/ci/partition_table/partition-table.bin \
-    0x10000 /tmp/ci/cores3_noise_adapt_demo.bin
+sh tools/build.sh          # 只编译
+sh tools/build.sh flash    # 编译后刷写（复用 tools/flash.sh，逐区写+校验）
 ```
+
+刷写前先 `sh tools/free_port.sh --kill`（host 会占串口）。CI（push 触发，host-tests →
+firmware，约 7-8 分钟）仍保留作交叉验证；取产物后 `sh tools/flash.sh <产物目录>`。
 
 回滚靠 `outputs/cores3-pre-demo-backup-20261013.bin`（16 MB 原厂整片备份，
 SHA256 前缀 `cfe4efba216fbe59`）。
@@ -432,7 +454,7 @@ SHA256 前缀 `cfe4efba216fbe59`）。
 ## 已知的维护风险
 
 - **文档里的数字是手工同步的**：断言总数与渲染校验条数**以 CI/运行输出为准**（正文只在
-  2026-10-21 收尾时统一写一次，不追每个中间版本）；真机延迟（节拍 100.03、分析 7.02、
+  2026-10-23 收尾时统一同步一次，不追每个中间版本）；真机延迟（节拍 100.03、分析 7.02、
   决策 0.06）写在 README 与两份 docs 里。改代码不会自动改它们，目前没有 CI 检查，
   所以**改完代码要同时搜一遍这几个数字**。
 - 真机数字与固件版本绑定：当前实测值对应 **100 ms 节拍**（`4308366` 引入）。换版本后必须重新

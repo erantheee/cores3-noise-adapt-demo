@@ -20,6 +20,10 @@ AirPods Pro 负责播放。现实人声增益与歌曲 EQ 是两个互斥动作�
 定义；最终产品的耳机仓是 AI 算力中心。D8 的“不做响度闪避”仍成立，降低歌曲音量不能冒充现实
 人声增强。
 
+**2026-10-21 注**：当前耳机已从 AirPods Pro 换为 OWS 耳夹（Xiaomi 耳夹式耳机，见 D35）。
+D0 的核心口径（本机不做降噪，只做增益/调音/下压）不变；上面"AirPods Pro 不开放…"的限制
+对第三方 OWS 耳机同样成立——它也不开放双耳原始麦克风与聆听 DSP 接口。
+
 ---
 
 ## D1 · CoreS3 定位为"端侧可行性验证机"，不做音频输出
@@ -943,3 +947,503 @@ Qwen3-ASR，模型输出满屏"就是，就是，就是…"；用户反馈"转�
 
 **文件**：`tools/host/assistant.py`、`tools/host/__main__.py`、`tools/host/training.py`、
 `tools/host_up.sh`、`tools/host/web/index.html`、`tools/host/tests/test_host.py`。
+
+---
+
+## D35 · 2026-10-21 本次耳机从 TWS 切到 OWS（Xiaomi 耳夹式耳机）
+
+**背景**：demo 的叙事是「AI OWS 耳机仓」，但"本次耳机"一直挂的是 AirPods Pro（TWS 入耳
+ANC），与产品形态不一致。2026-10-21 晚起换成 OWS 耳夹（Xiaomi 耳夹式耳机：开放式夹耳、
+无 ANC、无聆听模式）。
+
+**决定**：
+
+1. **设备名不写死**：`tools/host/mac_audio.py` 的 `EXPECTED_TARGET = "AirPods Pro"` 删除，
+   改成 `DEFAULT_OUTPUT_DEVICE = "Xiaomi"` + `--output-device`（大小写不敏感子串匹配）。
+   S3 路由页显示名用 `--output-label`（默认 `Xiaomi OWS`，**必须 ASCII**：`lv_font_ui_16`
+   是 115 字子集，中文设备名会渲染成方框）。中继默认设备同步改为 `Xiaomi`（`--relay-device`）。
+   **（2026-10-21 晚补：本条的单设备参数已被 D36 的 `--earphone` 注册表取代，中继默认也改为
+   跟随系统输出。设备识别从"切一副"升级为"两副都认"。）**
+2. **`--ambient-executor airpods` 降为 TWS 时代 legacy**：它靠 `airpods-control` 走 AX 点
+   控制中心切聆听模式，OWS 耳夹没有聆听模式，这条执行端在 OWS 上不可用。默认仍 `off`
+   （D30 不变），relay 路径保留。
+3. **`ambient_open` 语义降级**：OWS 物理开放，环境声不需要"打开"；该意图在 OWS 上退为
+   遥测 + 中继门控。对外的动作口径收敛为「下压媒体 + 可选中继」。
+4. **延迟必须重测**：170.7 ms 输出腿与 211–231 ms 中继延迟是 2026-10-15 AirPods Pro 实测
+   （D14），不能沿用到 OWS。到手后先跑 `tools/host/output_latency.swift`，按
+   `plan-status.md`「自研耳机接上后：先量输出腿」一节的判据（≤60 / 60–150 / ≥150 ms）
+   重新记录，再决定是否重估 D2/D3。**（次日实测：Xiaomi 耳夹驱动侧 324.8 ms，见 D36。）**
+5. **EQ 结论分设备**：执行逻辑不变（Mac 侧 24 段），但开放式低频泄漏会让低频段听感收益
+   打折；"歌曲 EQ 有没有用"的结论必须标注 TWS 还是 OWS。
+
+**不做**：不删 relay 执行端；不改 D0（仍不做降噪）；不把小米生态功能（超级小爱/翻译/录音）
+接进链路——本次只换"耳机"这个角色。~~TWS 对照时用 `--output-device` 切回 AirPods~~ 已被 D36
+取代：现在两副耳机默认都在注册表里，Mac 默认输出是哪副就认哪副。
+
+**文件**：`tools/host/mac_audio.py`、`tools/host/__main__.py`、`tools/host/audio_relay.py`、
+`tools/host_up.sh`、`tools/host/web/index.html`、`tools/host/tests/test_host.py`、
+`tools/host/tests/render_check.js`、`README.md`、`docs/product-alignment.md`。
+
+
+---
+
+## D36 · 2026-10-21 晚 双耳机兼容（Xiaomi 耳夹 + AirPods Pro 自动识别）+ OWS 输出腿实测
+
+**背景**：D35 把耳机切到 OWS 后，用户要求**同一版本也能直接用 AirPods Pro**（"又兼容 AirPods
+又兼容 Xiaomi"），不应靠改启动参数切换；且当天耳机已在 Mac 上，可以直接实测输出腿。
+
+**决定**：
+
+1. **设备识别从单值参数改成注册表**：`--earphone MATCH=LABEL`（可重复），默认
+   `Xiaomi=Xiaomi OWS`、`AirPods=AirPods Pro`；设备名按大小写不敏感子串匹配，按顺序取第一个
+   命中；未命中 → S3 报 `inactive` + 回退名 `Earphone`。显示名强制 **ASCII**（`lv_font_ui_16`
+   是 115 字子集，中文设备名会渲染成方框）。D35 的 `--output-device/--output-label` 由本参数取代。
+2. **中继默认不再钉死某副耳机**：`--relay-device` 默认空 = 跟随系统默认输出，戴哪副就送哪副；
+   要钉住某副时显式传名字。当前默认输出不是已识别耳机（例如掉线落到 MacBook 扬声器）时，
+   面板报警（原有行为保留）。
+3. **输出腿实测（2026-10-21，`tools/host/output_latency.swift`，当前默认输出 = Xiaomi 耳夹）**：
+   驱动侧 **324.8 ms**（44.1 kHz：回调缓冲 11.6 + 设备延迟 313.2 + 安全/流 0）；按同拓扑中继
+   总时延约 **385–405 ms**（排队 40–60 + 324.8 + 设备侧约 20）。AirPods Pro 仍为 2026-10-15 的
+   170.7 ms / 总 211–231 ms。**两副都 ≥150 ms**，A2 判据不变："自己的耳机更快"不成立；D2
+   （不做音频回传注入）不变，反而更稳——第三方 OWS 比 Apple 自家栈慢 154 ms。
+4. **口径**：从"当前耳机 = OWS"改为"同时支持两副，按 Mac 默认输出自动识别"；S3 路由页显示命中
+   的那副短名（`Xiaomi OWS` / `AirPods Pro`），未识别显示 `Earphone`。
+
+**不做**：不做运行中热切换的强保证（换默认输出后中继通常随 AVAudioEngine 配置变更重解析，
+但不承诺毫秒级跟随；换耳机后重启 host 最稳）；不试图控制耳机厂商 DSP；`--ambient-executor
+airpods` 仍只在 TWS 时可用；不改 D0（不做降噪）。
+
+**文件**：`tools/host/mac_audio.py`、`tools/host/__main__.py`、`tools/host/audio_relay.py`、
+`tools/host_up.sh`、`tools/host/web/index.html`、`tools/host/tests/test_host.py`、
+`README.md`、`docs/product-alignment.md`、`docs/plan-status.md`、`docs/goals.md`。
+
+
+---
+
+## D37 · 2026-10-21 输出设备切换后播放器"假运行"（位置恒 0 / 没声音）
+
+**现象**：宿主启动时默认输出还是 AirPods Pro，之后 Xiaomi 耳夹接管默认输出。用户点播放后
+面板显示在播，但位置恒 0、峰值冻住，耳机里没有声音——看起来像"点了播放没反应"。
+
+**根因**：`tools/player/player.swift` 的 AVAudioEngine 没有处理
+`AVAudioEngineConfigurationChange`。输出设备被系统换掉后引擎停止渲染，但
+`engine.isRunning` 仍为 true、`player.play()` 也不报错，于是"在播"只是状态字段在播：
+位置靠 `playerTime` 计算，节点不再被拉数据就永远是 0；峰值 tap 不再回调就冻在最后一个值。
+（relaysink 有重启逻辑，但当时 relay gate 关着，所以没有第二条证据。）
+
+**修复**：
+
+1. **监听配置变化**：tick 里重启引擎，并从**最后已知位置**重排当前曲目继续播（不是从 0）。
+2. **锚点修正**：`playerTime` 在引擎重启后可能沿用累计时间轴（实测位置 1.9 s → 26 s），
+   用墙钟基准校验；偏差 >1 s 就重设锚点。播放刚开始读不到 `playerTime` 时置 pending，
+   下一拍补锚点，不把 0 当锚点。
+3. **暂停中切设备**：保留片段起点，`play` 从暂停位置继续，而不是从 0 重来。
+4. **看门狗**：在播但位置 1.5 s 不动 → 判定"假运行"，触发一次恢复（覆盖通知没到的路径）。
+5. **可见性**：`recoveries` 计数进播放器状态与上位机快照——恢复路径到底有没有走过，
+   面板/日志能看见，不靠猜。
+
+**验证**（2026-10-21，Xiaomi 耳夹与 MacBook 扬声器来回切，播放音量 0 静音）：
+每次切换 `recoveries` +1，位置连续无跳变（2.4→6.2→10.0→暂停 10.0→切设备→12.9→16.8）。
+
+**边界**：不做无缝热切换（切换瞬间会有一拍内重启，音频有极短断点）；播放器进程若被杀或
+崩溃，上位机不会自动重启它，需要重启 host。不改 D0/D2 的任何口径。
+
+**文件**：`tools/player/player.swift`、`tools/host/player.py`。
+
+
+---
+
+## D38 · 2026-10-21 用户记忆（memo）：先存下来，再谈"学用户"
+
+**背景**：LLM 的跨片段 context（24 轮 + 4 次判定）只活在进程内存里，换一次对话或重启上位机
+就失忆。用户明确要求"需要保存；时间长了记忆要进入决策，这才是 AI 学习用户的意义"，并指出
+**量产的 AI 时间长了其实都是用户自己量身定制的**：不是每人一份权重，而是同一套模型 + 每个人
+自己的记忆。
+
+**决定（分三阶段，不跳级）**：
+
+1. **存档（本轮已实现）**：新增 `tools/host/memo.py`，落盘三层：
+   - `rolling`：最近事件（判定 / 环境声开与关 / 用户纠正），保留期默认 14 天、上限 240 条；
+   - `sessions.jsonl`：每次 host 运行结束写一条结构化摘要；
+   - `profile`：按「场景 × 时段」聚合的确定性统计（判定分布、环境声短开/被否决次数、
+     噪声均值、纠正次数），**半衰期 7 天**。
+   目录默认 `记录/memo/`（已在 .gitignore 里）；只存文本与统计，不存音频；删掉 `memo.json`
+   即清空记忆。
+2. **注入（本轮已实现）**：assistant 调 LLM 时把 `memo.prompt_context()`（≤300 字）放进
+   facts，并在 prompt 里写死"弱先验：与本段逐字稿/遥测冲突时以本段为准，不能凭记忆判对话
+   或开放环境声"。
+3. **影子与受限执行（下一步，未实现）**：profile 先生成**影子建议**（只记录、不执行）；
+   达到样本量与一致率门槛后，才允许作为**慢层先验**进入执行，且必须有：上限（例如 EQ 偏置
+   ≤2 dB）、TTL、面板可见来源、一键关闭（`--no-memo`）。**永远不进 100 ms 实时环，也不
+   替代 SAFETY_HOLD 等本地安全约束。**
+
+**为什么不直接"学完就进决策"**：记忆是**用户偏好状态**，不是模型权重——必须可解释、可删除、
+可回滚。直接让 LLM 改 EQ/环境声会破坏 D0 的"谁在做决策"这个唯一变量，也没法验收。
+
+**验收（先定后跑）**：有 memo vs 无 memo 的 LLM 判定一致率、环境声误开时长、用户纠正次数；
+以及"过期记忆不生效"测试（昨天的场景不得套今天）。
+
+**不做**：不做端上在线学习、不把音频/原始频谱写进 memo、不跨设备同步。用户纠正入口
+（面板/API）尚未接，本轮只留 `record_correction()` 数据入口。
+
+**文件**：`tools/host/memo.py`、`tools/host/assistant.py`、`tools/host/state.py`、
+`tools/host/__main__.py`、`tools/host/tests/test_host.py`。
+
+
+---
+
+## D39 · 2026-10-21 晚 歌曲 EQ 重做：从"噪声谱复读"改成"内容先验 × 噪声暴露 × 噪声主导抑制"
+
+**背景**：用户现场反馈"环境很嘈杂，但调音好像一般般；不是拉爆问题，是该凸显的没凸显"。
+只读采样与离线复刻（`work/eq-design/`，90 s / 900 帧）把问题量化成两条：
+
+1. **旧公式没有内容先验**。`main/controller.cpp` 的 `song_eq` 是
+   `min(4, 4 × band_noise × importance × focus)`：`band_noise` 是"该段噪声有多响"，
+   不是"该段内容有多重要"。现场低频隆隆谱下 24 段建议最大只有 **0.34 dB**（×2.5 后复合
+   ≤0.7 dB），**1–4 kHz 恒为 0**；A/B 渲染里 b（现状）与 a（无 EQ）逐段差 ≤0.5 dB，
+   等于没调。它只是把噪声谱的形状复读了一遍。
+2. **旧公式结构上不能输出负值**（`min(4, …)`），无法做"去糊"削减；而两首参考曲目在
+   346–842 Hz 都有 20–27% 的能量，正是掩蔽人声的糊区。
+
+**决定**：
+
+1. **曲线语义升级为有符号的"内容曲线"**：
+   `g[b] = clamp(C[b] · N · (1 − k[b]·D[b]), −4, +4)`
+   - `C[b]`：固定的内容先验。低频 70/141 Hz +2.5/+3.0（补 OWS 开放式低频泄漏），
+     1.6–4 kHz 人声 presence 驼峰（峰 +2.3），8.5–13.6 kHz 空气感 +2.6/+2.6/+1.9；
+     **346–842 Hz 给负值 −1.8…−0.5（去糊）**。
+   - `N`：噪声暴露，`-54→0`、`-34→1`。安静不动作，越吵动作越大，只改幅度不改形状。
+   - `D[b]`：该段被噪声主导程度，`-75→0`、`-35→1`；正增益按 `k` 抑制（人声 0.45、
+     低频 0.65、空气 0.85），**负增益（去糊）不抑制**——噪声里削糊总是有利的。
+   - 设备建议口径 `[-4, +4]` dB/段；Mac 播放器仍乘面板深度（默认 2.5）并夹 `[-12, +10]`。
+2. **`external_voice_intent` 用同一条内容曲线**，再对 1.4–4 kHz 按语音证据额外加
+   ≤2 dB 人声强调（D26 的"背景/别人说话也要把 EQ 拉起来"保留，从"只抬中频"升级成
+   "整条曲线 + 人声加权"）。
+   **2026-10-22 注：本条的"人声强调"已被 D41 的掩蔽口径取代**——背景人声的目标
+   不是让人声靠前，而是盖住它。
+3. **`safety_hold` 只允许非正增益**：保留去糊削减，绝不抬升（D25 第 3 条不变）。
+4. **模式路由改用 250 ms 平滑电平**（`smoothed_dbfs_`）：现场 broadband 在 -30 dBFS
+   门槛附近被键盘/拍桌的 100 ms 瞬态推着来回穿，环境标签 NOISY↔LOUD 每 100–200 ms 抖一次，
+   SONG_EQ/SAFETY_HOLD 跟着切、EQ 抽动。平滑后单帧瞬态不再改变模式。
+5. **风场景只压正增益**：`apply_wind_eq` 不再对负增益乘 1/4（否则风一吹就少削）。
+
+**现场实测（2026-10-21 18:4x，真机 + 新固件）**：SONG_EQ 下设备建议低频 +1.4、去糊 −1.2、
+presence +1.6、空气 +1.8；Mac applied（×2.5）低频 +3.7/+3.9、去糊 −3.2、presence +2.7…+4.0、
+空气 +4.7。环境谱变时曲线随 N/D 连续变化，面板蓝线/绿柱有正有负。
+
+**听感预期与边界**：离线 A/B（`work/eq-design/audition/`，两首 25 s）中 c 档（新曲线 ×2.5）
+相对 b 档约为 presence 复合 +6~8 dB、去糊 −3~4 dB、低频 +3 dB 的质变；d 档（×4.0）只作
+"够不够明显"的上限对照，不建议默认。**EQ 只能优化播放的音乐，不能提升外界说话在噪声里的
+清晰度**（后者需要耳机侧降噪，本 demo 没有）；OWS 开放式低频泄漏会让文件级低频增益在耳道
+打折扣。"demo 要明显不要好听"的既有口径不变。
+
+**不做**：不加 limiter、不改 D0（不做降噪）、不把 Mac 侧做成"内容感知"第二决策者
+（形状仍只由 S3 下发，Mac 只乘深度）。
+
+**文件**：`main/controller.cpp`、`main/controller.hpp`、`test/controller_test.cpp`、
+`work/eq-design/**`、`tools/host/{protocol,state,player}.py`、`tools/host/web/index.html`、
+`tools/host/tests/{test_host.py,render_check.js}`。
+
+
+---
+
+## D40 · 2026-10-21 晚 对话确认改为"持续证据"：0.5 s 预下压、0.8 s 确认
+
+**背景**：D39 的曲线在真机上仍然听不到——现场 4 分钟只有 10.7% 的帧进入 SONG_EQ，
+87.4% 是 FLAT + 媒体 60%。诊断（`work/diagnosis/state.md`，只读 1179 帧 + 独立 90 s/843 帧
+10 Hz 复采）结论：**对话状态机把断续的 speech-like 噪声积分成了常驻 engaged**。
+
+- 现场"对话证据"（`voice>0.65 && bb>-58 && event∉{keyboard,wind,artifact}`）占空比仅
+  23.6%，**连续段 p50 = 110 ms、p90 = 215 ms、最长 640 ms，≥800 ms 的段为 0**；
+- 旧参数 `onset_confirm_ms = 200 ms` + engaged 的"连续 2 帧（200 ms）即续命"让
+  2.5 s hold 在噪声里永不过期：4 min 里 conversation=LIKELY 86.3%、media=60% 占 79.8%，
+  最长 engaged 29.1 s；
+- 同期 review 也发现默认启动配置没有登记 ASR 采集（mic 块在流但 assistant 丢弃），
+  D34 的 LLM 迟到否决在默认 demo 路径上没有生效；且 host→S3 没有回写 dialogue 的控制通道。
+  这是 D34 闭环的已知缺口，列入 TODOS，本轮不改。
+
+**决定**：把"对话开始/维持"从"第一拍"改成"**持续证据**"：
+
+1. **预下压**（媒体 → 70%）要求连续证据 ≥ **500 ms**（`preview_confirm_ms`）；
+2. **确认**（媒体 60% + `ambient_open=true`）要求连续证据 ≥ **800 ms**
+   （`onset_confirm_ms`，200 → 800）；
+3. **engaged 续命**要求连续证据 ≥ **800 ms**（原"连续 2 帧"）；
+4. **releasing 里重新出现证据不再立刻回 engaged**，重新走一遍 0.5 s/0.8 s 确认，
+   否则一段断续噪声会按 2.5 s 周期反复"放下→压回"。
+
+**为什么不是"LLM 迟到否决回写"**：那是 D34 的完整闭环，需要同时修 host 采集登记与
+新增 S3 控制行（尚未做）。本轮先用本地证据的持续性做第一时间区隔：现场噪声最长连续
+640 ms，真实对话（连续说话）能在 1 s 内确认；实现只在端侧，不引入新依赖。
+
+**代价（必须写清）**：真实对话的首次动作从约 0.2 s 变成 **0.5 s 预下压 / 0.8 s 确认**；
+`docs/goals.md` 的"第一拍就动 ≤1 帧"和 README 的"0.2–0.3 s"旧口径作废，按本条更新。
+噪声场景的收益：实测同一现场从 87–95% FLAT+60% 变成 **media=100%、SONG_EQ 约 84%、
+不再开环境声**，D39 的调音终于听得到。
+
+**验收（离线单测 + 现场观察）**：C++ 11 套件全绿（`controller_test` 95/95、
+`conversation_awareness_test` 48/48），新增"断续噪声不确认对话/不压媒体"与"已结束对话不被
+断续噪声续命"用例；现场真机：新固件下 SONG_EQ 占比、media=100%、无 FLAT 常驻。
+**待验收**：真实两人对话的首次响应延迟与误判率（需要真人 + 现场，列 TODOS）。
+
+**不做**：不改 2.5 s hold、不改 60% 地板、不改 `--ambient-executor off` 默认、
+不默认开 relay/voiceprint。
+
+**文件**：`main/conversation_awareness.{hpp,cpp}`、`test/conversation_awareness_test.cpp`、
+`test/controller_test.cpp`、`work/diagnosis/**`、`README.md`、`docs/goals.md`、
+`docs/plan-status.md`。
+
+
+---
+
+## D41 · 2026-10-22 demo 先做掩蔽：背景人声不是"抬人声"，是"盖住它"
+
+**背景**：用户把真实场景拆成三种，音频诉求完全不同：
+
+1. **背景有无关人说话**——压根不想听；
+2. **有人跟我说、简单回两句**——快速让位、快速回来；
+3. **有人跟我说长段的话**——彻底让位、别反复。
+
+D16 的"附近有人开口先下压、200 ms 后开环境声"在场景 1 做了两件相反的事：压下音乐让人声
+更突出、开环境声等于放大不想听的声音；D26 的"背景说话抬中频"方向也错了。用户明确要求：
+**demo 先做掩蔽，可以拉爆，要明显**；并指出 OWS 用户买的是舒适与开放，不是高品质歌曲，
+所以用 EQ 改音色做掩蔽是可接受的代价。
+
+**决定（demo 口径，不是产品口径）**：
+
+1. `external_voice_intent` 语义改为**掩蔽**：背景人声触发时，音乐全频段 +1 dB、语音段
+   1–4 kHz 抬到设备单段上限 +4 dB；Mac 侧默认 2.5× 处方深度后，语音段有效约 **+8 dB**
+   （设备段值约 3.2 dB 起，随内容曲线浮动）。
+2. **不压媒体、不开环境声**：掩蔽是"加音乐"，不是"让位"；对话成立仍走 flat + 下压
+   （D16/D40 的对话分支不变）。
+3. 不改状态机与触发条件（触发仍来自 S3 的 `speech_active` 分支）：本轮只改"动作"，
+   不动"何时动作"——后者是三态化的下一步。
+4. **已知代价**：会改音色、可能顶爆（D25 不装限幅器）；OWS 物理上不隔音，掩蔽只能降低
+   背景人声的可懂度，不能消除。面板文案必须写"掩蔽 ≠ 降噪 ≠ 人声增强"。
+
+**产品上不成立的部分（下一步）**：真正的三态是 `ignore / exchange / conversation`，靠
+"用户有没有接话（own-voice）+ 轮次结构"决定，而不是"附近有人说话"。当前 own-voice 证据
+仍弱（骨传导被否、声纹 self 实验性），所以 demo 先用掩蔽把场景 1 做"明显"。
+
+**验收（demo）**：背景人声出现时，面板 24 段里 1–4 kHz 明显抬起、全频段有薄抬升；对话成立
+时 EQ 立即回平直并下压媒体。`test/controller_test.cpp` 锁定"语音段 ≥3 dB、全频段 ≥0.8 dB"。
+
+**文件**：`main/controller.cpp`、`test/controller_test.cpp`、`tools/host/web/index.html`。
+
+
+---
+
+## D42 · 2026-10-22 demo 执行门：背景人声不执行环境声，等到"你接话/LLM 确认"才开门
+
+**现象**：D41 掩蔽生效后，用户仍看到环境声在**背景别人说话**时进来了 **2 s**。查
+`events.jsonl`：`device_intent=true → open=true` 的授权状态是 `fast_local`——S3 预判式快路径
+置了 `ambient_open`，Mac 按 D34 立即执行；LLM 的迟到否决还没回来，S3 意图又先掉下去，
+于是正好露出 ~2 s 的现实声音。
+
+**根因**：D34 的"端侧快路径先开"对**对话**是对的，但对**背景人声**是反的——快路径唯一能
+看到的是"附近有像人声的声音"，它分不清"冲我说的"还是"旁边在聊"。在 addressee 证据出现
+之前，执行端必须比设备更保守。
+
+**决定（demo 执行门，D42）**：在 Mac 执行端加 `--ambient-gate off|llm|voice`：
+
+1. `off`：旧行为（D34 快路径直接执行）。
+2. `llm`：只有 ASR/LLM 的新鲜 `llm_confirmed` 才执行；背景人声基本被 `llm_veto` 挡掉，
+   但开门要等 5–10 s。
+3. `voice`（**本次演示默认**）：`voiceprint` 判 `self`（= 你接话了）**或** LLM 确认才执行；
+   背景人声没有"你接话"证据，所以只显示 S3 意图、不执行。
+   - **门栓**：一旦触发，保持到 S3 环境声意图消失 2.5 s，避免一句一关；
+   - **self 不回传设备**：voice 门下 `self` 由主机当"接话"证据用；回传 S3 会触发 D31 的
+     self-veto（自己说话不算对话），反而把门锁死；
+   - voiceprint worker 未就绪/不可用时自动退化为 `llm` 门（fail-closed）。
+4. 门只拦**执行**，不拦 S3 的媒体下压/EQ：背景人声仍然由 D41 做掩蔽，面板同时显示
+   "设备意图 / 授权 / 执行 / 门状态"。
+
+**验证（2026-10-22 10:2x 真机）**：`--ambient-gate voice --voiceprint` 下，背景人声帧出现
+`EXTERNAL_VOICE_INTENT`、`ambient_open=false`、`ambient.opens=0`——环境声没有进；voiceprint
+worker `ready`。下一步要用户真人验证：背景聊天不得开门；接话后应开门并保持。
+
+**同日追加（现场"莫名其妙的压分贝"）**：用户全程没开口，但媒体被压——原因是**媒体下压仍走
+S3 快路径**，而 S3 的预判只看"附近像人声"（视频/旁人说话也算），不要求佩戴者开口。现在同一道
+执行门也管媒体：`--ambient-gate` 开启时，**没等到你接话/LLM 确认之前，媒体保持 100%**；证据
+来自上一拍（50 ms），对真实让位时序无可感知影响。实测：S3 帧报 75/86/94% 下压、播放器保持
+100%，环境声不开。`--ambient-gate off` 恢复旧的预测式下压。
+
+**边界/代价**：voiceprint 是实验性（D31/D28 止损门过但未过真人验收）；self 判定的延迟与
+误判直接决定开门时机，先按"多等 1–2 s 也不误开"取舍。`llm` 门更稳但更慢。这不是最终产品
+形态——最终要靠 `ignore / exchange / conversation` 三态与 addressee 证据（D41 提到的方向）。
+
+**文件**：`tools/host/__main__.py`（执行门/门栓/self 不回传）、`README.md`、
+`docs/plan-status.md`。
+
+
+---
+
+## D43 · 2026-10-22 转写可读性：短应答不丢、VAD 少碎、面板留更久、ASR 有遥测
+
+**背景**：用户反馈"只能录到几句话"。查数据：ASR 本身不慢（模型加载 3.2 s、单段 0.3–2.1 s），
+但一轮 15 个候选段只有 2 段通过 ASR——10 段被"只有语气词/噪声"丢弃、3 段无语音证据；面板
+又只保留 8 段（约 48 s），看起来就像"只说了几句"。
+
+**决定（可读性四项，不换模型）**：
+
+1. **短应答保留**：`_SHORT_ANSWER_WORDS` 扩充（"对啊/是的/行吧/稍等…"）。对话里的"对。"
+   是轮次证据，不能和"嗯。"一起被当噪声丢掉。
+2. **VAD 合并间隔 0.35→0.5 s**（遥测区间与能量 VAD），减少半句碎片；轮次切分仍保持 0.35 s，
+   LLM 看得到的问答结构不被并坏。
+3. **面板保留 24 段**（原 8 段，约 2.5 分钟对话账本）；训练数据本来就不丢。
+4. **ASR 吞吐遥测**：记录每段 ASR 延迟，快照暴露 `asr_stats`（段数/通过/跳过/过滤/p50），
+   面板顶部显示"通过 X/Y · 跳过 · 过滤 · ASR p50"。以后判断瓶颈不用猜。
+
+**边界**：这些只改善"看得见/可诊断"，不提升远场识别准确率；若通过率仍低，下一步才是
+降低语音证据门（0.65/1 s）或流式 ASR。当天实测：重启后第一段 1/1 通过、ASR p50 352 ms。
+
+**文件**：`tools/host/assistant.py`、`tools/host/web/index.html`。
+
+
+---
+
+## D44 · 2026-10-22 声纹 unknown 的根因：不是不认识，是根本没让它判
+
+**现象**：用户对着设备说"一二三四五六。"，转写正确却标成 `unknown`；面板声纹
+`verdict=unknown, score≈0.2, speech_ratio=0`。
+
+**根因（两层）**：
+
+1. 设备端 `voice_likelihood` 只有 **0.21**（用户小声/设备在侧，S3 更多判成 NOISY）；
+2. 上位机 `voiceprint.feed()` 只在"S3 帧 event=speech 且 voice_likelihood ≥0.6"时给
+   worker 发 `speech_active=true`。于是 worker 每个窗的 `speech_ratio=0`，在**比较分数之前**
+   就直接回 unknown——WavLM 其实没参与判定。
+
+**证据**：把 `seg1035.wav` 原样离线喂给同一个 worker（`speech_active=true`）：
+第一个窗 score 0.33，随后 **0.9527 → self**。声纹认得用户，是活动门把它锁死了。
+
+**决定（不换模型/不降阈值）**：给 `voiceprint.feed()` 加**能量活动兜底**：
+
+- 每块算 RMS（dBFS），维护近 20 s 的 20 分位本底；
+- 块能量 ≥ 本底 +6 dB 且 > -48 dBFS 也算 `speech_active`（与 S3 判据取 OR）；
+- 能量只决定"这个窗值不值得判"，self/other 仍由 WavLM 的 cosine（阈值 0.80）决定；
+- 快照暴露 `energy_floor_dbfs` 与 `activity_chunks` 便于现场诊断。
+
+**验证**：同一条 seg1035 端到端经 `VoiceprintService`：`activity_chunks=5`、
+`speech_ratio=1.0`、连续 `self`（0.8197 / 0.8914 / 0.9693 / 0.9527），最终 `verdict=self`。
+单测 74 组 / 7774 条通过。
+
+**边界**：S3 自己的 `voice_likelihood` 偏低还在，它影响的是设备端环境声意图与候选段触发；
+声纹标签这一层已解耦。若后续要更早触发对话，应调设备侧判据或让 host 把能量证据回传，
+而不是继续加高声纹阈值。
+
+**文件**：`tools/host/voiceprint.py`、`tools/host/tests/test_host.py`。
+
+
+---
+
+## D45 · 2026-10-22 说话人归属按句子聚合 + 工作台把 ASR 与判定窗口拆开
+
+**背景**：D44 只修了"声纹活动门"，用户复测仍看到"我明明在说，却出现 unknown/other"，
+并指出：① 之前的版本感觉是成功的，优化后反而不成功；② 面板内容太多，ASR 和判断窗口
+混在一起。
+
+**查证**：
+
+- `_speaker_segments` 自 `e96b309`（2026-10-21）之后没有改过——不是这条代码被"优化坏了"；
+- 保存的 13 个训练会话里，ASR 轮次约 1580 条，`self` 标签只有 6 条（112211 会话 4 条、
+  143224 会话 2 条）——不存在"之前大规模分清"的记录可对照；
+- 离线重放已知本人段（1035/1036/794/795）：**干净自说窗 0.89–0.97（self）**；同一段里
+  大量窗口是电视/旁人/静音（中位 0.46），旧逻辑按 0.75 s 片切标签，同一句被切成
+  `self`+`unknown`/`other`。
+
+**决定**：
+
+1. **归属聚合（`_speaker_segments`）**：保留逐片声纹判定（窗口中点落在片内才投票，
+   self/other 冲突或缺失→unknown），再做**边界平滑**：短 unknown 片如果只挨着一侧明确
+   身份，就并入那一侧；self 与 other 相邻的 unknown 保持 unknown（未解决边界不猜）。
+   只改归属、不改 WavLM 阈值。一句话不再被 1.5 s 窗边界切碎。
+2. **UI 拆分（`web/index.html`）**：LLM 工作台分成两块——「ASR 转写（按轮次）」只放
+   转写文本与说话人；「判定窗口（声纹/语音证据）」放声纹窗分数、语音证据、增益和过滤
+   原因。判定/LLM 上下文/录音边界/总结收进 `<details>` 折叠，去掉重复的"最近转写"块；
+   ASR 通过率统计移到转写区顶部。
+3. **不改的东西**：混音轮次（电视+用户同时说话）仍可能判错——单麦没有分离能力；
+   这属于 D28/D31 的物理边界，不能用调阈值假装解决。
+
+**验证（离线 A/B，同一批假窗 + 真录音）**：1035 的 self 段从 3.0 s → 3.7 s（尾部
+unknown 并回）；1036 从 0.8 s → 1.0 s；电视段 779/782/786 保持 other，没有新增 self。
+上位机自测 **75 组 / 7779 条**通过；渲染检查 58/0。
+
+**文件**：`tools/host/assistant.py`、`tools/host/web/index.html`、`tools/host/tests/test_host.py`。
+
+## D46 · 2026-10-22 混合环境识别：情境模型从 argmax 单标签升级为 top1+top2+混合标志
+
+**背景**：端侧九分类情境模型（v0.2-s3）上报时只取 argmax + top1 分数。但环境音多数时候
+是**混合**的（近处人声+嘈杂人声、街道声+持续噪声……），argmax 会把第二名藏掉：near_voice
+0.62 / babble 0.21 的窗在面板上看起来和 0.93 的纯窗一样"确定"，混合成分无法显示、无法
+度量、进不了日志与 LLM 上下文。
+
+**决定**：
+
+1. **端侧上报 softmax 分布的前两名 + 混合标志**（`main/context_window.hpp::softmax_probs`、
+   `ContextResult` 的 `top2_index/top2_score/mixed`）：`mixed = top2_score ≥ 0.20`
+   （第二名至少占 1/5；9 类均匀分布 top2≈0.111 不会误判混合）。串口追加
+   `context_top2/context_top2_score/context_mixed` 三个可选键，**不涨 schema**（先例
+   voiceprint_*）；valid=false 时报占位 unknown/0.0/false，与 context 组同构。
+2. **协议/面板/日志全链路显式建模混合**：host 解析三键并校验（成组、top2 在 9 类内、
+   分数∈[0,1]、top2≠top1）；面板情境卡显示"near_voice 62% ＋ babble 21%（混合）"；
+   变更日志带"混合 xxx 0.21"；模拟源 VOICE/LOUD 给混合窗（top2 0.21/0.24），
+   QUIET/NOISY 保持单类；设备屏幕感知卡标题在混合时显示"感知 0.62+0.21"。
+3. **修一处既有断层**：`__main__.py::current_scene()` 一直读 `context.class_name`（str
+   没有该属性，恒为空），九分类从没进过 LLM/账本的场景名——修正为直接读 `frame.context`，
+   混合时场景名带"（混合：xxx）"，否则退回环境四分类。
+4. **决策仍不读九分类**（Round 2 纪律不变）：混合信息只做遥测/显示/入账；决策层的混合
+   处理（人声+噪声连续掩蔽）仍是 D41 的 voice 置信度连续缩放，不受本轮影响。九分类
+   接入决策是 Round 3，届时分布信息（而不是 argmax）就是门槛判据的输入。
+
+**验证**：C++ 单测 11 套全过（context_window_test 新增 softmax 数值稳定/次序/阈值语义）；
+上位机自测 **83 组 / 7873 条**；渲染检查 43/0（含混合窗断言）。
+
+**文件**：`main/{context_window.hpp,controller.hpp,app_main.cpp,demo_ui.cpp}`、
+`tools/host/{protocol.py,state.py,simulating.py,__main__.py,web/index.html}`、
+`test/context_window_test.cpp`、`tools/host/tests/{test_host.py,render_check.js}`。
+
+## D47 · 2026-10-23 双麦取数：I2S 开 STEREO，两路统计随帧上报（只遥测，不改决策）
+
+**背景**：用户指出"远/近这个概念应该有处理"并拍板"应该使用双麦"。此前（D47 前）固件
+I2S 只开 MONO、`format.channel=1`，而 CoreS3 板载双麦（ES7210，驱动默认 mic_select =
+MIC1|MIC2）——第二路麦的采样一直**被采集链路丢弃**。本轮只做取数，不做判据。
+
+**事实与物理口径（先查证）**：
+
+- 硬件：CoreS3 板载双麦，ES7210 是 4 通道 ADC（`docs/goals.md`；`managed_components/`
+  esp_codec_dev 的 `es7210.c` 默认 `ES7210_INPUT_MIC1 | ES7210_INPUT_MIC2`，两路在标准
+  I2S 的 L/R 槽）。
+- 两路是同一次 I2S 采样的 L/R 槽：样本对齐、无时差；麦间距约 1–2 cm。
+- 期望区分度（**待真机验证，未定阈值**）：近场声源（嘴对设备）→ 两路电平差大、
+  帧内 Pearson 相关低；远场/混响/电视 → 电平差 ≈ 0、相关高。精确方向（DOA）不做
+  （D36 边界不变，1–2 cm 间距的角度分辨率不足）。
+
+**决定**：
+
+1. **采集双路化**：`I2S_SLOT_MODE_STEREO`、`format.channel=2`；staging 单位改为交织
+   样本（容量 8×512×2）；读字节数 `want×2×2B`。
+2. **下游零行为变化**：分析窗口只存 L 路（偶数下标）；降采样/中继/录音先抽 L 路
+   （`mono_block`）再喂 decimator。主判据、EQ、对话、中继全部与单麦完全一致。
+3. **帧级双麦统计（`main/dual_mic.hpp`，纯函数、可主机单测）**：逐块喂交织数据 →
+   `finish()` 出 `{left_dbfs, right_dbfs, diff_db = L−R, coherence(Pearson r ∈ [-1,1]),
+   valid}`。串口追加 `mic2_broadband_dbfs / mic_diff_db / mic_coherence / mic2_valid`
+   四个可选键（不涨 schema）；`mic2_valid=false` 时报 -120/0/0。
+4. **host**：protocol 解析+校验（四键一组、dbfs≤0、|diff|≤80、r∈[-1,1]）；面板环境卡
+   显示"双麦 差x.x dB · 相关0.xx"；模拟源 VOICE=近场（差2.4 dB、相关0.35）、其余
+   环境=远场（差0.1、相关0.95）。
+5. **判据不接**：D47 结束条件是拿到真机三态数据（近场说话/远场/安静）并评估区分度；
+   接对话预判 evidence 是下一步，阈值必须用这批数据标定。
+
+**验证**：C++ 单测 **12/12**（新增 dual_mic_test：同相 r≈1、反相 r≈−1、半幅差 +6.02 dB、
+独立噪声 |r|<0.25、静音地板、reset/空累加器）；host 自测 **86 组 / 7907 条**；渲染
+45/0。**已刷机真机跑通**：mic2_valid 全 true，安静房间（远场）diff ≈ 0.1–1.0 dB、
+coherence 0.87–0.99（两路近似一致，符合远场预期）；近场样本待采。
+
+**踩坑（已记录根因）**：初版真机 mic2_valid 恒 false——`controller.update()` 的遥测搬运段
+漏搬 mic2 字段（AnalysisFrame→EarbudCommand），统计算好了但没进 command。用临时诊断键
+`dual_acc_frames`（报 2560）定位后修复并删除诊断。
+
+**文件**：`main/{dual_mic.hpp(新),controller.hpp,app_main.cpp}`、
+`test/{dual_mic_test.cpp(新),CMakeLists.txt}`、
+`tools/host/{protocol.py,state.py,simulating.py,web/index.html}`、
+`tools/host/tests/{test_host.py,render_check.js}`。

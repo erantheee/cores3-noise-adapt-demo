@@ -1,6 +1,6 @@
 # AI OWS 耳机仓综合体验 Demo
 
-本项目用 **CoreS3 = AI OWS 耳机仓、Mac = 播放器与原型执行器、AirPods Pro = 本次耳机**，
+本项目用 **CoreS3 = AI OWS 耳机仓、Mac = 播放器与原型执行器、耳机 = OWS 耳夹 + TWS 对照（自动识别）**，
 验证端侧 AI 根据环境、时间、个人历史和用户纠正做出的综合听音决策是否真的有用。
 
 唯一产品口径见 [`docs/product-alignment.md`](docs/product-alignment.md)。功能、UI 和对外表述都必须与它一致。
@@ -21,27 +21,126 @@ CoreS3 双麦克风 → 24频段环境分析 → 对话开始预判 → 端侧�
                                                            ↓
                                                   EarbudCommand v4
                                                            ↓ USB
-                             Mac：歌曲 EQ / 媒体下压 / AirPods 聆听模式 → AirPods Pro
+                             Mac：歌曲 EQ / 媒体下压 / 环境声（中继） → 当前耳机（自动识别 OWS / TWS）
                                                            ↑
                              Mac：候选人声 → 语音证据门控 → Qwen3-ASR → LLM 语义判定
                                   （D34：端侧先开，ASR/LLM 只做迟到否决；D33 负责噪声门控）
 ```
 
-**对话感知是预判式的（D16）**：附近有人开口的那一刻就先压低媒体，确认对话成立后把
-`ambient_open=true` 意图发给 Mac 并**立即执行**（D34：快路径完全在端侧，约 0.2–0.3 s）；
-ASR/LLM 只在这之后给出迟到的语义否决/确认，不进入首次响应路径。**当前 demo 走 S3 麦克风中继**（S3 麦 → Mac → 耳机，
-固有时延约 211–231 ms，先把预判与开关跑通）；后续再拓展成 AirPods 通透模式。对话结束后
+**对话感知是预判式的（D16/D40）**：附近有人持续开口就先压低媒体（连续证据 **0.5 s** 预下压
+70%，**0.8 s** 确认后压到 60%），确认对话成立后把 `ambient_open=true` 意图发给 Mac 并
+**立即执行**——快路径完全在端侧，**首响约 0.5 s、确认约 0.8 s**（D40 按现场噪声实测把
+旧的"第一拍就压 0.2–0.3 s"改成持续证据门槛：现场 speech-like 噪声连续段 p50 110 ms、
+最长 640 ms，第一拍阈值会把它们积分成常驻对话）；ASR/LLM 只在这之后给出迟到的语义
+否决/确认，不进入首次响应路径。**当前 demo 走 S3 麦克风中继**（S3 麦 → Mac → 耳机，
+AirPods Pro 约 211–231 ms、Xiaomi 耳夹约 385–405 ms（2026-10-21 实测），先把预判与开关跑通）；
+TWS 时可拓展成 AirPods 通透模式。对话结束后
 恢复媒体与关闭环境声。**不是**"检测到佩戴者说话才下压"——旧实现只能事后反应，方向已改。
 
-CoreS3 承担耳机仓侧的感知、判断与决策；Mac 承担本次 Demo 的音频执行；AirPods Pro 只播放 Mac
-最终输出。AirPods 不开放双耳原始麦克风与目标人声增益接口，所以当前不能声称使用 AirPods 麦克风
-完成了目标人声增强；环境声只通过切换聆听模式（通透）实现，不是目标人声提取。真实执行链路尚未
-接通时，协议固定上报 `execution: decision_only`。
+CoreS3 承担耳机仓侧的感知、判断与决策；Mac 承担本次 Demo 的音频执行；耳机只播放 Mac 最终
+输出。**2026-10-21 起同一版本自动识别两副耳机：OWS 耳夹（Xiaomi 耳夹式耳机）与 TWS 对照
+（AirPods Pro），Mac 的默认输出是哪副就认哪副（D35/D36）**。耳机厂商接口不开放双耳原始麦克风
+与目标人声增益接口，所以当前不能声称使用耳机麦克风完成了目标人声增强；TWS 时环境声可通过
+切换聆听模式（通透）实现，OWS 耳夹本身开放，这条动作退化为中继/下压。真实执行链路尚未接通时，
+协议固定上报 `execution: decision_only`。
+
+## 2026-10-22 demo：背景人声改成"掩蔽"（D41）
+
+现场把场景拆成三种：**背景无关人说话（压根不想听）／有人跟我说、简单回两句／有人跟我说长段
+的话**。原 D16 的"附近有人开口先下压 + 开环境声"和 D26 的"背景说话抬中频"在第一种场景里
+方向是反的：压音乐让人声更突出、开环境声等于放大不想听的声音。
+
+**本轮只改动作、不改触发**：
+
+- `EXTERNAL_VOICE_INTENT` 从"人声靠前"改为**掩蔽**：背景人声时音乐全频段 +1 dB、
+  1–4 kHz 抬到设备单段上限 +4 dB；Mac 默认 2.5× 深度后语音段有效约 **+8 dB**。
+- **不压媒体、不开环境声**；对话成立仍走 flat + 下压（D40 的 0.5 s 预览 / 0.8 s 确认不变）。
+- 面板卡片改名「掩蔽推量（背景人声）」，并写明 **掩蔽 ≠ 降噪 ≠ 人声增强**。
+- 真机/单测：`test/controller_test.cpp` 锁定"语音段 ≥3 dB、全频段 ≥0.8 dB"；C++ 12 套通过（2026-10-23 实测 12/12）。
+
+**代价与边界**：会改音色、可能顶爆（本 demo 不装限幅器）；OWS 物理上不隔音，掩蔽只能降低
+背景人声的可懂度，不能消除。产品三态（ignore / exchange / conversation）仍待 own-voice 证据。
+
+**同日追加（D42）环境声执行门**：掩蔽生效后，背景人声仍会把 S3 的 `ambient_open` 快路径顶开
+约 2 s（LLM 迟到否决来不及）。Mac 执行端新增 `--ambient-gate off|llm|voice`：
+
+- `voice`（演示默认，配合 `--voiceprint`）：voiceprint 判 `self`（你接话）或 LLM 确认对话
+  才执行；背景人声只显示意图、不执行。触发后门栓保持到 S3 意图消失 2.5 s。
+- `llm`：只认 LLM 确认，更稳更慢；`off`：旧行为。
+- self 判定在 voice 门下不回传 S3（否则 D31 self-veto 会把对话关掉）。
+- **媒体下压也走同一道门**：没接话/没被 LLM 确认之前媒体保持 100%，背景视频/旁人说话不会
+  再把歌压小；`--ambient-gate off` 恢复旧的预测式下压。
+- 真机验证：背景人声帧为 `EXTERNAL_VOICE_INTENT`、`ambient_open=false`、`opens=0`；
+  S3 报 75/86/94% 下压时播放器保持 100%。
+
+**同日追加（D44）说话人标签 unknown 修复**：设备端 `voice_likelihood` 只有 0.21 时，
+host 不再给声纹 worker 发 `speech_active=true`，worker 的 `speech_ratio=0` 会在比对分数前
+直接回 unknown。现在声纹加能量兜底（块 RMS 高于近 20 s 本底 +6 dB 也算说话），阈值不动；
+同一条真声段端到端复测从 unknown 变连续 `self`（0.82–0.97）。
+
+**同日追加（D43）转写可读性**：面板保留 24 段对话账本；短应答（"对啊/是的/行吧…"）不再被
+当语气词丢掉；VAD 合并间隔放宽到 0.5 s 减少半句碎片；每段 ASR 延迟与"通过/跳过/过滤"进
+`asr_stats`，面板顶部直接显示（例：通过 2/15 · 跳过 3 · 过滤 10 · ASR p50 400 ms）。
+
+## 2026-10-21 深夜：调音重做 + 对话确认改成"持续证据"（D39/D40）
+
+用户现场反馈"环境很嘈杂，但调音一般般；不是拉爆，是该凸显的没凸显"。只读采样 + 离线复刻
+（`work/eq-design/`、`work/diagnosis/`）确认这是两个问题叠在一起：
+
+- **旧 EQ 公式是噪声谱复读机**：它按"每段噪声有多响"抬增益，没有内容先验。现场低频谱下
+  24 段建议最大只有 **0.34 dB**（×2.5 复合 ≤0.7 dB），1–4 kHz 恒 0；而且结构上不能出负值。
+- **现场 87–95% 的时间根本没进调音**：断续的 speech-like 噪声（连续段 p50 110 ms、
+  最长 640 ms）被旧的"200 ms 确认 + 连续 2 帧续命"积分成常驻对话 → 一直 `FLAT + media 60%`。
+
+本轮改动（已烧机、真机复验）：
+
+- **歌曲 EQ 改成有符号内容曲线** `g[b] = clamp(C[b]·N·(1−k[b]·D[b]), −4, +4)`：低频 +
+  人声 presence + 空气感为正，346–842 Hz 去糊为负；`N` 是噪声暴露（越吵越动作），
+  `D` 是该段被噪声主导程度（被噪声占满的段不猛抬，去糊段不受抑制）。面板/协议/播放器
+  支持负值（0 dB 零线，正上负下）；`safety_hold` 只保留削减、禁止抬升；风场景只压正增益。
+- **对话确认改成持续证据**（D40）：0.5 s 连续证据才预下压、0.8 s 才确认；engaged 续命
+  也要 0.8 s 连续证据；releasing 里重新出现证据要重新确认。现场噪声连续段最长 640 ms，
+  因此不再触发/维持对话态。
+- **模式路由改用 250 ms 平滑电平**：键盘/拍桌的单帧瞬态不再把 NOISY↔LOUD 来回切。
+
+**真机复验（2026-10-21 18:4x，同一嘈杂现场）**：从 `media=60%、FLAT 87–95%` 变成
+`media=100%、SONG_EQ ≈84%、EXTERNAL_VOICE_INTENT ≈5%、不再开环境声`；SONG_EQ 下设备建议
+低频 +1.4、去糊 −1.2、presence +1.6、空气 +1.8 dB，Mac applied（×2.5）低频 +3.7/+3.9、
+去糊 −3.2、presence +2.7…+4.0、空气 +4.7 dB。A/B 试听素材在
+`work/eq-design/audition/`（a=原片 / b=旧公式 / c=新×2.5 / d=新×4.0）。
+
+**代价**：真实对话的首次动作从约 0.2 s 变成 0.5 s 预下压 / 0.8 s 确认（旧口径作废）。
+**待验收**：真人对话的首响延迟与误判率（TODOS）；LLM 迟到否决回写 S3 快路径仍未实现。
+
+## 2026-10-21 晚：耳机升级为 TWS/OWS 双设备兼容（D35/D36）
+
+demo 的叙事是「AI OWS 耳机仓」。当晚先把 OWS 耳夹（Xiaomi 耳夹式耳机）接进链路，随后按
+"同一版本也要能直接用 AirPods Pro"的要求改成**自动识别两副耳机**，不需要改启动参数：
+
+- **设备注册表**：默认 `Xiaomi=Xiaomi OWS`、`AirPods=AirPods Pro`，大小写不敏感子串匹配；
+  Mac 默认输出命中哪副，S3 路由页就显示那副的短名（ASCII：设备字库是 115 字子集）。
+  加新耳机用 `--earphone "型号名=显示名"`（可重复，覆盖默认列表；显示名必须 ASCII）。
+- **中继跟随系统默认输出**：`--relay-device` 默认为空，戴哪副就送到哪副；要固定某副再显式
+  传名字。当前默认输出不是已识别耳机（例如掉线落到 MacBook 扬声器）时，面板会报警。
+- **实测输出腿（2026-10-21）**：Xiaomi 耳夹驱动侧 **324.8 ms**（44.1 kHz，回调 11.6 +
+  设备延迟 313.2），中继总时延约 **385–405 ms**；AirPods Pro 仍是 170.7 ms / 总 211–231 ms。
+  两副都 ≥150 ms，**"自己的耳机更快"不成立**（A2 判据、D2 不变）。
+- **`--ambient-executor airpods` 仅 TWS 可用**：OWS 耳夹没有聆听模式，`ambient_open` 在 OWS 上
+  退为意图/遥测 + 中继门控；默认仍 `off`（D30）。
+- **EQ 结论分设备**：开放式低频泄漏会让 24 段歌曲 EQ 的低频段听感收益打折；执行逻辑不变，
+  「有没有用」的结论必须分 TWS/OWS。
+- **播放器要扛住"换耳机"（D37）**：AVAudioEngine 在默认输出被换掉后会"假运行"——状态显示
+  在播、位置恒 0、没有声音。播放器现在监听设备配置变化，重启引擎并从最后已知位置继续；
+  面板的 `recoveries` 计数能看出恢复路径被触发过几次。
+- **用户记忆（D38）**：LLM 的上下文不再只活在内存——判定、环境声开关、纠正事件落盘到
+  `记录/memo/`（rolling 事件 + `sessions.jsonl` 会话摘要 + 场景×时段 profile，7 天半衰期），
+  重启可恢复；每次 LLM 调用注入 ≤300 字弱先验（与本段证据冲突时以本段为准）。当前**只注入、
+  不直接进执行**；影子建议与受限执行的门槛见 D38。
 
 ## 2026-10-21 收尾变更（上一轮）
 
 - **环境声执行端默认关闭（D30）**：`host_up.sh` 真机默认 `--ambient-executor off`，只显示
-  `ambient_open` 意图；要环境声必须显式传 `--ambient-executor relay` 或 `airpods`。
+  `ambient_open` 意图；要环境声必须显式传 `--ambient-executor relay`（`airpods` 仅 TWS 对照）。
 - **声纹 self-veto（D28 第 3 步 / D31）**：Mac 侧 WavLM-SV 判定经串口回传给 S3
   （`voiceprint self` / `other` / `pending`；host 退出时发 `off`）。`self` → 不压媒体、不抬人声 EQ、不开环境声；
   `other` → 按 D16 的预判逻辑正常动作。判定 **3 秒**没有新行就自动过期，不再永久锁死；
@@ -161,14 +260,14 @@ CoreS3 承担耳机仓侧的感知、判断与决策；Mac 承担本次 Demo 的
 
 ## 屏幕（中文界面）
 
-- 第一页是 S3 环境与决策；左滑进入第二页查看 Mac→AirPods Pro 路由
+- 第一页是 S3 环境与决策；左滑进入第二页查看 Mac→耳机 路由
 - `环境`：安静 / 噪声 / 人声嘈杂 / 高噪声
 - `当前动作`：保持 / 歌曲调音 / 现实人声增益意图 / 安全保持
 - `人声状态`：`NONE / SPEECH / LIKELY`；只是 S3 麦克风启发式，不是身份识别
-- `调音`：`SONG_EQ` 的 24 段建议；现实人声模式下保持歌曲 EQ 平直
+- `调音`：`SONG_EQ` 的 24 段**有符号**建议（正=抬、负=削，D39）；现实人声模式下保持歌曲 EQ 平直
 - `人声增益`：现实中对方说话的增益意图，硬上限 +6.5 dB
 - `控制链路`：Mac 串口是否真实连接
-- 第二页显示 `AirPods Pro`、Mac 控制通道和 Mac 回报的蓝牙输出状态
+- 第二页显示耳机名（自动识别，默认 `Xiaomi OWS` / `AirPods Pro`，`--earphone` 可配）、Mac 控制通道和 Mac 回报的蓝牙输出状态
 - 底部信息行：麦克风正常/异常、处理耗时与剩余内存
 - 底部那行右侧：声音事件类别（ASCII 的 `keyboard / wind / speech / artifact / quiet`，
   窗口没攒满时显示 `--`）；事件同时进串口与上位机面板
@@ -199,21 +298,23 @@ v4 = `ambient_open`（环境声开放意图）。`event` / `event_valid`（端�
 「环境声」卡上单独显示；没有执行端时意图仍然可见，不允许把意图写成已执行。
 
 **2026-10-21 起（D34，取代 D32 的"授权才开"）**：执行端**立即**执行 S3 的
-`ambient_open` 意图（端侧快路径，约 0.2–0.3 s）；Mac 同时把候选段送 Qwen3-ASR + LLM，
+`ambient_open` 意图（端侧快路径按 D40：连续证据 0.5 s 预下压、0.8 s 确认）；Mac 同时把候选段送 Qwen3-ASR + LLM，
 LLM 只有**迟到的否决权**：新鲜 `dialogue=no` 会关闭已经打开的环境声，`yes` 确认，
 `unclear` 不阻塞，本地"无有效语音"也可以否决。面板把 **S3 意图 / LLM 判定 / 环境声授权 /
 执行端状态** 分成四行，并显示快路径/迟到否决的时间。**仍然不允许把"LLM 判定"写成
 "已经执行"。** LLM 未配置时退回设备意图 + 声纹门控。
 
-没有 Mac 执行回执前，`execution` 必须保持 `decision_only`。`eq_gain_db` 按模式区分（D26）：
+没有 Mac 执行回执前，`execution` 必须保持 `decision_only`。`eq_gain_db` 按模式区分（D26/D39）：
 **对话成立 / 声纹判定 self** 时保持平直（下压媒体、不抬歌曲中频）；**背景或别人说话但还没构成
-对话**（`EXTERNAL_VOICE_INTENT`）允许抬 8–16 段（约 1–3.6 kHz）作为代理；**`SONG_EQ`** 按
-环境谱写稳态噪声 EQ；风时低频抬升压到 1/4。不能把"抬歌曲中频"写成"现实人声已增强"。
+对话**（`EXTERNAL_VOICE_INTENT`）走**掩蔽**：全频段 +1 dB、1–4 kHz 抬到单段上限（D41，不是
+人声增强）；**`SONG_EQ`** 用有符号
+内容曲线（低频/人声 presence/空气为正，346–842 Hz 去糊为负）；`SAFETY_HOLD` 只保留削减；
+风时低频**正**增益压到 1/4。不能把"抬歌曲中频"写成"现实人声已增强"。
 
-`eq_gain_db` 是 S3 给 Mac 的歌曲 EQ 建议，`ambient_band_dbfs` 是
+`eq_gain_db` 是 S3 给 Mac 的歌曲 EQ 建议（**有符号**：负值=削减，D39），`ambient_band_dbfs` 是
 S3 实测环境谱。**Mac 目前只按 S3 的逐段建议 × 深度倍率执行，没有做歌曲内容分析**——"结合歌曲
-内容生成最终处方"是计划，不是现状；面板上必须按这个口径显示。`external_voice_gain_db` 是现实
-人声增益意图，不代表 AirPods 已执行。
+内容生成最终处方"是计划，不是现状；面板上必须按这个口径显示。`external_voice_gain_db` 是掩蔽
+推量（意图遥测）：它驱动的是**歌曲掩蔽**，不是现实人声增益，也不代表耳机已执行（D41）。
 
 v4 还带判据遥测：`broadband_dbfs` / `voice_likelihood` / `vocal_ratio` / `spectral_flatness` /
 `vocal_peakiness` / `excited_vocal_bands`；2026-10-21 又追加了声纹回显
@@ -274,9 +375,10 @@ v4 还带判据遥测：`broadband_dbfs` / `voice_likelihood` / `vocal_ratio` / 
 
 判据回答的是"像不像人声"；**触发对话感知的不是它**。总目标是"预判我即将跟别人讲话"，所以：
 
-- 触发输入是 `conversation_cue`：附近有人开口 + 近场电平门（-58…-42 dBFS）。第一拍进入
-  `anticipating`，媒体立刻预下压（70%）；**不依赖佩戴者开口**。
-- 证据持续 200 ms 进入 `engaged`：媒体压到 60%，同时把 `ambient_open=true` 发给 Mac。
+- 触发输入是 `conversation_cue`：附近有人开口 + 近场电平门（-58…-42 dBFS）。**连续证据
+  0.5 s** 进入 `anticipating`，媒体预下压（70%）；**不依赖佩戴者开口**（D40）。
+- **连续证据 0.8 s** 进入 `engaged`：媒体压到 60%，同时把 `ambient_open=true` 发给 Mac。
+  断续背景噪声（现场连续段 p50 110 ms、最长 640 ms）不会触发，也不会把已结束的对话续命。
 - 最后一个人声后 2.5 s 无声 → 恢复媒体、关闭环境声；短促声退回 `idle`，环境声不为咳嗽切换。
 - 旧的"自身语音是唯一触发输入"已删除（它只能事后反应）；`own_voice` 只保留为可选确认。
 
@@ -334,9 +436,9 @@ idf.py -p /dev/cu.usbmodemXXX flash monitor
 `main/controller.cpp` 刻意不依赖 ESP-IDF，所以整条决策路径可以在开发机上秒级验证。
 **新增判据或阈值时必须在这里补用例。**
 
-当前 **11 个套件、365 条断言**（2026-10-21 定稿实测全部通过；明细：controller 80、
-noise_analyzer 46、latency_profiler 40、mic_capture 16、mic_decimator 15、voiceprint_gate 60、
-context_window 23、conversation_awareness 38、bone_voice 19、sound_event 25、speech_gate 3）。
+当前 **12 个套件**（2026-10-23 实测 12/12 全部通过；断言条数随用例变化，以 `ctest` 输出为准。
+套件：controller、noise_analyzer、latency_profiler、mic_capture、mic_decimator、voiceprint_gate、
+context_window、conversation_awareness、bone_voice、sound_event、speech_gate、dual_mic（D47 新增））。
 
 `context_window` 是融合第二轮加的：它拿 `experiments/listening-model/scripts/features.py`
 （训练那一侧的权威实现）在固定配方上的输出当金标准，逐维比对固件里的 92 维窗口构造。
@@ -360,8 +462,8 @@ CI 里这一步跑在固件构建**之前**（[`.github/workflows/build.yml`](.g
 上位机（`tools/host/`）另有一套自己的自测，同样是纯 Python、秒级、不需要设备：
 
 ```bash
-python3 tools/host/tests/test_host.py            # 70 组、7728 条断言（连跑 3 次稳定）
-node tools/host/tests/render_check.js <快照.json> # 可选：用 DOM 桩真跑一遍界面渲染（49 条通过、0 条失败，条数随快照内容略变）
+python3 tools/host/tests/test_host.py            # 88 组、7914 条断言（2026-10-23 实测，连跑稳定）
+node tools/host/tests/render_check.js <快照.json> # 可选：用 DOM 桩真跑一遍界面渲染（80 条通过、0 条失败，条数随快照内容略变）
 ```
 
 `render_check.js` 存在的原因很具体：这台机器上无头浏览器拿不到显示器，系统也不允许截屏，
@@ -444,16 +546,16 @@ python3 tools/voice_separability.py --enroll 甲A.wav 甲B.wav 甲C.wav \
 
 ```bash
 sh tools/host_up.sh                    # 真机（自动找 /dev/cu.usbmodem*）
-sh tools/host_up.sh --relay-audio      # S3 麦克风实时中继到 AirPods（可 --relay-device 改目标）
+sh tools/host_up.sh --relay-audio      # S3 麦克风实时中继到当前耳机（可 --relay-device 改目标）
 sh tools/host_up.sh --ambient-executor relay  # S3 的 ambient_open 意图 → S3 麦克风中继到耳机（当前玩法）
-sh tools/host_up.sh --ambient-executor airpods  # 后续：切 AirPods 通透模式
+sh tools/host_up.sh --ambient-executor airpods  # 仅 TWS 对照：切 AirPods 通透模式
 sh tools/host_up.sh --mock             # 没有设备也能先把界面跑起来
 sh tools/host_up.sh --replay 记录/x.log --speed 4    # 回放历史日志
 # 然后打开 http://127.0.0.1:8787/
 ```
 
 `--relay-audio` 会自动让设备进入无限时长采集，把 16 kHz 单声道 PCM 送给 Mac，再由 Mac
-播放到**指定设备**（默认 `AirPods Pro`，`--relay-device` 可改）。固件以 20 ms 小包发送。
+播放到**指定设备**（默认 `Xiaomi`，`--relay-device` 可改）。固件以 20 ms 小包发送。
 中继期间同一份麦克风流仍进入环境分析，所以 VAD、歌曲 EQ 和现实人声意图不会因为开始中继而
 冻结。
 
@@ -466,7 +568,7 @@ sh tools/host_up.sh --replay 记录/x.log --speed 4    # 回放历史日志
 | 播放到哪 | 跟随系统默认输出（跳到扬声器也不说） | 用 AUHAL 钉住名字匹配的设备，**不改系统默认输出** |
 | 延迟上限 | 靠上位机的虚拟时钟猜（100 ms，猜错就永久留着） | `--relay-target-ms`（默认 60 ms），超限丢**来不及播的那一块** |
 
-**实测（2026-10-15，固件 20 ms 分包，AirPods Pro，设备连续中继 50 秒）：**
+**实测 A：AirPods Pro 对照（2026-10-15，固件 20 ms 分包，设备连续中继 50 秒）：**
 
 | 项 | 值 | 出处 |
 |---|---|---|
@@ -476,9 +578,19 @@ sh tools/host_up.sh --replay 记录/x.log --speed 4    # 回放历史日志
 | 设备侧打包 + USB | 约 20 ms + 未单独测 | 固件 320 点一块（设备自报 `decimated/chunks = 320.1`） |
 | 丢弃 | **0 ms / 50 秒**；启动排空 0 ms | `dropped_ms` / `drained_ms` |
 
-**这个 211–231 ms 是这条拓扑的物理下限，不是调参调出来的**：其中 170.7 ms 是蓝牙输出，
-`relaysink` 只占 40–60 ms，设备侧 20 ms。要更小只能换拓扑（见 D2：混合必须发生在出声的那台
-设备上）。面板上这一格同时写着"不含设备侧打包与 USB"，不许把它当成整条链路的全部。
+**实测 B：Xiaomi 耳夹（2026-10-21，`tools/host/output_latency.swift`，当前系统默认输出）：**
+
+| 项 | 值 | 出处 |
+|---|---|---|
+| 驱动侧输出（蓝牙，44.1 kHz） | **324.8 ms** | `driver_ms`：回调缓冲 512 帧 11.6 + 设备延迟 13812 帧 313.2 + 安全/流 0 |
+| 中继排队（同拓扑） | 40–60 ms | `queued_ms` |
+| **合计：进播放端 → 耳机出声** | **约 385–405 ms** | 40–60 + 324.8 + 设备侧约 20 |
+
+**这两组时延都是拓扑决定的物理下限，不是调参调出来的**：AirPods Pro 的 211–231 ms 里
+170.7 ms 是蓝牙输出，`relaysink` 只占 40–60 ms；Xiaomi 耳夹的驱动侧就 324.8 ms（A2DP
+44.1 kHz），换成它之后中继总时延约 385–405 ms——**戴哪副耳机，延迟差约 170 ms**。
+要更小只能换拓扑（见 D2：混合必须发生在出声的那台设备上）。面板上这一格同时写着
+"不含设备侧打包与 USB"，不许把它当成整条链路的全部。
 
 **不许把「测不到」显示成「延迟为 0」**：`--relay-player ffplay` 那条路保留着只为 A/B 对比，
 面板对它会写明"测不到"。
@@ -591,8 +703,8 @@ sh tools/host_up.sh               # 起上位机时会自动带起播放器（--
 
 | 曲线 | 含义 |
 |---|---|
-| 蓝线（调音卡片） | **S3 报的原始建议**（24 段由设备实测下发；只有缺 `eq_gain_db` 的旧固件才标"推导"） |
-| 绿柱（Mac 实际应用卡片） | **Mac 真正设进 EQ 的值** = S3 的逐段形状 × 处方深度（默认 2.5×，夹到 +10 dB） |
+| 蓝线（调音卡片） | **S3 报的原始建议**（24 段由设备实测下发，**有符号：正上负下**；只有缺 `eq_gain_db` 的旧固件才标"推导"） |
+| 绿柱（Mac 实际应用卡片） | **Mac 真正设进 EQ 的值** = S3 的逐段形状 × 处方深度（默认 2.5×，夹到 [-12, +10] dB） |
 
 形状永远来自 S3；**深度倍率是本机的演示参数，不是设备的建议**，面板上写明了这一点。
 产品策略上限是 +6.5 dB（`kMaxSpeechGainDb`），固件实发上限是 +8.0 dB（`kDemoSpeechGainDb`），
@@ -600,7 +712,7 @@ Mac 侧再放大也不越过用户既定规则的 +10 dB。
 
 **回执分三件事写，不许合成一句**：设备自报 `execution=decision_only`（它自己的视角）、
 Mac 的 `applied` / `idle` / `silent` / `bypass` / `unavailable`（有证据：
-24 段已设 + 引擎在跑 + 最近 2.5 秒实测有信号）、以及 **AirPods 是否已播放：无法验证**
+24 段已设 + 引擎在跑 + 最近 2.5 秒实测有信号）、以及 **耳机是否已播放：无法验证**
 （这条链路没有回执通路）。没在播放时回执就是 `idle`——决策已产生但没人执行，
 面板必须能看出这个差别。
 
@@ -621,8 +733,8 @@ Mac 的 `applied` / `idle` / `silent` / `bypass` / `unavailable`（有证据：
 ### 上位机自测
 
 ```bash
-python3 tools/host/tests/test_host.py      # 70 组、7728 条断言，不需要设备、不需要串口
-node tools/host/tests/render_check.js <快照.json>   # 用 DOM 桩真跑一遍 render()：49 条通过、0 条失败（条数随快照内容略变）
+python3 tools/host/tests/test_host.py      # 88 组、7914 条断言，不需要设备、不需要串口
+node tools/host/tests/render_check.js <快照.json>   # 用 DOM 桩真跑一遍 render()：80 条通过、0 条失败（条数随快照内容略变）
 ```
 
 它自带一份真机日志 `tools/host/tests/fixtures/device_real.log`（**2026-10-15 从当前固件重抓**：
