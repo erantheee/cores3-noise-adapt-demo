@@ -12,9 +12,12 @@ unknown / pending / stale / worker failure 一律关闭。
 
 from __future__ import annotations
 
+import array
 import base64
 import json
+import math
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -65,6 +68,9 @@ class VoiceprintService:
         self._latency_ms: float | None = None
         self._clips = 0
         self._dim = 0
+        #: 在线积累（2026-10-23）：高置信 self 窗口更新原型后的累计次数 / 来源文件。
+        self._learn_updates = 0
+        self._learned_from = ""
         self._updated_at: float | None = None
         self._fed_chunks = 0
         self._dropped_chunks = 0
@@ -72,6 +78,11 @@ class VoiceprintService:
         self._last_sent_verdict: str | None = None
         self._history: deque[dict] = deque(maxlen=120)
         self._stderr_tail: list[str] = []
+        #: 能量兜底：S3 的 voice_likelihood 对"近场但小声"会漏报（2026-10-22：用户
+        #: 对着说话时设备端只有 0.2，声纹 worker 于是永远收到 speech_active=false，
+        #: 哪怕 WavLM 对同一段音频的 self 相似度是 0.95）。这里用块 RMS 做第二证据。
+        self._energy_history: deque[float] = deque(maxlen=200)
+        self._activity_chunks = 0
 
     # ------------------------------------------------------------------ 生命周期
 
@@ -136,6 +147,27 @@ class VoiceprintService:
 
     # ------------------------------------------------------------------ 数据
 
+    @staticmethod
+    def _chunk_dbfs(chunk) -> float | None:
+        """块 RMS（dBFS）。上位机不依赖 numpy，16 kHz 单声道 int16 直接算。"""
+        raw = bytes(getattr(chunk, "pcm", b"") or b"")
+        raw = raw[: len(raw) - len(raw) % 2]
+        if len(raw) < 320:  # <20 ms 的碎片不参与判据
+            return None
+        samples = array.array("h")
+        samples.frombytes(raw)
+        if sys.byteorder != "little":
+            samples.byteswap()
+        rms = math.sqrt(sum(float(value) * value for value in samples) / len(samples))
+        return 20.0 * math.log10(max(rms, 1.0) / 32768.0)
+
+    def _energy_floor(self) -> float | None:
+        values = self._energy_history
+        if len(values) < 20:
+            return None
+        ordered = sorted(values)
+        return ordered[int(len(ordered) * 0.2)]
+
     def feed(self, chunk) -> None:
         """chunk 是 host.protocol.MicChunk（有 .pcm 和 .rate）。"""
         if not self._ready or self._process is None or self._process.stdin is None:
@@ -145,16 +177,31 @@ class VoiceprintService:
                 "rate": int(getattr(chunk, "rate", 16000)),
                 "pcm_base64": base64.b64encode(bytes(chunk.pcm)).decode("ascii"),
             }
+            speech_active = False
             if self.activity_provider is not None:
                 try:
                     frame = self.activity_provider()
-                    payload["speech_active"] = bool(
+                    speech_active = bool(
                         frame is not None
                         and getattr(frame, "event", None) == "speech"
                         and float(getattr(frame, "voice_likelihood", 0.0)) >= 0.6
                     )
                 except Exception:  # noqa: BLE001 - activity missing must fail closed
-                    payload["speech_active"] = False
+                    speech_active = False
+            # 第二证据：块能量显著高于近 20 s 本底（+6 dB）也算说话。
+            # S3 的 voice_likelihood 在"用户小声/设备在侧"时会漏；声纹判定本身
+            # 仍由 WavLM 的 cosine 决定，能量只决定"这个窗值不值得判"。
+            dbfs = self._chunk_dbfs(chunk)
+            if dbfs is not None:
+                with self._lock:
+                    self._energy_history.append(dbfs)
+                    floor = self._energy_floor()
+                if floor is not None and dbfs >= floor + 6.0 and dbfs > -48.0:
+                    speech_active = True
+                if speech_active:
+                    with self._lock:
+                        self._activity_chunks += 1
+            payload["speech_active"] = speech_active
             self._process.stdin.write(json.dumps(payload) + "\n")
             self._process.stdin.flush()
             with self._lock:
@@ -213,6 +260,8 @@ class VoiceprintService:
                 self._ready = True
                 self._clips = int(message.get("clips", 0))
                 self._dim = int(message.get("dim", 0))
+                self._learn_updates = int(message.get("learn_updates", 0))
+                self._learned_from = str(message.get("learned_from") or "")
                 self._error = ""
             elif kind == "verdict":
                 self._verdict = str(message.get("verdict"))
@@ -221,6 +270,8 @@ class VoiceprintService:
                 self._dbfs = message.get("dbfs")
                 self._speech_ratio = message.get("speech_ratio")
                 self._windows = int(message.get("windows", self._windows))
+                self._learn_updates = int(
+                    message.get("learn_updates", self._learn_updates))
                 self._latency_ms = message.get("latency_ms")
                 self._last_sent_verdict = self._verdict
                 start_sample = message.get("start_sample")
@@ -268,11 +319,18 @@ class VoiceprintService:
                 "windows": self._windows,
                 "clips": self._clips,
                 "dim": self._dim,
+                "learn_updates": self._learn_updates,
+                "learned_from": self._learned_from,
                 "latency_ms": self._latency_ms,
                 "fed_chunks": self._fed_chunks,
                 "dropped_windows": self._dropped_chunks,
                 "sent_verdicts": self._sent_verdicts,
                 "last_sent_verdict": self._last_sent_verdict,
+                "energy_floor_dbfs": (
+                    None if self._energy_floor() is None
+                    else round(self._energy_floor(), 1)
+                ),
+                "activity_chunks": self._activity_chunks,
                 "history": list(self._history),
                 "age_s": age,
                 "stderr_tail": list(self._stderr_tail),

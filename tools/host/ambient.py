@@ -1,5 +1,9 @@
 """环境声执行端：把固件的 `ambient_open` 意图落到 AirPods 聆听模式上。
 
+**2026-10-21（D35/D36）现状**：当前版本同时支持 OWS 耳夹（Xiaomi 耳夹式耳机）与 TWS 对照
+（AirPods Pro）。OWS 耳夹物理开放、没有聆听模式，因此本模块只在 TWS 时可用；OWS 下
+`ambient_open` 退为遥测 + 中继门控（见 `RelayAmbient`）。默认执行端仍是 off（D30）。
+
 分工：**S3 决定该不该让现实声音进来，Mac 负责执行**。设备本身没有"打开耳朵"的能力
 （AirPods 不开放通透 DSP 的控制接口），macOS 也没有公开 API 切聆听模式；兄弟工程
 `airpods-control` 的 `bin/airpods mode ...` 走辅助功能（AX）点控制中心声音面板，实测可用，

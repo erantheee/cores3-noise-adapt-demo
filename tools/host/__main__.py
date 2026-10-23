@@ -31,8 +31,16 @@ from .audio_relay import (
     AudioRelay,
     RelayError,
 )
-from .mac_audio import EXPECTED_TARGET, default_output, route_command
+from .mac_audio import (
+    DEFAULT_EARPHONES,
+    Earphone,
+    default_output,
+    match_earphone,
+    route_command,
+)
 from .player import DEFAULT_VOLUME_PERCENT, PlayerService
+from .systemeq import SystemEqService
+from .continuous_audio import ContinuousAudioWriter
 from .server import Broadcaster, make_server, pick_port
 from .training import TrainingWriter
 from .voiceprint import VoiceprintService
@@ -44,9 +52,28 @@ from .sources import (
     SourceError,
     build_source,
 )
-from .state import HostState
+from .memo import MemoStore
+from .state import CONTEXT_TEXT, HostState, environment_text
 
 DEFAULT_WEB_PORT = 8787
+#: 用户记忆目录（gitignore）：rolling + sessions + profile 都在这里。
+DEFAULT_MEMO_DIR = str(Path(__file__).resolve().parents[2] / "记录" / "memo")
+
+
+def masking_depth(mode: str | None, broadband_dbfs: float | None,
+                  base: float = 1.3, peak: float = 2.5) -> float | None:
+    """掩蔽自适应深度（2026-10-23 用户口径："噪声什么样、多大声，你来调节"）。
+
+    背景人声（S3 的 EXTERNAL_VOICE_INTENT）时，掩蔽处方是 1–4 kHz 拉满 + 全段 +1；
+    基础档平时 1.3× 是"自然"，但掩蔽要盖住人声，幅度应跟噪声大小连续走：
+    安静（-54 dBFS）1.3× → 嘈杂（-30 dBFS）2.5×。非掩蔽模式返回 None（不覆盖面板深度）。
+    """
+    if mode != "EXTERNAL_VOICE_INTENT":
+        return None
+    if broadband_dbfs is None:
+        return peak
+    t = max(0.0, min(1.0, (broadband_dbfs + 54.0) / 24.0))
+    return base + (peak - base) * t
 
 
 def voiceprint_allows_ambient(snapshot: dict, max_age_s: float = 3.0) -> bool:
@@ -75,6 +102,39 @@ def fresh_self_veto(snapshot: dict, max_age_s: float = 3.0) -> bool:
         and isinstance(age, (int, float))
         and 0.0 <= age <= max_age_s
     )
+
+
+def relay_reports_audio(*, relay_audio: bool, relay_ambient: object | None) -> bool:
+    """中继是否真的在送音频（决定横幅/面板/路由告警怎么说）。
+
+    坑（2026-10-23 真机审计）：只开 `--voiceprint` 时 main() 也会建一个 Relay 对象——
+    它只是借"有 relay"来触发设备持续采集（`start_live_capture`），**不喂音频**
+    （base_feed=None）。如果拿 `relay is not None` 当"中继已开"，面板会显示一个永远
+    0 字节的 24 ms 延迟，并在耳机没连时误报"中继正在播放到扬声器"。上报口径只看
+    真正会送音频的两个来源：`--relay-audio` 或 `--ambient-executor relay|observe`。
+    """
+    return bool(relay_audio or relay_ambient is not None)
+
+
+def ambient_gate_allows(*, device_intent: bool, llm_ok: bool, self_ok: bool,
+                        intent_recent: bool, evidence_recent: bool,
+                        dual_turn: bool = False, llm_veto: bool = False) -> bool:
+    """环境声执行门放行判定（D42；2026-10-23 加入 dual_turn 触发源）。
+
+    触发器有两个：
+      * device_intent：S3 端侧预判意图（快路径，但设备 vl 判据在真实对话下
+        几乎不可达——voice_likelihood 帧间 0↔1 抖动，见 12:02 录音复盘）；
+      * dual_turn：声纹双向交替（最近 10 s 内 self 与 other 都出现且交替）——
+        用户拍板的 B 方案，约 2–3 s 延迟，不依赖设备 vl。自言自语（只有 self）
+        不触发，所以不会重蹈"自己说话把环境声拉开"的覆辙。
+    门证据：本拍/8 s 内 self 接话、LLM 确认、或 dual_turn 本身。LLM 明确否决
+    （llm_veto）优先级最高，任何证据都不能覆盖（D34 迟到否决）。
+    """
+    if llm_veto:
+        return False
+    trigger = bool(device_intent or dual_turn)
+    evidence = bool(llm_ok or self_ok or dual_turn or intent_recent or evidence_recent)
+    return bool(trigger and evidence)
 
 
 def llm_ambient_authorization(assistant) -> dict:
@@ -238,6 +298,22 @@ class DeviceWriter:
         self(f"voiceprint {verdict} {float(score):.2f}\n".encode("ascii"))
 
 
+def parse_earphone(raw: str) -> Earphone:
+    """解析 `--earphone MATCH=LABEL`。
+
+    显示名必须 ASCII：S3 的 `lv_font_ui_16` 是 115 字子集，中文设备名会渲染成方框。
+    """
+    match, sep, label = raw.partition("=")
+    match, label = match.strip(), label.strip()
+    if not sep or not match or not label:
+        raise argparse.ArgumentTypeError(f"需要 MATCH=LABEL，收到 {raw!r}")
+    if not label.isascii():
+        raise argparse.ArgumentTypeError(
+            f"S3 显示名必须是 ASCII（lv_font_ui_16 是固定汉字子集）：{label!r}"
+        )
+    return Earphone(match, label)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="python3 -m host",
@@ -284,9 +360,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"播放增益百分比（100%% 为原始电平），默认 {DEFAULT_VOLUME_PERCENT:.0f}，可在面板上调节",
     )
     parser.add_argument(
+        "--system-eq-app",
+        default=None,
+        help=(
+            "启用第三方播放器 system EQ 执行端（tools/systemeq），tap 指定 bundle id 的音频"
+            "过 24 段 EQ 后送当前耳机（例如 com.tencent.QQMusicMac）。启用后 S3 的 24 段"
+            "决策改发到这条链，而不是 tools/player。"
+        ),
+    )
+    parser.add_argument(
+        "--eq-mode",
+        choices=("basic", "aggressive"),
+        default="aggressive",
+        help=(
+            "systemeq 的 demo 基线档位：basic＝网友共识克制版（±3 dB 量级），"
+            "aggressive＝\"demo 要明显\"×2 版（默认）。面板可实时切换；"
+            "完全关闭 EQ 用面板「关闭EQ」（bypass 直通）。"
+        ),
+    )
+    parser.add_argument(
         "--relay-audio",
         action="store_true",
-        help="把 CoreS3 麦克风实时中继到 Mac 当前默认输出（AirPods）",
+        help="把 CoreS3 麦克风实时中继到当前耳机（--relay-device 可改目标）",
     )
     parser.add_argument(
         "--relay-player",
@@ -301,8 +396,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--relay-device",
         default=DEFAULT_DEVICE,
         help=(
-            f"中继要钉住的输出设备名（子串匹配），默认 {DEFAULT_DEVICE or '跟随系统默认输出'}。"
+            "中继要钉住的输出设备名（子串匹配）；默认跟随系统默认输出，"
+            "AirPods Pro 与 Xiaomi 耳夹哪副在用都能出声。"
             "只钉这条流的输出，不改系统默认输出；设备不在时会如实报警"
+        ),
+    )
+    parser.add_argument(
+        "--earphone",
+        action="append",
+        type=parse_earphone,
+        default=None,
+        metavar="MATCH=LABEL",
+        help=(
+            "可识别的耳机：设备名子串=显示名（显示名必须 ASCII），可重复；默认 "
+            + "、".join(f"{e.match}={e.label}" for e in DEFAULT_EARPHONES)
+            + "。大小写不敏感，按顺序取第一个命中；加新耳机只改参数不改代码"
         ),
     )
     parser.add_argument(
@@ -313,14 +421,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--ambient-executor",
-        choices=("off", "relay", "airpods"),
+        choices=("off", "relay", "observe", "airpods"),
         default="off",
         help=(
             "环境声执行端。off=只显示 S3 的 ambient_open 意图；"
             "relay=当前 demo 路径：S3 麦克风 → Mac → 耳机中继，S3 说开就放行音频"
-            "（固有时延约 211–231 ms，先把预判与开关跑通）；"
-            "airpods=后续拓展路径：用兄弟工程 airpods-control 把 AirPods 切到通透模式"
-            "（需要辅助功能权限，会短暂开合控制中心声音面板）"
+            "（AirPods 约 211–231 ms、Xiaomi 耳夹约 385–405 ms，先把预判与开关跑通）；"
+            "observe=只判定/记录，不输出环境声（ASR/LLM/记忆照常跑，但耳机里永远不加现实声音）；"
+            "airpods=仅 TWS 时代：用兄弟工程 airpods-control 把 AirPods 切到通透模式"
+            "（OWS 耳夹没有聆听模式，这条路径在 OWS 上不可用；D35；需要辅助功能权限）"
         ),
     )
     parser.add_argument(
@@ -354,6 +463,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="跑 voiceprint_worker.py 的解释器（默认仓库 .venv/bin/python）",
     )
     parser.add_argument(
+        "--ambient-gate",
+        choices=("off", "llm", "voice"),
+        default="off",
+        help=(
+            "环境声执行门（demo）。off=旧行为：S3 意图快路径直接执行；"
+            "llm=只有 ASR/LLM 确认对话才执行（背景人声不会开门，但开门要等 5–10 s）；"
+            "voice=voiceprint 判 self（你接话）或 LLM 确认才执行，背景人声不执行。"
+            "voice 需要同时开 --voiceprint；未启用时自动退化为 llm"
+        ),
+    )
+    parser.add_argument(
         "--ambient-mode",
         choices=("transparency", "adaptive", "anc"),
         default="transparency",
@@ -385,14 +505,62 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="完全不采集训练数据（覆盖 host_up.sh 的默认目录）",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--continuous-audio",
+        default="",
+        help=(
+            "连续音频落盘目录（默认关）：把中继的 16 kHz PCM 按到达顺序整段写成 WAV，"
+            "轮转处样本连续、丢块显式记账。与 --training-dir 的 6 s 分段不同，"
+            "它是无人工断裂的连续混合音频，供 TSE / 听感 A/B/C / 复盘使用。"
+            "host_up.sh 用 CORES3_CONTINUOUS_AUDIO=1 打开到 记录/连续音频/。"
+        ),
+    )
+    parser.add_argument(
+        "--continuous-chunk-seconds",
+        type=float,
+        default=600.0,
+        help="连续音频单个 WAV 的轮转长度（秒），默认 600（16 kHz 约 19 MB）",
+    )
+    parser.add_argument(
+        "--memo-dir",
+        default=DEFAULT_MEMO_DIR,
+        help=(
+            "用户记忆目录（默认 记录/memo/，已被 gitignore）；传空串关闭。"
+            "记忆只进慢层 LLM prompt + 影子统计，不参与实时判定（D38）"
+        ),
+    )
+    parser.add_argument(
+        "--memo-retention-days",
+        type=int,
+        default=14,
+        help="用户记忆的保留天数（rolling + profile 衰减前的窗口），默认 14",
+    )
+    parser.add_argument(
+        "--no-memo",
+        action="store_true",
+        help="完全不记录/注入用户记忆（--memo-dir "" 的等价开关）",
+    )
+    args = parser.parse_args(argv)
+    # `--earphone` 可重复；没给就用内置的两副耳机（Xiaomi 耳夹 + AirPods Pro）。
+    args.earphones = tuple(args.earphone) if args.earphone else DEFAULT_EARPHONES
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    # 环境声执行门（D42，demo）：voice 依赖 voiceprint；没有就退化为 llm。
+    # 必须放在横幅/回调之前定义：回调与启动说明都要读它。
+    effective_gate = args.ambient_gate
+    if effective_gate == "voice" and not args.voiceprint:
+        effective_gate = "llm"
+        print("注意：--ambient-gate voice 需要 --voiceprint；本次退化为 llm 门", file=sys.stderr)
     source = build_source(args)
     # relay 执行端需要中继基础设施；--relay-audio 只表示"开机就常开中继"。
-    relay_needed = args.relay_audio or args.ambient_executor == "relay" or args.voiceprint
+    relay_needed = (
+        args.relay_audio
+        or args.ambient_executor in ("relay", "observe")
+        or args.voiceprint
+    )
     relay = (
         AudioRelay(
             player=args.relay_player,
@@ -410,8 +578,16 @@ def main(argv: list[str] | None = None) -> int:
             return 3
     # 环境声执行端必须在 HostState 之前定下来：on_mic_chunk 要按"门控"还是"直通"接。
     # relay 执行端走门控（S3 说开才放行），--relay-audio 则是常开中继（调试/对照）。
-    relay_ambient = RelayAmbient(relay) if args.ambient_executor == "relay" and relay else None
-    if args.ambient_executor == "relay" and relay is None:
+    relay_ambient = (
+        RelayAmbient(relay)
+        if args.ambient_executor in ("relay", "observe") and relay
+        else None
+    )
+    # 上报口径 ≠ 建对象口径：voiceprint 借 relay 触发采集，但它不喂音频。
+    relay_reports = relay_reports_audio(
+        relay_audio=args.relay_audio, relay_ambient=relay_ambient
+    )
+    if args.ambient_executor in ("relay", "observe") and relay is None:
         print("无法启用中继执行端：中继没有创建", file=sys.stderr)
         return 3
     if relay_ambient is not None:
@@ -434,13 +610,26 @@ def main(argv: list[str] | None = None) -> int:
         voiceprint = VoiceprintService(**voiceprint_kwargs)
         voiceprint.start()
 
+    # 连续音频（P0/P1 的数据基建）：与训练数据 6 s 分段并存，互不替代。
+    # 分段有段间断裂，不能做 TSE / 听感 A/B/C；连续落盘才是"真实连续对话"。
+    continuous = None
+    if args.continuous_audio:
+        try:
+            continuous = ContinuousAudioWriter(
+                args.continuous_audio, chunk_seconds=args.continuous_chunk_seconds
+            )
+        except (OSError, ValueError) as exc:
+            print(f"连续音频目录不可用，本次不采集：{exc}", file=sys.stderr)
+
     def on_mic_chunk(chunk):
         if base_feed is not None:
             base_feed(chunk)
         if voiceprint is not None:
             voiceprint.feed(chunk)
+        if continuous is not None:
+            continuous.feed(chunk)
 
-    if base_feed is None and voiceprint is None:
+    if base_feed is None and voiceprint is None and continuous is None:
         on_mic_chunk = None
     training = None
     if args.training_dir and not args.no_training_data:
@@ -450,9 +639,46 @@ def main(argv: list[str] | None = None) -> int:
             )
         except OSError as exc:
             print(f"训练数据目录不可写，本次不采集：{exc}", file=sys.stderr)
+    memo = None
+    if not args.no_memo and args.memo_dir:
+        try:
+            memo = MemoStore(args.memo_dir, retention_days=args.memo_retention_days)
+        except OSError as exc:
+            print(f"用户记忆目录不可写，本次不记录：{exc}", file=sys.stderr)
+
+    # 场景/环境的取法：端侧 9 类情境模型优先（有中文译名），否则退回环境四分类。
+    # 它们引用下面才创建的 state —— 这些函数只在 assistant/主循环里被调用，届时 state
+    # 一定已经赋值（与 relay 的 attach 顺序同理，写错顺序会在启动时就暴露）。
+    # D46：混合环境（context_mixed）给 LLM/账本一个可读的复合场景名，
+    # 而不是只给 top1 单标签。
+    def current_scene() -> str:
+        frame = state.latest
+        if frame is None:
+            return "未知"
+        context = getattr(frame, "context", None)
+        if context is not None and getattr(frame, "context_valid", False):
+            label = CONTEXT_TEXT.get(str(context), "")
+            if label:
+                if getattr(frame, "context_mixed", False):
+                    top2 = CONTEXT_TEXT.get(str(getattr(frame, "context_top2", "") or ""), "")
+                    if top2:
+                        return f"{label}（混合：{top2}）"
+                return label
+        return environment_text(frame.environment)
+
+    def current_environment() -> str:
+        frame = state.latest
+        return environment_text(frame.environment) if frame is not None else ""
+
     assistant = AssistantService(
         voiceprint_snapshot=voiceprint.snapshot if voiceprint is not None else None,
         training=training,
+        memo_context=(lambda: memo.prompt_context(scene=current_scene())) if memo is not None else None,
+        on_decision=(
+            lambda decision: memo.record_decision(
+                decision, scene=current_scene(), environment=current_environment()
+            )
+        ) if memo is not None else None,
     )
     state = HostState(
         source=source.name,
@@ -462,6 +688,8 @@ def main(argv: list[str] | None = None) -> int:
     if voiceprint is not None:
         voiceprint.activity_provider = lambda: state.latest
     state.attach_assistant(assistant)
+    if memo is not None:
+        state.attach_memo(memo)
     assistant.start()
     assistant_configured = assistant.configured
     # 中继使用的是无结束时间的 S3 音频流；设备若在上一次主机退出后仍处于录音态，
@@ -469,10 +697,11 @@ def main(argv: list[str] | None = None) -> int:
     # 会话边界随后由 conversation 状态切分。
     if relay is not None:
         assistant.recording_started(16_000, 0)
-    if relay is not None:
+    if relay_reports:
         # 中继的数字要进快照：这条通路上原来最缺的就是"现在到底晚了多少"。
         # 顺序要紧：attach 必须发生在 HostState 建好之后（这里曾经写成之前，结果是
         # 启动就 UnboundLocalError —— 而所有单测都测不到 main()，是启动横幅救的场）。
+        # 只在真的送音频时 attach：voiceprint-only 的 relay 对象空转，不能进快照。
         state.attach_relay(relay)
     if relay_ambient is not None:
         ambient = relay_ambient
@@ -501,6 +730,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if voiceprint is not None:
         def _send_voiceprint(verdict: str, score: float) -> None:
+            if effective_gate == "voice" and verdict == "self":
+                # demo（D42）：self 由主机当"你接话"证据用；回传设备会被 D31 当成
+                # "自己说话"而否决对话，反而把环境声门锁死。
+                return
             try:
                 writer.send_voiceprint(
                     verdict if verdict in ("self", "other") else "pending", score
@@ -569,6 +802,18 @@ def main(argv: list[str] | None = None) -> int:
         player_service = PlayerService(volume_percent=args.player_volume)
         state.attach_player(player_service)
 
+    # 第三方播放器 system EQ 执行端。和 player 独立：它 tap 目标 App，不改 tools/player。
+    systemeq_service = None
+    if args.system_eq_app:
+        # 基础档是"自然好听"档：S3 自适应的处方深度也按演示口径降一档（1.3×），
+        # 否则 ×2.5 会把 S3 的 presence 建议放大到 +4~5，电吉他/MIDI 这类中高频
+        # 密集素材会听出"裂开"（2026-10-22 用户听感）。面板仍可实时拉深度。
+        eq_depth = 1.3 if args.eq_mode == "basic" else 2.5
+        systemeq_service = SystemEqService(
+            app=args.system_eq_app, mode=args.eq_mode, depth=eq_depth
+        )
+        state.attach_systemeq(systemeq_service)
+
     # 逐帧日志（--frames-jsonl）稍后才打开，但要把变量先定下来：收尾 cleanup 会引用它。
     frames_log = None
 
@@ -580,6 +825,8 @@ def main(argv: list[str] | None = None) -> int:
         cleanup_steps.append(("环境声执行端", ambient.stop))
     if player_service is not None:
         cleanup_steps.append(("Mac 播放器", player_service.stop))
+    if systemeq_service is not None:
+        cleanup_steps.append(("QQ 音乐 system EQ", systemeq_service.stop))
     if voiceprint is not None:
         cleanup_steps.append(("声纹 off 回执", send_voiceprint_off))
         cleanup_steps.append(("声纹 worker", voiceprint.stop))
@@ -588,8 +835,12 @@ def main(argv: list[str] | None = None) -> int:
     cleanup_steps.append(
         ("逐帧日志", lambda: frames_log.close() if frames_log is not None else None)
     )
+    if memo is not None:
+        cleanup_steps.append(("用户记忆", memo.finalize_session))
     if training is not None:
         cleanup_steps.append(("训练数据", training.close))
+    if continuous is not None:
+        cleanup_steps.append(("连续音频", continuous.close))
     cleanup = make_cleanup(cleanup_steps)
 
     httpd = make_server(
@@ -599,6 +850,7 @@ def main(argv: list[str] | None = None) -> int:
         writer=writer if can_control else None,
         releaser=release_port,
         player=player_service,
+        systemeq=systemeq_service,
         on_stop=cleanup,
     )
     url = f"http://127.0.0.1:{web_port}/"
@@ -607,11 +859,13 @@ def main(argv: list[str] | None = None) -> int:
         print("=" * 66)
         print("CoreS3 上位机")
         print(f"  数据源    {state.source}  {source.detail or ''}")
+        print("  耳机      自动识别：" + " / ".join(
+            f"{e.label}（{e.match}）" for e in args.earphones))
         print(f"  面板      {url}")
         print("  帧率      设备每 100 ms 一帧；录音时放宽到 250 ms（预期行为）")
         print("  回控      可发 rec start [秒数] / rec stop" if can_control else "  回控      不可用（当前数据源没有设备可写）")
-        if relay:
-            print(f"  中继      S3 麦克风 → {args.relay_device}（播放端 {relay.mode}，"
+        if relay_reports:
+            print(f"  中继      S3 麦克风 → {args.relay_device or '系统默认输出'}（播放端 {relay.mode}，"
                   f"排队上限 {args.relay_target_ms:g} ms）")
             if relay.mode == PLAYER_FFPLAY:
                 print("  注意      ffplay 不报告排队深度：这条路的延迟只能靠声学测量，"
@@ -619,20 +873,26 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print("  中继      未开启（加 --relay-audio 或 --ambient-executor relay）")
         if relay_ambient is not None:
+            mode_text = (
+                "只判定/记录，不输出（observe）"
+                if args.ambient_executor == "observe"
+                else "S3 麦克风中继到耳机"
+            )
             print(
-                "  环境声    S3 ambient_open 意图 → S3 麦克风中继到耳机"
-                f"（执行端 s3-relay，设备「{args.relay_device}」，"
+                f"  环境声    {mode_text}"
+                f"（执行端 s3-relay，设备「{args.relay_device or '系统默认输出'}」，"
                 f"排队上限 {args.relay_target_ms:g} ms）"
             )
-            print("  注意      中继通路的固有时延约 211–231 ms（蓝牙占 170 ms）；"
-                  "这一版只验证预判与开关，不宣称能听清对面")
+            print("  注意      中继时延 = 播放端排队 + 当前耳机的 driver_ms（面板实时显示）："
+                  "AirPods Pro 170.7 ms（总≈211–231），Xiaomi 耳夹 324.8 ms（总≈385–405，"
+                  "2026-10-21 实测）；这一版只验证预判与开关，不宣称能听清对面")
             if assistant_configured:
                 print("  授权      环境声还必须由 ASR/LLM 判定为对话且未过期；"
                       "不确定/非对话/过期一律关闭（D32）")
         elif isinstance(ambient, AmbientService):
             print(
-                f"  环境声    S3 ambient_open 意图 → AirPods「{args.ambient_mode}」"
-                f"（执行端 {ambient.cli_path}）"
+                f"  环境声    S3 ambient_open 意图 → AirPods 聆听模式「{args.ambient_mode}」"
+                f"（执行端 {ambient.cli_path}，仅 TWS；OWS 无聆听模式，D35）"
             )
             if not ambient.available:
                 print("  注意      找不到 airpods-control CLI：意图会显示，但执行端不可用")
@@ -640,6 +900,13 @@ def main(argv: list[str] | None = None) -> int:
                 print("  授权      环境声还必须由 ASR/LLM 判定为对话且未过期（D32）")
         else:
             print("  环境声    只显示 S3 意图（--ambient-executor relay|airpods 才执行）")
+        if effective_gate != "off":
+            print(
+                f"  环境声门  {effective_gate}（"
+                + ("voiceprint self / 你接话 或 LLM 确认才让位媒体/开环境声；背景人声两样都不做"
+                   if effective_gate == "voice" else "LLM 确认才让位媒体/开环境声；背景人声两样都不做")
+                + "，D42）"
+            )
         if assistant_configured:
             print(f"  对话判定  {assistant.model} · Qwen3-ASR 本地转写 · "
                   f"快路径端侧先开，LLM 迟到否决（D34）")
@@ -651,6 +918,19 @@ def main(argv: list[str] | None = None) -> int:
                   f"上限 {training.max_bytes // (1024 * 1024)} MB）")
         else:
             print("  训练数据  未采集（--training-dir 指到目录才开）")
+        if continuous is not None:
+            print(f"  连续音频  {continuous.session_dir}/"
+                  f"（16 kHz 单声道；{args.continuous_chunk_seconds:g} s/段轮转；"
+                  f"丢块会记账，供 TSE / 听感）")
+        else:
+            print("  连续音频  未采集（CORES3_CONTINUOUS_AUDIO=1 或 --continuous-audio 打开）")
+        if memo is not None:
+            memory = memo.snapshot()
+            print(f"  用户记忆  {memory['dir']}/"
+                  f"（已恢复 {memory['events']} 条事件 / {memory['profile_keys']} 个场景仓位；"
+                  "只进慢层先验，D38）")
+        else:
+            print("  用户记忆  未启用（--no-memo）")
         if isinstance(source, ReplaySource):
             print("  注意      回放只是把历史日志搬到界面上，不代表设备现在的状态")
         if isinstance(source, MockSource):
@@ -684,18 +964,21 @@ def main(argv: list[str] | None = None) -> int:
             if device == last_device or not writer.available:
                 continue
             try:
-                writer(route_command(device))
+                earphone = match_earphone(device, args.earphones)
+                writer(route_command(device, args.earphones))
                 last_device = device
                 state.log("route", "Mac 音频输出已同步", device or "没有默认输出")
-                # 真机踩过：AirPods 掉线后默认输出自动落到 MacBook Air 扬声器，中继照常播放，
+                # 真机踩过：耳机掉线后默认输出自动落到 MacBook Air 扬声器，中继照常播放，
                 # 面板只记了一行路由变更。用户戴着耳机听不到声音时，会以为是自己这边的问题，
                 # 于是往延迟、增益、缓冲的方向查——真正的原因（耳机压根没连）反而没人说。
                 # 所以这里必须报警，而不是只记录。
-                if relay is not None and device != EXPECTED_TARGET:
+                if relay_reports and earphone is None:
+                    expected = "、".join(f"「{e.match}」" for e in args.earphones)
                     state.note(
-                        f"中继正在播放到「{device or '没有默认输出'}」，不是 {EXPECTED_TARGET}。"
-                        "声音不会进到你戴的耳机里。先确认耳机已连上这台 Mac，并在"
-                        "「系统设置 → 声音 → 输出」里选中它。"
+                        f"中继正在播放到「{device or '没有默认输出'}」，不是已识别的耳机"
+                        f"（匹配 {expected}）。声音不会进到你戴的耳机里。先确认耳机已连上"
+                        "这台 Mac，并在「系统设置 → 声音 → 输出」里选中它；是别的耳机就加"
+                        " --earphone MATCH=LABEL。"
                     )
             except (OSError, RuntimeError):
                 continue
@@ -705,7 +988,7 @@ def main(argv: list[str] | None = None) -> int:
 
     def start_live_capture() -> None:
         """Start indefinite device capture after the serial console has finished booting."""
-        if relay is None:
+        if relay is None and continuous is None:
             return
         deadline = time.monotonic() + 10.0
         while not stop.is_set() and time.monotonic() < deadline:
@@ -713,14 +996,16 @@ def main(argv: list[str] | None = None) -> int:
                 time.sleep(0.8)
                 try:
                     writer(b"rec start\r\n")
-                    state.note_control_sent("rec start（音频中继）")
+                    state.note_control_sent(
+                        "rec start（音频中继）" if relay is not None else "rec start（连续音频）"
+                    )
                     return
                 except (OSError, RuntimeError):
                     pass
             time.sleep(0.1)
         state.note("音频中继未能启动：10 秒内没有可写的设备连接")
 
-    if can_control and relay is not None:
+    if can_control and (relay is not None or continuous is not None):
         threading.Thread(target=start_live_capture, name="relay-start", daemon=True).start()
 
     serving = threading.Thread(target=httpd.serve_forever, name="http", daemon=True)
@@ -740,6 +1025,23 @@ def main(argv: list[str] | None = None) -> int:
     started_monotonic = time.monotonic()
     last_ambient_open: bool | None = None
     last_authorization_state: str | None = None
+    #: memo 跟踪的是 **S3 的 ambient_open 意图**（不管执行端开没开），因为"设备认为该不该
+    #: 开"才是记忆要学的信号；执行结果与授权另存在事件里。
+    memo_intent_open: bool | None = None
+    memo_intent_opened_at: float | None = None
+    last_authorization: dict = {}
+    #: 环境声执行门（demo，D42）：voice 模式下"你接话"一次就把门栓住，
+    #: 直到 S3 的环境声意图消失 2.5 s；避免背景人声把耳机门顶开。
+    engagement_latch = False
+    last_intent_true_at: float | None = None
+    #: 门证据（self 接话 / LLM 确认）最近一次出现的时刻。2026-10-23 真机实测：S3
+    #: 端侧 engaged 判据（voice_likelihood≥0.65 连续 800 ms）在真实语音下几乎不成立
+    #: （最长连续只有 0.5 s），device_intent 恒 false；因此门证据本身必须能独立放行。
+    last_gate_evidence_at: float | None = None
+    last_gate_state: str | None = None
+    #: 声纹双向交替触发（2026-10-23 B 方案）：本拍是否认定"对方找你、你接话"。
+    #: 每拍在门逻辑里更新；media 分支在同一循环早段先读上一拍的值。
+    dual_turn_open = False
 
     # 主线程只做一件事：按节拍发布快照，并把最新一帧的决策下发给 Mac 执行端。
     # 没有新帧时也发快照，界面才能区分"设备停了"与"浏览器和主机之间的连接断了"——
@@ -747,6 +1049,50 @@ def main(argv: list[str] | None = None) -> int:
     while not stop.is_set():
         broadcaster.publish()
         latest = state.latest
+        if memo is not None and latest is not None:
+            # 每 10 秒采一次环境统计（memo 内部节流）；只进长期 profile，不参与决策。
+            memo.sample_frame(
+                scene=current_scene(),
+                environment=current_environment(),
+                broadband_dbfs=latest.broadband_dbfs,
+                voice_likelihood=latest.voice_likelihood,
+            )
+        if (
+            memo is not None
+            and latest is not None
+            and latest.ambient_open is not None
+        ):
+            # D38：记录的是 S3 的意图转变（默认执行端 off 时唯一的可观测信号）。
+            # 执行端开了的话，授权状态会作为同一事件的附件写进去。
+            intent = bool(latest.ambient_open)
+            if intent:
+                last_intent_true_at = time.monotonic()
+            if memo_intent_open is None:
+                memo_intent_open = intent
+                memo_intent_opened_at = time.monotonic() if intent else None
+            elif intent != memo_intent_open:
+                mono_now = time.monotonic()
+                if intent:
+                    memo_intent_opened_at = mono_now
+                    memo.record_ambient(
+                        open=True,
+                        scene=current_scene(),
+                        environment=current_environment(),
+                        intent=intent,
+                        authorization=last_authorization,
+                    )
+                else:
+                    opened_at = memo_intent_opened_at
+                    memo_intent_opened_at = None
+                    memo.record_ambient(
+                        open=False,
+                        scene=current_scene(),
+                        environment=current_environment(),
+                        intent=intent,
+                        authorization=last_authorization,
+                        duration_s=None if opened_at is None else max(0.0, mono_now - opened_at),
+                    )
+                memo_intent_open = intent
         if (
             frames_log is not None
             and latest is not None
@@ -780,13 +1126,33 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 + "\n"
             )
-        if player_service is not None:
+        if latest is not None and (player_service is not None or systemeq_service is not None):
             # 决策的形状永远来自 S3，这里只是把它搬到音频上；apply_decision 内部有节流。
             # 旧固件不发 eq_gain_db（tuning 为 None）时下发全平直：**没有建议就该什么都不做**，
             # 而不是把上一次的形状留在曲子上。
-            if latest is not None:
-                bands = list(latest.tuning.band_gain_db) if latest.tuning else [0.0] * 24
-                player_service.apply_decision(bands, float(latest.media_percent))
+            bands = list(latest.tuning.band_gain_db) if latest.tuning else [0.0] * 24
+            media_target = float(latest.media_percent)
+            if effective_gate != "off" and not engagement_latch:
+                # 同一道执行门也管媒体下压：背景人声/视频声不该把歌压小。
+                # 只在你接话（voiceprint self）或 LLM 确认对话之后才让位；
+                # 门的证据来自上一拍（50 ms），对让位时序没有可感知影响。
+                media_target = 100.0
+            elif dual_turn_open:
+                # 声纹交替触发时 S3 意图可能没发（设备 vl 判据不可达，12:02 复盘），
+                # 媒体也要让位到确认地板，否则音乐会盖住对方的话。
+                media_target = 60.0
+            if systemeq_service is not None:
+                # 掩蔽时按噪声大小自动加深处方深度（安静 1.3× → 嘈杂 2.5×）；
+                # 非掩蔽模式不覆盖面板深度。
+                depth_override = masking_depth(latest.mode, latest.broadband_dbfs)
+                # 安静/对话（S3 报 FLAT）时基线归零：EQ 完全平直，不留 demo 音染
+                # （2026-10-23 用户口径"安静时应该是完全没有"）。
+                base_gain = 0.0 if latest.mode == "FLAT" else 1.0
+                systemeq_service.apply_decision(bands, media_target,
+                                                depth_override=depth_override,
+                                                base_gain=base_gain)
+            else:
+                player_service.apply_decision(bands, media_target)
         if ambient is not None:
             # S3 的 ambient_open 意图 → 执行端（relay 门控 / AirPods 聆听模式）。安全规则：
             #   * 旧固件（v4 之前）不报 ambient_open → 当成"不开放"，不猜；
@@ -801,15 +1167,103 @@ def main(argv: list[str] | None = None) -> int:
                 # 能进入首次响应路径；LLM 判 no 时在这里把已开的环境声关掉。
                 authorization = llm_ambient_authorization(assistant)
                 want_open = want_open and bool(authorization.get("allow"))
-                if voiceprint is not None and fresh_self_veto(voiceprint.snapshot()):
+                if effective_gate == "off" and voiceprint is not None and fresh_self_veto(
+                    voiceprint.snapshot()
+                ):
                     want_open = False
             elif voiceprint is not None:
                 # LLM 未配置时保留历史回退：新鲜 other + 双方轮次证据才放行。
                 voiceprint_state = voiceprint.snapshot()
                 want_open = want_open and dialogue_turn_gate.allows(voiceprint_state, latest)
+            intent_open = want_open
+            gate_state = "off"
+            if effective_gate != "off":
+                # D42（demo）：背景人声不应把环境声顶开。门只拿两类证据：
+                #   * ASR/LLM 确认这是一个对话；
+                #   * voiceprint 判 self —— 也就是"你接话了"。
+                # 一旦触发，门栓到 S3 意图消失 2.5 s，避免一句一关。
+                llm_ok = str(authorization.get("state") or "") == "llm_confirmed"
+                self_ok = False
+                dual_turn_open = False
+                if effective_gate == "voice" and voiceprint is not None:
+                    vp = voiceprint.snapshot()
+                    age = vp.get("age_s")
+                    self_ok = bool(
+                        vp.get("ready")
+                        and vp.get("verdict") == "self"
+                        and isinstance(age, (int, float))
+                        and 0.0 <= age <= 3.0
+                    )
+                    # B 方案（2026-10-23 用户拍板）：声纹双向交替作为环境声触发源。
+                    # 最近 10 s（160000 样本 @16 kHz）内 self 与 other 都出现且交替，
+                    # 视为"对方找你、你接话"的双向对话；只有 self 的自言自语不触发。
+                    history = vp.get("history") or []
+                    if history and isinstance(history[-1].get("end_sample"), int):
+                        latest_end = int(history[-1]["end_sample"])
+                        order = [
+                            str(item["verdict"])
+                            for item in history
+                            if isinstance(item.get("end_sample"), int)
+                            and latest_end - int(item["end_sample"]) <= 16000 * 10
+                            and item.get("verdict") in ("self", "other")
+                        ]
+                        dual_turn_open = bool(
+                            "self" in order and "other" in order
+                            and any(a != b for a, b in zip(order, order[1:]))
+                        )
+                if llm_ok or self_ok or dual_turn_open:
+                    engagement_latch = True
+                    last_gate_evidence_at = time.monotonic()
+                intent_recent = (
+                    last_intent_true_at is not None
+                    and time.monotonic() - last_intent_true_at <= 2.5
+                )
+                evidence_recent = (
+                    last_gate_evidence_at is not None
+                    and time.monotonic() - last_gate_evidence_at <= 8.0
+                )
+                if engagement_latch and not (intent_recent or evidence_recent):
+                    engagement_latch = False
+                # 2026-10-23：门是**否决器**，不是触发器。S3 端侧意图（device_intent）
+                # 仍是环境声的唯一触发源；self 只能批准"别人发起的对话"，不能因为
+                # 佩戴者自己说话就把环境声拉开（用户现场质疑过这一点）。
+                # LLM 明确否决（llm_veto）优先级最高，self 证据不能覆盖（D34）。
+                want_open = ambient_gate_allows(
+                    device_intent=bool(want_open),
+                    llm_ok=llm_ok,
+                    self_ok=self_ok,
+                    intent_recent=intent_recent,
+                    evidence_recent=evidence_recent,
+                    dual_turn=dual_turn_open,
+                    llm_veto=bool(authorization.get("veto")),
+                )
+                gate_state = (
+                    "user_replied"
+                    if self_ok
+                    else ("llm_confirmed" if llm_ok else ("latch" if engagement_latch else "waiting"))
+                )
+                authorization = dict(authorization)
+                authorization["engagement"] = gate_state
             if state.is_stale() or state.is_silent() or not state.connected:
                 want_open = False
+            if args.ambient_executor == "observe":
+                # 只判定/记录，不输出：observe 模式保留 ASR/LLM/记忆与面板意图，
+                # 但永远不把现实声音送进耳机。给"怕环境声突然响"的场景用。
+                want_open = False
+            if (
+                effective_gate != "off"
+                and intent_open
+                and not want_open
+                and gate_state == "waiting"
+                and last_gate_state != "waiting"
+            ):
+                state.note(
+                    "环境声意图已发出，但没有等到你接话/LLM 确认，本次不执行"
+                    f"（demo 执行门 {effective_gate}，D42）"
+                )
+            last_gate_state = gate_state
             ambient.set_open(want_open)
+            last_authorization = authorization
             if training is not None and (
                 want_open != last_ambient_open
                 or str(authorization.get("state") or "") != (last_authorization_state or "")
@@ -824,6 +1278,8 @@ def main(argv: list[str] | None = None) -> int:
                     "decision_age_s": authorization.get("age_s"),
                     "decision_number": authorization.get("number"),
                     "reason": authorization.get("reason"),
+                    "engagement": authorization.get("engagement"),
+                    "gate": effective_gate,
                 })
                 last_ambient_open = bool(want_open)
                 last_authorization_state = str(authorization.get("state") or "")

@@ -5,7 +5,7 @@
 #   sh tools/host_up.sh --detach        # 脱离会话在后台运行（推荐：会话被回收也不会带走它）
 #   sh tools/host_up.sh --status        # 只看它是否在运行
 #   sh tools/host_up.sh --mock          # 没有设备时先把界面跑起来
-#   sh tools/host_up.sh --relay-audio   # S3 麦克风实时送到 Mac 默认输出/AirPods
+#   sh tools/host_up.sh --relay-audio   # S3 麦克风实时送到当前耳机（跟随系统默认输出）
 #   sh tools/host_up.sh --voiceprint    # 实验性 self-veto 声纹门控（self 不压/不抬/不开环境声）
 #   sh tools/host_up.sh --replay 记录/x.log --speed 4
 #
@@ -66,13 +66,37 @@ if [ "${1:-}" = "--detach" ]; then
 fi
 
 set -- --web-port "$WEB_PORT" "$@"
+# 耳机（2026-10-21 起，D35/D36）：同一版本同时支持 OWS 耳夹（Xiaomi 耳夹式耳机）与 TWS
+# 对照（AirPods Pro）。默认注册表是 "Xiaomi=Xiaomi OWS" 与 "AirPods=AirPods Pro"，
+# 按 macOS 默认输出自动识别，S3 路由页显示命中的短名（必须 ASCII：设备字库是固定子集）。
+# 中继默认跟随系统默认输出（--relay-device 空），哪副耳机在用就送到哪副。
+# 加别的耳机或固定一副时：
+#   --earphone "型号名=显示名"            # 可重复，覆盖默认注册表
+#   --relay-device "型号名"               # 把中继钉在这一副上
 # 环境声执行端默认 **off**：没有"是不是别人在说话"的前置判定之前，不自动开环境声
 # （用户 2026-10-19 明确要求：默认不开）。需要时显式传：
-#   --ambient-executor relay    S3 麦克风 → Mac → AirPods 中继（S3 意图只做门控）
-#   --ambient-executor airpods  调 AirPods 聆听模式（不要擅自用）
+#   --ambient-executor relay    S3 麦克风 → Mac → 耳机中继（S3 意图只做门控）
+#   --ambient-executor observe 只判定/记录（ASR/LLM/记忆照常），环境声永不输出
+#   --ambient-executor airpods  调 AirPods 聆听模式（仅 TWS 时代；OWS 耳夹没有聆听模式）
 case " $* " in
     *" --ambient-executor "*|*" --mock "*|*" --replay "*) : ;;
     *) set -- --ambient-executor off "$@" ;;
+esac
+# 演示默认三件套（2026-10-23 用户口径，固化防丢）：EQ 三档 + voice 门 + 声纹。
+# 2026-10-23 上午连续两次"host 被不带参数重启 → systemeq 静默消失"，根因是这些参数
+# 只存在于口头命令里。现在写进 host_up.sh 默认值：任何会话/脚本起 host 都带上。
+# 显式传参或 mock/replay 时不覆盖。
+case " $* " in
+    *" --system-eq-app "*|*" --mock "*|*" --replay "*) : ;;
+    *) set -- --system-eq-app com.tencent.QQMusicMac --eq-mode basic "$@" ;;
+esac
+case " $* " in
+    *" --ambient-gate "*|*" --mock "*|*" --replay "*) : ;;
+    *) set -- --ambient-gate voice "$@" ;;
+esac
+case " $* " in
+    *" --voiceprint "*|*" --mock "*|*" --replay "*) : ;;
+    *) set -- --voiceprint "$@" ;;
 esac
 # 训练数据默认落盘到 gitignore 的 记录/训练数据/（D34）：每个候选片段一条 JSONL +
 # 16 kHz WAV，供端侧蒸馏与人工复盘；不需要时传 --no-training-data 或 --training-dir ""。
@@ -80,6 +104,16 @@ case " $* " in
     *" --training-dir "*|*" --no-training-data "*|*" --mock "*|*" --replay "*) : ;;
     *) set -- --training-dir "$ROOT/记录/训练数据" "$@" ;;
 esac
+# 连续音频默认关（约 150 MB/小时）：与 6 s 训练分段不同，它是无人工断裂的整段混合音频，
+# 供 TSE / 听感 A/B/C / 复盘。CORES3_CONTINUOUS_AUDIO=1 打开，落 记录/连续音频/。
+# 可选 CORES3_CONTINUOUS_CHUNK_SECONDS（默认 600）控制单个 WAV 的轮转长度。
+if [ "${CORES3_CONTINUOUS_AUDIO:-0}" = "1" ]; then
+    case " $* " in
+        *" --continuous-audio "*|*" --mock "*|*" --replay "*) : ;;
+        *) set -- --continuous-audio "$ROOT/记录/连续音频" \
+               --continuous-chunk-seconds "${CORES3_CONTINUOUS_CHUNK_SECONDS:-600}" "$@" ;;
+    esac
+fi
 if [ -n "${CORES3_PORT:-}" ]; then
     case " $* " in
         *" --mock "*|*" --replay "*) : ;;

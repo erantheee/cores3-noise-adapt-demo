@@ -47,6 +47,14 @@ MAX_NOISE_REDUCTION_DB = 8.0
 CAPTURE_RATE_HZ = 16000
 CAPTURE_CHUNK_SAMPLES = 320
 
+#: 24 段歌曲 EQ 建议的合法区间（dB）。**有符号语义**：设备建议可以抬（正）也可以削（负）。
+#: 上下限取播放器真正能执行的范围（tools/player/player.swift 的 minAppliedGainDb=-12 /
+#: maxAppliedGainDb=+10，按深度放大后再钳位），不是"建议一般不会超过"的经验值。
+#: 越界的值按本模块的纪律**保留原始值并报异常**，不在这里钳掉——钳掉会把"协议不一致"
+#: 伪装成"一切正常"。旧固件只发 0…+4，落在这个区间内，行为与以前完全一致。
+MIN_BAND_GAIN_DB = -12.0
+MAX_BAND_GAIN_DB = 10.0
+
 #: 已知的固件状态与环境的字符串（main/controller.cpp 的 adapt_state_name /
 #: environment_name）。未知值要如实显示为"未知(原文)"，不要猜。
 KNOWN_STATES = ("OBSERVING", "ADJUSTING", "HOLDING", "RECOVERING", "MIC FAULT")
@@ -103,13 +111,30 @@ def d2(value: float) -> float:
 
 @dataclass(frozen=True)
 class Tuning:
-    """24 频段调音：设备实际要施加的每频段增益。"""
+    """24 频段调音：设备实际要施加的每频段增益。
+
+    语义：**有符号**。正 = 抬，负 = 削，0 = 不动。`band_gain_db` 始终是"设备原始建议"，
+    不是 Mac 按深度放大后的值。旧固件只发 0…+4（历史日志/旧设备），此时下面三个新增字段
+    恒为 `0/0.0`，既有字段含义与旧行为完全不变。
+    """
 
     band_gain_db: tuple[float, ...]
-    #: 被抬起的频段数（>0.05 dB 才算）。
+    #: 被抬起的频段数（>0.05 dB 才算）。**只数正值**，旧字段含义不变。
     lifted_bands: int
-    #: 抬起的幅度（各频段里的最大值）。
+    #: 抬起的幅度（各频段里的最大值）。旧固件下就是 max(band_gain_db)。
+    #: 全为负值时它是那个负的"最大值"（最接近 0 的值）——想拿绝对值请看 peak_abs_db。
     peak_gain_db: float
+    #: 被削减的频段数（<-0.05 dB 才算）。旧固件恒为 0。
+    cut_bands: int = 0
+    #: 削减的幅度（各频段里的最小值，负数；没有削减段时为 0.0）。旧固件恒为 0.0。
+    max_cut_db: float = 0.0
+    #: 绝对值最大的建议（抬升与削减都算，恒 ≥0）。旧的只抬曲线下等于 peak_gain_db。
+    peak_abs_db: float = 0.0
+
+    @property
+    def has_cuts(self) -> bool:
+        """这一帧的建议里是否有任何削减段（负=削）。"""
+        return self.cut_bands > 0
 
     @property
     def shape_is_speech_band(self) -> bool:
@@ -117,7 +142,12 @@ class Tuning:
 
         当前固件只有这一种形状（main/controller.cpp 的 eq_gain_db 循环）。写成性质判断
         而不是硬编码 8–16，是为了将来固件真的做多段整定时，这里不会跟着说谎。
+
+        有符号扩展：只要建议里有任何削（<-0.05 dB），它就不是"只抬语音段、其余 0"这个
+        形状，返回 False。旧固件（0…+4）走的分支与以前逐行相同。
         """
+        if any(value < -0.05 for value in self.band_gain_db):
+            return False
         lifted = [index for index, value in enumerate(self.band_gain_db) if value > 0.05]
         if not lifted:
             return True
@@ -152,6 +182,14 @@ class CommandFrame:
     spectral_flatness: float | None = None
     vocal_peakiness: float | None = None
     excited_vocal_bands: int | None = None
+    #: D47 双麦遥测（取数阶段）。None = 这一帧没报（旧固件/单麦固件）。四键一组：
+    #: mic2_broadband_dbfs = 第二路麦宽带电平；mic_diff_db = L − R；mic_coherence =
+    #: 帧内两路 Pearson 相关系数 ∈ [-1,1]；mic2_valid=false 时报 -120/0/0。只做遥测，
+    #: 用于标定近场/远场判据，**不参与任何决策**。
+    mic2_broadband_dbfs: float | None = None
+    mic_diff_db: float | None = None
+    mic_coherence: float | None = None
+    mic2_valid: bool | None = None
     #: 旧固件的字段（已从固件删除）。保留只为读得懂历史日志；上位机不显示它。
     noise_reduction_db: float | None = None
     #: 设备实际要施加的调音。None 表示这一帧没有报（旧固件不发 eq_gain_db）。
@@ -163,6 +201,12 @@ class CommandFrame:
     context_valid: bool | None = None
     #: 一次前向的耗时，微秒。设备逐帧实报，不是估算。
     context_us: int | None = None
+    #: D46 混合环境识别：softmax 分布的第二名（类别、概率）与混合标志。None = 这一帧
+    #: 没报这三个键（旧固件）。`context_mixed=True` = top2 ≥ 0.20（固件阈值
+    #: context::kMixedTop2Threshold），单标签在该窗不可信。仍只做遥测/显示，不改决策。
+    context_top2: str | None = None
+    context_top2_score: float | None = None
+    context_mixed: bool | None = None
     #: 92 维窗上的说话/非说话二分类学生输出（speech_gate_model.h）。None = 旧固件没报。
     #: **只做遥测**：当前不参与决策，替换四判据要过 D19 验收。
     speech_gate: float | None = None
@@ -352,6 +396,13 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
     spectral_flatness = _as_float(payload, "spectral_flatness")
     vocal_peakiness = _as_float(payload, "vocal_peakiness")
     excited_vocal_bands = _as_int(payload, "excited_vocal_bands")
+    # D47 双麦遥测。缺字段一律 None（旧固件/单麦固件不发），"没报"与"报了 -120/0/0"
+    # 必须分得开（与 v3/v4 各遥测组同纪律）。
+    mic2_broadband_dbfs = _as_float(payload, "mic2_broadband_dbfs")
+    mic_diff_db = _as_float(payload, "mic_diff_db")
+    mic_coherence = _as_float(payload, "mic_coherence")
+    raw_mic2_valid = payload.get("mic2_valid")
+    mic2_valid = raw_mic2_valid if isinstance(raw_mic2_valid, bool) else None
     confidence = _as_float(payload, "confidence")
     state = _as_str(payload, "state")
     environment = _as_str(payload, "environment")
@@ -362,6 +413,12 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
     context = _as_str(payload, "context")
     context_score = _as_float(payload, "context_score")
     context_us = _as_int(payload, "context_us")
+    # D46：混合环境识别的三个追加键。缺字段一律 None（旧固件不发），"没报"与
+    # "报了 unknown/0.0/false"必须分得开（与 context 组同纪律）。
+    context_top2 = _as_str(payload, "context_top2")
+    context_top2_score = _as_float(payload, "context_top2_score")
+    raw_context_mixed = payload.get("context_mixed")
+    context_mixed = raw_context_mixed if isinstance(raw_context_mixed, bool) else None
     event = _as_str(payload, "event")
     raw_event_valid = payload.get("event_valid")
     event_valid = raw_event_valid if isinstance(raw_event_valid, bool) else None
@@ -446,6 +503,21 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
             )
 
     tuning = _parse_tuning(payload)
+    # 有符号调音的上下限校验：设备建议必须在播放器可执行的范围内（-12…+10 dB）。
+    # 越界说明固件与上位机对协议的理解已经不一致——保留原始值（上面已解析）并报异常，
+    # 让面板照原样显示 + 告警，而不是替固件钳到一个"看起来正常"的值。
+    if tuning is not None:
+        out_of_range = [
+            value
+            for value in tuning.band_gain_db
+            if not MIN_BAND_GAIN_DB - 1e-6 <= value <= MAX_BAND_GAIN_DB + 1e-6
+        ]
+        if out_of_range:
+            problems.append(
+                f"调音建议越界：{len(out_of_range)} 段超出 "
+                f"{MIN_BAND_GAIN_DB:+.1f}…{MAX_BAND_GAIN_DB:+.1f} dB"
+                f"（最远 {max(out_of_range, key=abs):+.2f} dB，原始值已保留）"
+            )
     ambient = _parse_float_array(payload, "ambient_band_dbfs")
     if schema >= 2 and external_voice_gain is None:
         problems.append("v2 帧缺 external_voice_gain_db")
@@ -495,6 +567,25 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
                 f"context_valid=false 却报了类别 {context!r}（占位符应是 {CONTEXT_UNKNOWN!r}）"
             )
 
+    # D46：混合环境识别的三个追加键与 context 组同纪律：要么全不报（旧固件），要么成组。
+    top2_fields = (context_top2, context_top2_score, context_mixed)
+    top2_reported = [value is not None for value in top2_fields]
+    if any(top2_reported) and not all(top2_reported):
+        problems.append(
+            "混合情境字段只报了一部分（context_top2/context_top2_score/context_mixed 是一组）"
+        )
+    elif context_valid is True and context_top2 is not None:
+        if context_top2 not in CONTEXT_CLASSES:
+            problems.append(f"未知第二候选情境类别 {context_top2!r}")
+        if not 0.0 <= context_top2_score <= 1.0:
+            problems.append(f"第二候选置信度 {context_top2_score} 不在 [0,1]")
+        if context_top2 == context:
+            problems.append(f"第二候选 {context_top2!r} 与第一名相同")
+    elif context_valid is False and context_top2 is not None and context_top2 != CONTEXT_UNKNOWN:
+        problems.append(
+            f"context_valid=false 却报了第二候选 {context_top2!r}（占位符应是 {CONTEXT_UNKNOWN!r}）"
+        )
+
     speech_gate = _as_float(payload, "speech_gate")
     speech_gate_valid = _as_bool(payload, "speech_gate_valid")
     speech_gate_us = _as_int(payload, "speech_gate_us")
@@ -515,6 +606,24 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
     if voiceprint_age_ms is not None and voiceprint_age_ms < -1:
         problems.append(f"声纹判定年龄 {voiceprint_age_ms} ms 非法（-1 表示从未判定）")
 
+    # D47 双麦遥测：四键一组，同 v3/v4 各组纪律。值域：电平 ≤ 0 dBFS（-120 是占位/地板，
+    # 合法）；相关系数 ∈ [-1,1]；电平差有限。valid=false 时报 -120/0/0，不算异常。
+    mic2_reported = [
+        value is not None
+        for value in (mic2_broadband_dbfs, mic_diff_db, mic_coherence, mic2_valid)
+    ]
+    if any(mic2_reported) and not all(mic2_reported):
+        problems.append(
+            "双麦遥测字段只报了一部分"
+            "（mic2_broadband_dbfs/mic_diff_db/mic_coherence/mic2_valid 是一组）"
+        )
+    if mic2_broadband_dbfs is not None and mic2_broadband_dbfs > 1.0:
+        problems.append(f"第二路麦电平 {mic2_broadband_dbfs} dBFS 超过 0")
+    if mic_diff_db is not None and (not -80.0 <= mic_diff_db <= 80.0):
+        problems.append(f"双麦电平差 {mic_diff_db} dB 超出 ±80")
+    if mic_coherence is not None and not -1.0 <= mic_coherence <= 1.0:
+        problems.append(f"双麦相关系数 {mic_coherence} 不在 [-1,1]")
+
     return ParsedLine(
         value=CommandFrame(
             sequence=sequence,
@@ -529,6 +638,12 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
             spectral_flatness=None if spectral_flatness is None else d2(spectral_flatness),
             vocal_peakiness=None if vocal_peakiness is None else d2(vocal_peakiness),
             excited_vocal_bands=excited_vocal_bands,
+            mic2_broadband_dbfs=(
+                None if mic2_broadband_dbfs is None else d2(mic2_broadband_dbfs)
+            ),
+            mic_diff_db=None if mic_diff_db is None else d2(mic_diff_db),
+            mic_coherence=None if mic_coherence is None else d2(mic_coherence),
+            mic2_valid=mic2_valid,
             state=state,
             environment=environment,
             noise_spectrum=str(payload.get("noise_spectrum", "NONE")),
@@ -544,6 +659,11 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
             context_score=None if context_score is None else d2(context_score),
             context_valid=context_valid,
             context_us=context_us,
+            context_top2=context_top2,
+            context_top2_score=(
+                None if context_top2_score is None else d2(context_top2_score)
+            ),
+            context_mixed=context_mixed,
             speech_gate=speech_gate,
             speech_gate_valid=speech_gate_valid,
             speech_gate_us=speech_gate_us,
@@ -571,7 +691,12 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
 
 
 def _parse_tuning(payload: dict[str, Any]) -> Tuning | None:
-    """解析 24 频段调音数组。缺字段返回 None——旧固件本来就不发它。"""
+    """解析 24 频段调音数组。缺字段返回 None——旧固件本来就不发它。
+
+    有符号语义：正值=抬、负值=削。新增的 cut_bands/max_cut_db/peak_abs_db 只是把同一份
+    `eq_gain_db` 数组用另一种口径数出来，**不改变** band_gain_db/lifted_bands/peak_gain_db
+    的含义；旧固件只发非负值，三个新字段因此恒为 0。
+    """
     raw = payload.get("eq_gain_db")
     if not isinstance(raw, list):
         return None
@@ -583,10 +708,14 @@ def _parse_tuning(payload: dict[str, Any]) -> Tuning | None:
     if not gains:
         return None
     lifted = [value for value in gains if value > 0.05]
+    cuts = [value for value in gains if value < -0.05]
     return Tuning(
         band_gain_db=tuple(gains),
         lifted_bands=len(lifted),
         peak_gain_db=d2(max(gains)),
+        cut_bands=len(cuts),
+        max_cut_db=d2(min(cuts)) if cuts else 0.0,
+        peak_abs_db=d2(max(abs(value) for value in gains)),
     )
 
 

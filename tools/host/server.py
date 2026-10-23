@@ -32,6 +32,7 @@ from typing import Any
 
 from .player import PlayerError
 from .state import HostState
+from .systemeq import SystemEqError
 
 WEB_ROOT = Path(__file__).resolve().parent / "web"
 INDEX_FILE = WEB_ROOT / "index.html"
@@ -135,7 +136,7 @@ class HostHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
     def __init__(self, address, handler, state: HostState, broadcaster: Broadcaster, writer=None,
-                 releaser=None, player=None, on_stop=None, exit_fn=None):
+                 releaser=None, player=None, systemeq=None, on_stop=None, exit_fn=None):
         super().__init__(address, handler)
         self.state = state
         self.broadcaster = broadcaster
@@ -145,6 +146,8 @@ class HostHTTPServer(ThreadingHTTPServer):
         #: Mac 播放与执行端（tools/host/player.py）。为 None 表示本次没启用播放器，
         #: 面板上的播放控件要明确禁用而不是假装点过了。
         self.player = player
+        #: 第三方播放器 system EQ 执行端（tools/host/systemeq.py）。为 None 表示没启用。
+        self.systemeq = systemeq
         #: /api/stop 的收尾回调（正常退出路径也复用同一个幂等 cleanup）。None = 没有。
         #: 必须在 os._exit 之前跑，否则 AirPods 聆听模式、子进程、日志都不会被收掉。
         self.on_stop = on_stop
@@ -293,19 +296,15 @@ class Handler(BaseHTTPRequestHandler):
         return payload
 
     def _handle_player(self) -> None:
-        """Mac 播放与执行端的回控。与设备回控同一条原则：**白名单，不是通用终端**。
+        """Mac 播放与执行端（player / systemeq）的回控。与设备回控同一条原则：
+        **白名单，不是通用终端**。
 
         面板上只有播放/暂停、切曲、音量、处方深度这几个动作，所以这里只放行这几个。
-        播放器没启用或没构建出来时明确拒绝并带回原因——按钮"点过了"但什么都没发生，
+        执行端没启用或没构建出来时明确拒绝并带回原因——按钮"点过了"但什么都没发生，
         是这块面板最不该有的谎。
         """
-        player = getattr(self.server, "player", None)
-        if player is None:
-            self._send_json(
-                {"ok": False, "error": "本次运行没有启用 Mac 播放器（用 --no-player 起的）"},
-                HTTPStatus.CONFLICT,
-            )
-            return
+        # 必须先读 body 再判断执行端：HTTP/1.1 keep-alive 下，不消费请求体，
+        # 残留字节会和下一条请求拼成畸形请求行（表现为 501 Unsupported method）。
         payload = self._read_json_body()
         if payload is None:
             return
@@ -313,11 +312,86 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(command, str):
             self._send_json({"ok": False, "error": "缺少 cmd 字段"}, HTTPStatus.BAD_REQUEST)
             return
+
+        player = getattr(self.server, "player", None)
+        systemeq = getattr(self.server, "systemeq", None)
+
+        if command == "depth":
+            try:
+                if systemeq is not None:
+                    result = systemeq.set_depth(float(payload.get("depth", systemeq.depth)))
+                elif player is not None:
+                    result = player.set_depth(float(payload.get("depth", player.depth)))
+                else:
+                    self._send_json(
+                        {"ok": False, "error": "本次运行没有启用任何执行端"},
+                        HTTPStatus.CONFLICT,
+                    )
+                    return
+            except (SystemEqError, PlayerError) as exc:
+                self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            except (TypeError, ValueError) as exc:
+                self._send_json(
+                    {"ok": False, "error": f"参数不合法：{exc}"}, HTTPStatus.BAD_REQUEST
+                )
+                return
+            snapshot: dict[str, Any] = {}
+            if player is not None:
+                snapshot["player"] = player.snapshot()
+            if systemeq is not None:
+                snapshot["systemeq"] = systemeq.snapshot()
+            self._send_json({"ok": True, "result": result, **snapshot})
+            return
+
+        if command == "mode":
+            # EQ 档位（basic=网友共识克制版 / aggressive=×2 明显版）只属于 systemeq。
+            if systemeq is None:
+                self._send_json(
+                    {"ok": False, "error": "EQ 档位只属于 systemeq（本次运行没有 --system-eq-app）"},
+                    HTTPStatus.CONFLICT,
+                )
+                return
+            try:
+                result = systemeq.command("mode", value=str(payload.get("value", "")))
+            except SystemEqError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json({"ok": True, "result": result, "systemeq": systemeq.snapshot()})
+            return
+
+        if command == "bypass":
+            # "关掉所有 EQ"：执行端直通。有 systemeq 优先（QQ 音乐链路），否则走 player。
+            try:
+                if systemeq is not None:
+                    result = systemeq.command("bypass", on=bool(payload.get("on")))
+                elif player is not None:
+                    result = player.command("bypass", on=bool(payload.get("on")))
+                else:
+                    self._send_json(
+                        {"ok": False, "error": "本次运行没有启用任何执行端"},
+                        HTTPStatus.CONFLICT,
+                    )
+                    return
+            except (SystemEqError, PlayerError) as exc:
+                self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            snapshot_data: dict[str, Any] = {}
+            if player is not None:
+                snapshot_data["player"] = player.snapshot()
+            if systemeq is not None:
+                snapshot_data["systemeq"] = systemeq.snapshot()
+            self._send_json({"ok": True, "result": result, **snapshot_data})
+            return
+
+        if player is None:
+            self._send_json(
+                {"ok": False, "error": "本次运行没有启用 Mac 播放器（用 --no-player 起的）"},
+                HTTPStatus.CONFLICT,
+            )
+            return
         try:
-            if command == "depth":
-                result = player.set_depth(float(payload.get("depth", player.depth)))
-            else:
-                result = player.command(command, **payload)
+            result = player.command(command, **payload)
         except PlayerError as exc:
             self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
@@ -418,11 +492,13 @@ def make_server(
     writer=None,
     releaser=None,
     player=None,
+    systemeq=None,
     on_stop=None,
     exit_fn=None,
 ) -> HostHTTPServer:
     return HostHTTPServer(
-        (host, port), Handler, state, broadcaster, writer, releaser, player, on_stop, exit_fn
+        (host, port), Handler, state, broadcaster, writer, releaser, player, systemeq,
+        on_stop, exit_fn
     )
 
 

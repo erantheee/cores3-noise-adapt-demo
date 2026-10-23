@@ -175,7 +175,7 @@
       <div class="sub" id="state-raw">—</div>
     </div>
     <div class="card">
-      <h2>现实人声增益意图</h2>
+      <h2>掩蔽推量（背景人声）</h2>
       <div class="value" id="gain">—</div>
       <div class="meter"><span id="gain-bar"></span></div>
       <div class="sub" id="gain-cap">硬上限 +6.5 dB</div>
@@ -184,20 +184,32 @@
       <h2>环境声（S3 意图 → 执行端）</h2>
       <div class="value small" id="amb">—</div>
       <div class="sub" id="amb-raw">—</div>
-      <div class="sub" id="amb-note">设备只报意图；切 AirPods 聆听模式由 Mac 执行（--ambient-open airpods）</div>
+      <div class="sub" id="amb-note">设备只报意图；聆听模式由 Mac 执行（--ambient-executor airpods，仅 TWS）</div>
     </div>
     <div class="card">
       <h2>调音（24 频段 EQ）</h2>
       <canvas id="eq" height="52" style="height:52px"></canvas>
-      <div class="sub" id="eq-note">仅用于 Mac 本地歌曲；不等于现实人声增强</div>
+      <!-- 有符号语义写死在卡片上：负=削。柱向上是抬升（蓝），向下是削减（橙），
+           零线是 0 dB；量程 -12…+10 dB 与「Mac 实际应用」共用（见 drawEq）。 -->
+      <div class="sub" id="eq-legend">设备建议（负=削）：柱向上＝抬升，柱向下＝削减；零线＝0 dB，刻度 −12…+10 dB</div>
+      <div class="sub" id="eq-note">背景人声时抬 1–4 kHz 掩蔽；≠ 降噪，≠ 人声增强</div>
     </div>
     <div class="card">
       <h2>Mac 实际应用（24 段）</h2>
       <canvas id="applied" height="52" style="height:52px"></canvas>
+      <!-- 绿柱向上=抬、向下=削；蓝线是 S3 的原始建议。图例文字由 applyNote/render 写清。 -->
+      <div class="sub" id="applied-legend">绿柱＝Mac 真正设进 EQ 的值（负值向下＝削减）；蓝线＝S3 原始建议</div>
       <div class="row" style="margin-top:6px">
         <span class="sub">处方深度</span>
         <input type="range" id="depth" min="1" max="4" step="0.1" value="2.5" style="flex:1">
         <span class="sub" id="depth-text">2.5×</span>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <span class="sub">EQ 档位</span>
+        <button id="eq-mode-basic">基础</button>
+        <button id="eq-mode-aggressive">激进</button>
+        <button id="eq-mode-off">关闭EQ</button>
+        <span class="sub" id="eq-mode-text">当前：—</span>
       </div>
       <div class="sub" id="apply-note">—</div>
       <div class="sub" id="receipt">—</div>
@@ -238,6 +250,7 @@
         <span class="sub" id="player-vol-text">150%</span>
       </div>
       <div class="sub" id="player-note">—</div>
+      <div class="sub" id="systemeq-note" style="margin-top:4px">—</div>
     </div>
     <div class="card">
       <h2>人声置信度</h2>
@@ -252,7 +265,7 @@
       <h2>趋势（最近 90 秒）</h2>
       <canvas id="chart" width="900" height="150"></canvas>
       <div class="legend">
-        <span><i style="background:#4cc2ff"></i>现实人声增益意图 dB</span>
+        <span><i style="background:#4cc2ff"></i>掩蔽推量 dB（背景人声）</span>
         <span><i style="background:#3ddc84"></i>媒体音量 %（当前固定100）</span>
       </div>
     </div>
@@ -297,18 +310,22 @@
         <span class="sub" id="llm-sessions">今日会话 —</span>
       </div>
       <div class="sub" id="llm-task">等待接入 ASR 与 LLM</div>
-      <div class="sub" style="margin-top:8px">快路径 → LLM 迟到否决（端侧先开，LLM 只纠正）</div>
-      <pre class="raw" id="llm-decision">尚无判定</pre>
-      <div class="sub" style="margin-top:8px">LLM 上下文（跨片段轮次 / 最近判定）</div>
-      <pre class="raw" id="llm-context">尚无上下文</pre>
-      <div class="sub" style="margin-top:8px">录音边界与当前说话人</div>
-      <pre class="raw" id="llm-recording">采集通道尚未启动</pre>
-      <div class="sub" style="margin-top:8px">最近片段</div>
-      <pre class="raw" id="llm-segments">尚无片段</pre>
-      <div class="sub" style="margin-top:8px">最近转写</div>
-      <pre class="raw" id="llm-transcript">尚无转写</pre>
-      <div class="sub" style="margin-top:8px">总结状态</div>
-      <div id="llm-summary">尚无会话账本</div>
+
+      <!-- 转写只放 ASR 文本；声纹/证据另放一块（用户：ASR 和你判断的窗口别放一块）。 -->
+      <div class="sub" style="margin-top:8px">ASR 转写（按轮次，最近 24 段）</div>
+      <pre class="raw" id="llm-asr">尚无转写</pre>
+
+      <div class="sub" style="margin-top:8px">判定窗口（声纹 / 语音证据）</div>
+      <pre class="raw" id="llm-windows">尚无窗口</pre>
+
+      <details style="margin-top:8px">
+        <summary class="sub">LLM 上下文 / 判定 / 录音边界（点开）</summary>
+        <div class="sub">快路径 → LLM 迟到否决（端侧先开，LLM 只纠正）</div>
+        <pre class="raw" id="llm-decision">尚无判定</pre>
+        <pre class="raw" id="llm-context">尚无上下文</pre>
+        <pre class="raw" id="llm-recording">采集通道尚未启动</pre>
+        <div id="llm-summary">尚无会话账本</div>
+      </details>
     </div>
   </div>
 
@@ -334,7 +351,7 @@
 </main>
 
 <footer>
-  <code>decision_only</code> 表示 S3 已产生决策，但 Mac 尚未回报实际施加；AirPods Pro 只播放 Mac 输出。
+  <code>decision_only</code> 表示 S3 已产生决策，但 Mac 尚未回报实际施加；耳机（自动识别 TWS / OWS）只播放 Mac 输出。
 </footer>
 
 <script>
@@ -460,11 +477,11 @@ function renderAmbient(s, f) {
   const relay = exec && exec.executor === "s3-relay";
   if (!exec) {
     $("amb-raw").textContent = "执行端未启用";
-    $("amb-note").textContent = "加 --ambient-executor relay（当前玩法）或 airpods（后续）才执行";
+    $("amb-note").textContent = "加 --ambient-executor relay（当前玩法）或 airpods（仅 TWS）才执行";
     return;
   }
   if (!exec.available) {
-    $("amb-raw").textContent = relay ? "中继不可用" : "执行端不可用（找不到 airpods CLI）";
+    $("amb-raw").textContent = relay ? "中继不可用" : "执行端不可用（找不到 airpods-control CLI；仅 TWS）";
     $("amb-note").textContent = (exec.last_error || "意图已上报，但没有执行者") + authorization;
     return;
   }
@@ -512,10 +529,16 @@ function renderContext(f) {
   const pct = Math.max(0, Math.min(100, (f.context_score || 0) * 100));
   $("ctx").textContent = f.context_text;
   bar.style.width = pct + "%";
-  $("ctx-raw").textContent = `${f.context} · ${pct.toFixed(0)}%`;
+  let raw = `${f.context} · ${pct.toFixed(0)}%`;
+  if (f.context_mixed === true && f.context_top2) {
+    const pct2 = Math.max(0, Math.min(100, (f.context_top2_score || 0) * 100));
+    raw += ` ＋ ${f.context_top2} ${pct2.toFixed(0)}%（混合）`;
+  }
+  $("ctx-raw").textContent = raw;
   let note = f.context_us === null || f.context_us === undefined
     ? "9 分类 · 只显示，不参与决策"
     : `前向 ${f.context_us} µs · 只显示，不参与决策`;
+  if (f.context_mixed === true) note = "混合环境 · " + note;
   if (f.speech_gate_valid === true && typeof f.speech_gate === "number") {
     note += ` · 说话 gate ${f.speech_gate.toFixed(2)}（${f.speech_gate_us ?? 0} µs，只做遥测）`;
   }
@@ -597,6 +620,12 @@ function render(s) {
     $("env").textContent = f.environment_text;
     $("env").className = "value env-" + f.environment;
     $("env-raw").textContent = f.environment;
+    // D47 双麦遥测（取数阶段，只显示不决策）：第二路电平、两路差、帧内相关。
+    if (f.mic2_valid === true && typeof f.mic_diff_db === "number") {
+      const coh = typeof f.mic_coherence === "number" ? f.mic_coherence.toFixed(2) : "—";
+      $("env-raw").textContent =
+        `${f.environment} · 双麦 差${fmt(f.mic_diff_db, 1, " dB")} · 相关 ${coh}`;
+    }
     renderOwnVoice(f);
     renderAmbient(s, f);
     renderContext(f);
@@ -625,13 +654,16 @@ function render(s) {
   drawEq(f ? f.tuning : null, 0);
   // 「设备实测」四个字是有意的：设备报了 eq_gain_db 才算实测，没报只能是推导值。
   // 把推导值写成实测值，是这块面板最容易犯的错。
+  // 有符号语义：负=削。削减段数/最大削减来自快照的新字段；旧 host/旧固件没有这些字段，
+  // 按 0 处理，文案与旧版一致（不把"没报"说成"没削"以外的结论）。
   $("eq-note").textContent = !f
     ? "等待设备数据"
     : f.tuning
-      ? `设备实测：S3 报的 24 段建议抬起 ${f.tuning.lifted_bands} 个频段，最高 +${f.tuning.peak_gain_db.toFixed(1)} dB`
+      ? tuningNote(f.tuning)
       : "这一帧没有调音数据（旧固件不发 eq_gain_db）；图形是由语音段增益推导的";
   $("control-warn").style.display = s.control && s.control.unresponsive ? "block" : "none";
   renderPlayer(s);
+  renderSystemEq(s);
   drawApplied(s);
   $("apply-note").textContent = applyNote(s);
   $("receipt").textContent = receiptText(s);
@@ -689,7 +721,7 @@ function renderRelay(s) {
 }
 
 // 回执：设备报了"决策已产生"，Mac 这边必须能说出"执行到哪一步"。三件事分开写，
-// 不许合成一句话——"决策已产生""Mac 已执行""AirPods 已播放"是三件不同的事，
+// 不许合成一句话——"决策已产生""Mac 已执行""耳机已播放"是三件不同的事，
 // 而第三件本链路无法验证（没有回执通路）。
 const EXECUTION_LABEL = {
   applied: "已执行（24 段已设、引擎在跑、实测有信号）",
@@ -699,27 +731,126 @@ const EXECUTION_LABEL = {
   unavailable: "不可用（播放器没起来）",
 };
 
+// 现在有两条执行端：tools/player（本地曲目）与 systemeq（第三方播放器 tap）。
+// 启用 systemeq 时 S3 的 24 段发到 systemeq，所以"Mac 实际应用"卡画的是它。
+function executionSide(s) {
+  const se = s.systemeq;
+  if (se && se.available !== false) return { kind: "systemeq", data: se };
+  return s.player ? { kind: "player", data: s.player } : null;
+}
+
 function receiptText(s) {
-  const player = s.player;
   const device = s.frame ? s.frame.execution : "unknown";
-  if (!player) {
-    return `设备自报 execution=${device} · Mac：本次运行没有启用播放器 · AirPods 是否已播放：无法验证`;
+  const side = executionSide(s);
+  if (!side) {
+    return `设备自报 execution=${device} · Mac：本次运行没有启用执行端 · 耳机是否已播放：无法验证`;
   }
-  const state = EXECUTION_LABEL[player.execution] || `未知状态（${player.execution}）`;
-  return `设备自报 execution=${device} · Mac：${state} · AirPods 是否已播放：无法验证（链路无回执）`;
+  const label = side.kind === "systemeq" ? "QQ音乐 tap" : "Mac";
+  const state = EXECUTION_LABEL[side.data.execution] || `未知状态（${side.data.execution}）`;
+  return `设备自报 execution=${device} · ${label}：${state} · 耳机是否已播放：无法验证（链路无回执）`;
+}
+
+// 调音卡的文案。有符号语义必须写在数字旁边：负=削。
+// 旧 host 的快照没有 cut_bands/max_cut_db 时按 0 处理——本产品当前固件只发非负值，
+// 两种说法此时一致；新固件发负值时这里会给出削减段数与最低值。
+function tuningNote(tuning) {
+  const lifted = Number(tuning.lifted_bands) || 0;
+  const peak = Number(tuning.peak_gain_db) || 0;
+  const cuts = Number(tuning.cut_bands) || 0;
+  const maxCut = Number(tuning.max_cut_db) || 0;
+  const head = "设备实测：S3 建议（负=削）";
+  if (cuts > 0) {
+    const liftText = lifted > 0
+      ? `抬起 ${lifted} 个频段（最高 +${peak.toFixed(1)} dB）`
+      : "没有抬升段";
+    return `${head}${liftText}、削减 ${cuts} 个频段（最低 ${maxCut.toFixed(1)} dB）`;
+  }
+  return `${head}抬起 ${lifted} 个频段，最高 +${peak.toFixed(1)} dB（本帧没有削减段）`;
 }
 
 function applyNote(s) {
-  const player = s.player;
-  if (!player || !player.available) {
+  const side = executionSide(s);
+  if (!side || !side.data.available) {
     return "没有执行端：这条曲线画不出来。音频被谁改了，面板就必须能说清——说不清就不画。";
   }
-  const applied = Array.isArray(player.applied_bands) ? player.applied_bands : [];
+  const exec = side.data;
+  const applied = Array.isArray(exec.applied_bands) ? exec.applied_bands : [];
   if (applied.length === 0) return "还没有下发过调音。";
-  const peak = Number(player.applied_peak_db) || 0;
-  return `绿柱＝Mac 真正设进 EQ 的值（峰值 +${peak.toFixed(2)} dB）；蓝线＝S3 报的原始建议。` +
-    `形状来自 S3，深度 ${(player.depth || 0).toFixed(1)}× 是本机为"听得出来"设的演示参数，` +
-    `面板不把它说成设备的建议。`;
+  // 有符号（负=削）：新 host 的快照直接给 peak_abs/max_cut/段数；
+  // 旧 host 没有这三个字段时，从 applied_bands 里读（数组本身就是播放器的实测，
+  // 从它取几个数不是面板在造曲线）。
+  const values = applied.map((value) => Number(value) || 0);
+  const peakAbs = Number.isFinite(Number(exec.applied_peak_abs_db))
+    ? Number(exec.applied_peak_abs_db)
+    : values.reduce((peak, value) => Math.max(peak, Math.abs(value)), 0);
+  const maxCut = Number.isFinite(Number(exec.applied_max_cut_db))
+    ? Number(exec.applied_max_cut_db)
+    : Math.min(0, ...values);
+  const cutBands = Number.isFinite(Number(exec.applied_cut_bands))
+    ? Number(exec.applied_cut_bands)
+    : values.filter((value) => value < -0.05).length;
+  const shape = cutBands > 0
+    ? `绝对值最大 ${peakAbs.toFixed(2)} dB（其中最大削减 ${maxCut.toFixed(2)} dB，${cutBands} 段在削）`
+    : `峰值 +${peakAbs.toFixed(2)} dB`;
+  const owner = side.kind === "systemeq" ? "QQ音乐 tap" : "Mac";
+  const extra = side.kind === "systemeq" && exec.demo
+    ? "（含 demo 基线，S3 ×深度）"
+    : `（形状来自 S3，深度 ${(exec.depth || 0).toFixed(1)}× 是本机为"听得出来"设的演示参数）`;
+  return `绿柱＝${owner} 真正设进 EQ 的值${extra}（${shape}，向上=抬 / 向下=削）；蓝线＝S3 报的原始建议。`;
+}
+
+function renderEqMode(se) {
+  // 三档 A/B 测试开关：基础＝网友共识克制基线，激进＝×2 明显基线，关闭EQ＝执行端直通。
+  const bypass = se ? !!se.bypass : false;
+  const mode = (se && se.mode) || "aggressive";
+  ["basic", "aggressive", "off"].forEach((key) => {
+    const btn = $("eq-mode-" + key);
+    if (!btn) return;
+    const active = key === "off" ? bypass : !bypass && mode === key;
+    btn.disabled = !se || se.available === false;
+    btn.style.background = active ? "#2f6db3" : "";
+    btn.style.color = active ? "#fff" : "";
+  });
+  const label = $("eq-mode-text");
+  if (label) {
+    label.textContent = !se
+      ? "未启用执行端"
+      : bypass
+        ? "当前：EQ 全关（直通）"
+        : "当前：" + (mode === "basic" ? "基础" : "激进");
+  }
+}
+
+function renderSystemEq(s) {
+  const el = $("systemeq-note");
+  const se = s.systemeq;
+  renderEqMode(se);
+  if (!se) {
+    el.textContent = "未启用第三方播放器 system EQ（--system-eq-app）";
+    return;
+  }
+  if (se.available === false) {
+    el.textContent = `QQ 音乐 tap 不可用：${se.reason || "进程没起来"}`;
+    return;
+  }
+  const exec = {
+    applied: "已执行",
+    idle: "空闲（无回执）",
+    silent: "无信号",
+    bypass: "直通",
+    unavailable: "不可用",
+  }[se.execution] || se.execution;
+  const harsh = Number(se.content_harshness);
+  const env = Number(se.content_env_exposure);
+  const trim = Number(se.content_trim);
+  const contentNote = Number.isFinite(harsh)
+    ? ` · 内容 ${(harsh * 100).toFixed(0)}% · 环境 ${Number.isFinite(env) ? (env * 100).toFixed(0) : "?"}% · 高频压 ${Number.isFinite(trim) ? (trim * 100).toFixed(0) : "?"}%`
+    : "";
+  el.textContent = `QQ 音乐 tap：${exec}${se.demo ? " · demo基线" : ""} · RMS ${fmt(se.rms, 4)} · 峰值 ${fmt(se.peak, 2)} · `
+    + `深度 ${(Number(se.depth) || 0).toFixed(1)}× · ${se.sample_rate || "?"} Hz · `
+    + `状态 ${se.state_age_s ?? "?"} s 前${contentNote}${se.last_error ? ` · ${se.last_error}` : ""}`;
+  // 深度滑块现在是 systemeq 的处方深度（1…4 倍）。
+  $("depth-text").textContent = (Number(se.depth) || 0).toFixed(1) + "×";
 }
 
 function renderPlayer(s) {
@@ -763,12 +894,72 @@ function renderPlayer(s) {
   $("player-vol-text").textContent = Math.round(player.volume_percent) + "%";
 }
 
+// 24 段调音（设备建议）与 Mac 实际应用共用一把**有符号**刻度：
+//   0 dB 是零线，正=抬向上、负=削向下。
+// 量程取快照 caps.band_gain_db（host 下发，等于播放器可执行范围）；旧 host 没有这个字段
+// 时退回同一组契约常量——面板不写死一个"只抬不削"的轴，也不自己造曲线。
+const BAND_RANGE_FALLBACK_DB = { min: -12, max: 10 };
+// 设备建议卡的刻度：永远用 caps（S3 建议口径 ±4，不要被执行端的 ±24 把蓝线压扁）。
+function bandRange(s) {
+  const caps = (s && s.caps && s.caps.band_gain_db) || {};
+  const min = Number.isFinite(Number(caps.min)) ? Number(caps.min) : BAND_RANGE_FALLBACK_DB.min;
+  const max = Number.isFinite(Number(caps.max)) ? Number(caps.max) : BAND_RANGE_FALLBACK_DB.max;
+  return max > min ? { min, max } : BAND_RANGE_FALLBACK_DB;
+}
+
+// "Mac 实际应用"卡的刻度：执行端真正能执行的量程（player 是 -12…+10，systemeq 是 ±24）。
+function appliedBandRange(s) {
+  const side = executionSide(s);
+  if (side && Number.isFinite(Number(side.data.min_applied_gain_db))
+      && Number.isFinite(Number(side.data.max_applied_gain_db))) {
+    const min = Number(side.data.min_applied_gain_db);
+    const max = Number(side.data.max_applied_gain_db);
+    if (max > min) return { min, max };
+  }
+  return bandRange(s);
+}
+
+// 画 24 段有符号柱：从零线向上（正=抬，posColor）或向下（负=削，negColor）。
+// 返回 { zeroY, yOf }，调用方据此补刻度与"设备原始建议"的蓝线。
+function drawSignedBands(ctx, width, height, range, values, posColor, negColor) {
+  const topY = 10, bottomY = height - 10;
+  const span = range.max - range.min;
+  const clamp = (value) => Math.max(range.min, Math.min(range.max, Number(value) || 0));
+  const yOf = (value) => topY + ((range.max - clamp(value)) / span) * (bottomY - topY);
+  const zeroY = yOf(0);
+  const bands = values.length || 24;
+  const slot = width / bands;
+  const barWidth = Math.max(2, slot - 2);
+  // 零线先画：所有柱子从它出发，读数前先看见 0 dB 在哪。
+  ctx.fillStyle = "#44576b";
+  ctx.fillRect(0, Math.round(zeroY), width, 1);
+  for (let band = 0; band < bands; band++) {
+    const value = clamp(values[band]);
+    const y = yOf(value);
+    ctx.fillStyle = Math.abs(value) <= 0.05 ? "#243244" : value > 0 ? posColor : negColor;
+    const top = Math.min(y, zeroY);
+    const barHeight = Math.max(2, Math.abs(zeroY - y));
+    ctx.fillRect(band * slot + 1, top, barWidth, barHeight);
+  }
+  return { zeroY, yOf };
+}
+
+// 图内刻度：下界、零线、上界。负段必须能在同一个刻度上读出来（-12…+10 dB）。
+function drawBandScale(ctx, width, height, zeroY, range) {
+  ctx.fillStyle = "#8ea3b8";
+  ctx.font = "10px ui-monospace, Menlo, monospace";
+  ctx.fillText(`${range.min} dB`, 2, height - 1);
+  ctx.fillText("0 dB", 2, Math.max(10, zeroY - 3));
+  ctx.fillText(`+${range.max} dB`, width - 52, 10);
+}
+
 function drawApplied(s) {
   const canvas = $("applied");
   if (!canvas || !canvas.getContext) return;
-  const player = s.player || {};
-  const applied = Array.isArray(player.applied_bands) ? player.applied_bands : [];
-  const source = Array.isArray(player.source_bands) ? player.source_bands : [];
+  const side = executionSide(s);
+  const exec = side ? side.data : {};
+  const applied = Array.isArray(exec.applied_bands) ? exec.applied_bands : [];
+  const source = Array.isArray(exec.source_bands) ? exec.source_bands : [];
   const dpr = window.devicePixelRatio || 1;
   const width = canvas.clientWidth || 300;
   const height = 52;
@@ -778,26 +969,23 @@ function drawApplied(s) {
   if (!ctx.setTransform) return;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, width, height);
-  // 纵轴按播放器自报的硬上限（+10 dB），不是 S3 的上限：S3 建议 +4 dB 经深度放大后
-  // 会超过它，若按 6.5 画，柱子会被截平，看起来像是"设备建议有这么高"。
-  const maxDb = Math.max(1, Number(player.max_applied_gain_db) || 10);
+  // 有符号：绿柱向上=抬、向下=削。量程取执行端真正能执行的范围
+  // （player -12…+10，systemeq ±24）；设备建议卡仍用自己的 caps 刻度。
+  const range = appliedBandRange(s);
   const bands = 24;
+  const values = Array.from(
+    { length: bands },
+    (_, band) => (applied.length === 0 ? 0 : Number(applied[band]) || 0)
+  );
+  const { zeroY, yOf } = drawSignedBands(ctx, width, height, range, values, "#3ddc84", "#ff9f43");
+  // 蓝线＝S3 报的原始建议；绿柱才是 Mac 真正设进 EQ 的值（差值来自深度倍率）。
   const slot = width / bands;
   const barWidth = Math.max(2, slot - 2);
+  ctx.fillStyle = "#4cc2ff";
   for (let band = 0; band < bands; band++) {
-    const value = Math.max(0, Math.min(maxDb, Number(applied[band]) || 0));
-    const barHeight = (value / maxDb) * (height - 10);
-    ctx.fillStyle = applied.length === 0 ? "#243244" : "#3ddc84";
-    ctx.fillRect(band * slot + 1, height - 5 - barHeight, barWidth, Math.max(2, barHeight));
-    const suggested = Math.max(0, Math.min(maxDb, Number(source[band]) || 0));
-    const suggestedY = height - 5 - (suggested / maxDb) * (height - 10);
-    ctx.fillStyle = "#4cc2ff";
-    ctx.fillRect(band * slot + 1, suggestedY, barWidth, 1.5);
+    ctx.fillRect(band * slot + 1, yOf(source[band]), barWidth, 1.5);
   }
-  ctx.fillStyle = "#8ea3b8";
-  ctx.font = "10px ui-monospace, Menlo, monospace";
-  ctx.fillText("0 dB", 2, height - 1);
-  ctx.fillText(`+${maxDb.toFixed(1)} dB`, width - 58, 10);
+  drawBandScale(ctx, width, height, zeroY, range);
 }
 
 function renderLatency(s) {
@@ -845,26 +1033,21 @@ function drawEq(tuning, fallbackGainDb) {
   if (!ctx.setTransform) return;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, width, height);
-  const maxDb = 6.5;
+  // 有符号语义：负=削。以 0 dB 为零线，正段向上（蓝）、负段向下（橙）。
+  // 量程与「Mac 实际应用」共用（caps.band_gain_db，-12…+10 dB），
+  // 不再写死一个"只抬不削"的 6.5 dB 上限。
+  const range = bandRange(lastSnapshot);
   // 优先画设备报回来的每频段增益。设备没报（旧固件）时才退回"由标量增益推出的形状"，
   // 并且在下方注明这是推导值——把推导值画得像实测值，是这块面板最容易犯的错。
   const measured = tuning && Array.isArray(tuning.band_gain_db) ? tuning.band_gain_db : null;
-  const bands = measured ? measured.length : 24;
-  const slot = width / bands, barWidth = Math.max(2, slot - 2);
-  for (let band = 0; band < bands; band++) {
-    const inSpeech = band >= 8 && band <= 16;
-    const value = measured
-      ? Math.max(0, Math.min(maxDb, measured[band]))
-      : (inSpeech ? Math.max(0, Math.min(maxDb, fallbackGainDb)) : 0);
-    const barHeight = (value / maxDb) * (height - 10);
-    const x = band * slot + 1;
-    ctx.fillStyle = value > 0.05 ? "#4cc2ff" : "#243244";
-    ctx.fillRect(x, height - 5 - barHeight, barWidth, Math.max(2, barHeight));
-  }
-  ctx.fillStyle = "#8ea3b8";
-  ctx.font = "10px ui-monospace, Menlo, monospace";
-  ctx.fillText("0 dB", 2, height - 1);
-  ctx.fillText(`+${maxDb} dB`, width - 44, 10);
+  const values = measured
+    ? measured
+    : Array.from(
+        { length: 24 },
+        (_, band) => (band >= 8 && band <= 16 ? Math.max(0, Number(fallbackGainDb) || 0) : 0)
+      );
+  const { zeroY } = drawSignedBands(ctx, width, height, range, values, "#4cc2ff", "#ff9f43");
+  drawBandScale(ctx, width, height, zeroY, range);
 }
 
 function renderCapture(s) {
@@ -958,21 +1141,50 @@ function renderAssistant(s) {
     : "当前片段：未检测到需要转写的人声";
   $("llm-recording").textContent = `${channelLine}\n${candidateLine}`;
   const segments = Array.isArray(a.segments) ? a.segments : [];
-  $("llm-segments").textContent = segments.length
-    ? segments.map((item) => {
-        const skipped = /^(未识别|未检测到)/.test(item.transcript || "");
-        return (
-          `#${item.number} ${item.started_at || "—"} → ${item.ended_at || "—"} · ${item.duration_s || 0}s\n` +
-          `说话人 ${item.speaker || "unknown"} · 结束：${item.end_reason || "—"}` +
-          `${Number(item.speech_s) > 0 ? ` · 有效语音 ${Number(item.speech_s).toFixed(1)}s` : ""}` +
-          `${Number(item.asr_gain_db) > 0 ? ` · ASR远场增益 +${Number(item.asr_gain_db).toFixed(1)}dB` : ""}` +
-          `${item.asr_note ? `\n证据/过滤：${item.asr_note}` : ""}` +
-          `${skipped && item.asr_raw ? `\nASR 原始输出：${item.asr_raw}` : ""}\n` +
-          `${item.transcript || "等待转写"}`
-        );
-      }).join("\n\n")
-    : "尚无片段";
-  $("llm-transcript").textContent = a.transcript || "尚无转写";
+  const asrStats = a.asr_stats || null;
+  const statsLine = asrStats && asrStats.segments
+    ? `通过 ${asrStats.passed || 0}/${asrStats.segments} 段 · 跳过 ${asrStats.skipped || 0}` +
+      ` · 过滤 ${asrStats.filtered || 0}` +
+      (asrStats.latency_p50_ms !== null && asrStats.latency_p50_ms !== undefined
+        ? ` · ASR p50 ${Math.round(asrStats.latency_p50_ms)} ms` : "")
+    : "尚无统计";
+  // ASR 区：只放转写文本 + 谁说的，按时间正序；不夹带声纹分数/证据。
+  const asrLines = segments.slice().reverse().map((item) => {
+    const text = (item.transcript || "").replace(/\n+/g, " / ").trim() || "（无文字）";
+    return `#${item.number} ${item.started_at || "—"} · ${text}`;
+  });
+  $("llm-asr").textContent = statsLine + (asrLines.length
+    ? "\n\n" + asrLines.join("\n") : "\n\n尚无转写");
+
+  // 窗口区：声纹窗 + 每段的语音证据/判定依据；不放转写正文。
+  const vp = s.voiceprint || {};
+  const vpHist = Array.isArray(vp.history) ? vp.history.slice(-10) : [];
+  const windowLines = [];
+  if (vp.ready) {
+    windowLines.push(
+      `声纹 ${vp.verdict || "—"} ${fmt(vp.smoothed !== null && vp.smoothed !== undefined ? vp.smoothed : vp.score, 2)}` +
+      ` · 语音比 ${fmt(vp.speech_ratio, 2)} · 本底 ${fmt(vp.energy_floor_dbfs, 1)} dBFS`
+    );
+    for (const w of vpHist) {
+      windowLines.push(
+        `  窗 ${w.verdict || "—"} ${fmt(w.score, 2)} · ${fmt(w.dbfs, 1)} dBFS · 语音比 ${fmt(w.speech_ratio, 2)}`
+      );
+    }
+  } else {
+    windowLines.push(vp.error || "声纹未启用（--voiceprint）");
+  }
+  windowLines.push("");
+  for (const item of segments.slice(0, 6)) {
+    windowLines.push(
+      `#${item.number} ${item.started_at || "—"}→${item.ended_at || "—"} ${fmt(item.duration_s, 1)}s` +
+      ` · 说话人 ${item.speaker || "unknown"}` +
+      (Number(item.speech_s) > 0 ? ` · 语音 ${fmt(item.speech_s, 1)}s` : "") +
+      (Number(item.asr_gain_db) > 0 ? ` · 增益 +${fmt(item.asr_gain_db, 1)}dB` : "") +
+      (item.asr_note ? ` · ${item.asr_note}` : "") +
+      (item.asr_raw ? ` · 原始输出 ${item.asr_raw}` : "")
+    );
+  }
+  $("llm-windows").textContent = windowLines.join("\n");
   $("llm-summary").textContent = (a.summary_state || "尚无会话账本")
     + (a.llm_warning ? `\n${a.llm_warning}` : "");
   $("llm-sessions").textContent = a.today_sessions === null || a.today_sessions === undefined
@@ -1050,7 +1262,7 @@ function drawChart(samples) {
     ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(width, y); ctx.stroke();
   }
 
-  // 现实人声增益意图与媒体音量分开；意图不等于 AirPods 已执行。
+  // 现实人声增益意图与媒体音量分开；意图不等于耳机已执行。
   const series = [
     { key: "vg", color: "#4cc2ff", max: 8 },
     { key: "m", color: "#3ddc84", max: 100 },
@@ -1169,6 +1381,17 @@ $("player-vol").addEventListener("change", async (event) =>
   playerToast(await sendPlayer({ cmd: "volume", percent: Number(event.target.value) })));
 $("depth").addEventListener("change", async (event) =>
   playerToast(await sendPlayer({ cmd: "depth", depth: Number(event.target.value) })));
+
+// EQ 三档 A/B：基础/激进切 systemeq 的 demo 基线档位（顺带解除直通），关闭EQ=执行端直通。
+["basic", "aggressive"].forEach((key) => {
+  $("eq-mode-" + key).addEventListener("click", async () => {
+    const result = await sendPlayer({ cmd: "mode", value: key });
+    playerToast(result);
+    if (result.ok) sendPlayer({ cmd: "bypass", on: false });
+  });
+});
+$("eq-mode-off").addEventListener("click", async () =>
+  playerToast(await sendPlayer({ cmd: "bypass", on: true })));
 
 // 进度条：拖动时只更新文字（并暂停跟随状态），松手才真的 seek——一次拖动不该发几十条命令。
 $("player-seek").addEventListener("input", () => {

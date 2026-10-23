@@ -54,15 +54,21 @@ TARGETS = {
              "conversation": "NONE", "ambient_open": False},
 }
 
-#: 模拟的情境模型输出：固件那 4 个环境各自对应的类别与分数。**这是模拟值，不是测量值**——
-#: 它的用途只是让面板在 `--mock` 下把情境卡跑起来（真机现在的实际输出见 plan-status 第 29 项：
-#: 安静房间里模型几乎总是报 other）。
+#: 模拟的情境模型输出：固件那 4 个环境各自对应的 (top1, top1_score, top2, top2_score)。
+#: **这是模拟值，不是测量值**——它的用途只是让面板在 `--mock` 下把情境卡跑起来
+#: （真机现在的实际输出见 plan-status 第 29 项：安静房间里模型几乎总是报 other）。
+#: D46：VOICE / LOUD 特意给成混合窗（top2 ≥ 0.20 与固件 kMixedTop2Threshold 同值），
+#: 让面板与测试在 --mock 下能跑到"混合环境"这条路径；QUIET / NOISY 保持单类。
 CONTEXT_FOR_ENVIRONMENT = {
-    "QUIET": ("quiet", 0.93),
-    "NOISY": ("steady", 0.88),
-    "VOICE": ("near_voice", 0.72),
-    "LOUD": ("street", 0.61),
+    "QUIET": ("quiet", 0.93, "other", 0.04),
+    "NOISY": ("steady", 0.84, "wind", 0.08),
+    "VOICE": ("near_voice", 0.62, "babble", 0.21),
+    "LOUD": ("street", 0.55, "steady", 0.24),
 }
+
+#: 固件里"混合"的第二候选概率门槛（main/context_window.hpp kMixedTop2Threshold）。
+#: 模拟源按同阈值算 context_mixed，保证 --mock 与真机的布尔语义一致。
+CONTEXT_MIXED_TOP2_THRESHOLD = 0.20
 
 #: 固件要攒满 2 秒窗（20 帧 × 100 ms）才给判断，在那之前报 valid=false + 占位类别 unknown。
 #: 模拟源必须复刻这一段，否则面板会在那两秒里显示一个凭空的类别。
@@ -165,10 +171,12 @@ class MockDevice:
         self._gain = self._ramp(self._gain, min(target["gain"], DEMO_SPEECH_GAIN_DB), dt)
         self._media = self._ramp(self._media, float(target["media"]), dt, tau_s=1.6)
 
-        # 情境模型：前 2 秒窗没满，固件报 valid=false；之后按环境给一个类别。一次前向的
-        # 耗时取真机实测的量级（p50 151–158 µs，见 plan-status 第 29 项）。
+        # 情境模型：前 2 秒窗没满，固件报 valid=false；之后按环境给 top1 + top2。
+        # 一次前向的耗时取真机实测的量级（p50 151–158 µs，见 plan-status 第 29 项）。
         context_valid = at_s >= CONTEXT_WARMUP_S
-        context_class, context_score = CONTEXT_FOR_ENVIRONMENT[environment]
+        context_class, context_score, context_top2, context_top2_score = (
+            CONTEXT_FOR_ENVIRONMENT[environment]
+        )
         context_us = int(155 + 25 * self._random.random())
 
         # 声音事件判断（1 s 窗）：窗没满时 valid=false，类别报占位 quiet。
@@ -216,6 +224,15 @@ class MockDevice:
                         "spectral_flatness": round(0.08 if environment == "VOICE" else 0.40, 4),
                         "vocal_peakiness": round(0.45 if environment == "VOICE" else 0.70, 3),
                         "excited_vocal_bands": 12 if environment == "VOICE" else 6,
+                        # D47 双麦遥测（模拟值，不是测量值）：VOICE 当近场（两路电平差大、
+                        # 相关低），其余环境当远场（两路一致、相关高）。用途只是让面板
+                        # 与测试在 --mock 下把这条路径跑起来。
+                        "mic2_broadband_dbfs": round(
+                            _mock_dbfs(environment) + (2.4 if environment == "VOICE" else 0.1), 1
+                        ),
+                        "mic_diff_db": round(2.4 if environment == "VOICE" else 0.1, 2),
+                        "mic_coherence": round(0.35 if environment == "VOICE" else 0.95, 3),
+                        "mic2_valid": True,
                         "state": state,
                         "environment": environment,
                         "mode": mode,
@@ -231,6 +248,16 @@ class MockDevice:
                         "context_score": round(context_score, 3) if context_valid else 0.0,
                         "context_valid": context_valid,
                         "context_us": context_us,
+                        # D46 混合环境识别：第二候选与混合标志，与固件同构。
+                        # valid=false 时报占位 unknown/0.0/false（与 context 组同构）。
+                        "context_top2": context_top2 if context_valid else "unknown",
+                        "context_top2_score": (
+                            round(context_top2_score, 3) if context_valid else 0.0
+                        ),
+                        "context_mixed": bool(
+                            context_valid
+                            and context_top2_score >= CONTEXT_MIXED_TOP2_THRESHOLD
+                        ),
                         # 声音事件判断（1 s 窗规则，main/sound_event.hpp）。valid=false 有两种
                         # 情况：窗还没攒满，或刚被撞击清空（那时类别是 artifact）。模拟源只
                         # 复刻前者；artifact 由测试直接构造帧。

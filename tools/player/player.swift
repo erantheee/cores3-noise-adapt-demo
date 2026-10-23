@@ -37,7 +37,10 @@ let bandCenters: [Float] = [
 /// 固件的硬上限是 kMaxSpeechGainDb = 6.5、demo 上限 kDemoSpeechGainDb = 8.0，用户既定规则是
 /// "任何测试不得超过 +10 dB"。Mac 这一侧再放大也不许越过 10。
 let maxAppliedGainDb: Float = 10.0
-/// 允许的衰减范围。S3 目前只发 0…+4（song_eq）与 0…+8（人声意图），负值留给以后。
+/// 允许的衰减范围。S3 的 song_eq 现在发**有符号**建议（正=抬、负=削，约 -4…+4 dB；
+/// 人声意图仍是 0…+8），所以负值不再是"留给以后"：`scaled = band × depth` 之后
+/// 与原实现一样钳在 [-12, +10] 内执行。上位机（tools/host/player.py 的
+/// MIN_APPLIED_GAIN_DB / MAX_APPLIED_GAIN_DB）镜像同一组数用于面板刻度，改这里要同步。
 let minAppliedGainDb: Float = -12.0
 /// 每个 tick 向目标推进的比例。100 ms 决策节拍下，约 5 个 tick（≈100 ms）跟上，
 /// 与固件 300 ms attack 的手感一致，同时消掉逐帧跳变带来的 zipper 噪声。
@@ -152,6 +155,29 @@ final class Player {
     private var engineRunning = false
     private var lastError = ""
 
+    /// 系统输出设备变了（耳机连上/断开、默认输出切换）时置位，实际重启放在 tick 里做。
+    /// 不在通知线程上动 AVAudioEngine：参数更新必须发生在固定线程，这是本文件的既有约定。
+    private var configurationChanged = false
+    /// 重启引擎期间忽略自己触发的 configuration change，避免"重启→通知→再重启"的自激。
+    private var engineRestartInProgress = false
+    /// 两次重启之间的最小间隔。没有它，引擎重启自身的通知会在下一拍再触发一次重启
+    /// （实测：位置以约 0.17× 速度前进 = 每 0.5 秒被重启拉回一次）。
+    private var lastEngineRestartAt = Date.distantPast
+    /// 重启次数。给面板/日志一个"引擎被设备切换折腾了几次"的可见数字。
+    private var recoveries = 0
+    /// 看门狗：在播但位置长时间不动 = 引擎没有真正渲染。只靠通知不足以覆盖全部情况。
+    private var lastAdvanceAt = Date()
+    private var lastAdvancePosition: Double = 0
+    /// 刚 player.play() 后 `playerTime` 可能还读不到。此时不能把锚点留在 0——
+    /// 节点时间轴是累计的（含重启前的秒数），之后读到的第一个值会把位置直接推到
+    /// "应用启动以来的时长"（实测：切回 Xiaomi 后位置从 0.7 s 跳到 18.4 s）。
+    private var segmentAnchorPending = false
+    /// 本段开始播放的墙钟时刻与那一刻的媒体位置。用于校验 playerTime：
+    /// 引擎重启后节点时间轴可能不清零，读数和真实播放进度会差出几十秒（2026-10-21 实测：
+    /// 位置从 1.9 s 跳到 26 s）。差太多时把锚点重新对到墙钟位置，而不是把错误当结论。
+    private var playStartedAt: Date?
+    private var playStartPosition: Double = 0
+
     init() {
         engine.attach(player)
         engine.attach(eq)
@@ -219,6 +245,19 @@ final class Player {
             return
         }
         outputDevice = defaultOutputName()
+        // 2026-10-21 实测：宿主启动时默认输出是 AirPods，之后 Xiaomi 耳夹接管默认输出，
+        // AVAudioEngine 会悄悄停止渲染——engine.isRunning 仍是 true、player.play() 也不报错，
+        // 但位置恒 0、峰值冻住，面板显示在播、用户什么都听不到。所以必须接这个通知，
+        // 重启引擎并重排当前片段（见 recoverEngine）。
+        NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.lock.lock()
+            let cooling = Date().timeIntervalSince(self.lastEngineRestartAt) < 1.5
+            if !self.engineRestartInProgress && !cooling { self.configurationChanged = true }
+            self.lock.unlock()
+        }
         let timer = Timer(timeInterval: tickSeconds, repeats: true) { [weak self] _ in
             self?.tick()
         }
@@ -236,6 +275,54 @@ final class Player {
     private var deviceCheckCount = 0
 
     private func tick() {
+        // player.play() 刚返回时 playerTime 可能还读不到；一旦能读到就现场补锚点。
+        // 不补的话，累计的节点时间会把位置直接算成"启动以来时长"。
+        lock.lock()
+        if segmentAnchorPending, player.isPlaying,
+           let renderTime = player.lastRenderTime,
+           let nodeTime = player.playerTime(forNodeTime: renderTime) {
+            segmentStartPlayerSample = nodeTime.sampleTime
+            segmentAnchorPending = false
+        }
+        // 看门狗：播放中但位置长时间不动，说明引擎在"假运行"（设备切换后的已知失效模式）。
+        // 通知在有些路径上不会到，所以除了通知还要看位置本身。
+        let playingNow = playing
+        let engineOK = engineRunning
+        let currentPosition = positionSecondsLocked()
+        lock.unlock()
+        if playingNow && engineOK {
+            if currentPosition > lastAdvancePosition + 0.05 {
+                lastAdvancePosition = currentPosition
+                lastAdvanceAt = Date()
+            } else if Date().timeIntervalSince(lastAdvanceAt) > 1.5 {
+                lock.lock(); configurationChanged = true; lock.unlock()
+                lastAdvanceAt = Date()
+            }
+        } else {
+            lastAdvanceAt = Date()
+            lastAdvancePosition = currentPosition
+        }
+
+        // 先处理"输出设备切换/断连导致引擎停了"：通知不一定到，engine.isRunning 也可能
+        // 还是 true（见 configurationChanged 的注释），所以两路都查。
+        lock.lock()
+        var needsRecovery = configurationChanged
+        if engineRunning && !engine.isRunning { needsRecovery = true }
+        configurationChanged = false
+        let wasPlaying = playing
+        let resumeAt = positionSecondsLocked()
+        let recentRestart = Date().timeIntervalSince(lastEngineRestartAt) < 1.5
+        lock.unlock()
+        if needsRecovery && !recentRestart {
+            // 引擎停下后 positionSecondsLocked 只能给出片段起点；用看门狗记的最后已知位置兜底，
+            // 否则每次切耳机都从 0 重新开始（实测：切到扬声器后位置从 4.1 s 退回 0）。
+            let knownPosition = max(resumeAt, lastAdvancePosition)
+            // 先作废旧片段再 player.stop()：stop 会同步触发完成回调，不作废会自激换曲。
+            lock.lock(); invalidateSegmentLocked(); lock.unlock()
+            player.stop()
+            _ = recoverEngine(resumeAt: knownPosition, resumePlayback: wasPlaying)
+        }
+
         lock.lock()
         let pending = commands
         commands.removeAll()
@@ -309,6 +396,7 @@ final class Player {
             "output_device": outputDevice,
             "sample_rate": fileRate,
             "last_error": lastError,
+            "recoveries": recoveries,
             "track_count": tracks.count,
         ]
         lock.unlock()
@@ -471,6 +559,67 @@ final class Player {
         enqueue(["cmd": "next", "autoplay": true])
     }
 
+    /// 输出设备变化后重启引擎；需要时把当前曲目从 `resumeAt` 重排并继续播放。
+    ///
+    /// 为什么必须重排：引擎停止时 player 队列里已排的 buffer 已作废，只调 player.play()
+    /// 会在空队列上跑——位置恒 0、峰值冻住，面板显示在播却没有声音（2026-10-21 实测）。
+    @discardableResult
+    private func recoverEngine(resumeAt: Double, resumePlayback: Bool) -> Bool {
+        lock.lock(); engineRestartInProgress = true; lock.unlock()
+        if engine.isRunning { engine.stop() }
+        do {
+            try engine.start()
+        } catch {
+            lock.lock()
+            engineRunning = false
+            engineRestartInProgress = false
+            lastError = "输出设备变化后引擎重启失败：\(error.localizedDescription)"
+            lock.unlock()
+            emitError(lastError)
+            emitState()
+            return false
+        }
+        lock.lock()
+        engineRunning = true
+        engineRestartInProgress = false
+        lastEngineRestartAt = Date()
+        recoveries += 1
+        lastAdvanceAt = Date()
+        lastAdvancePosition = positionSecondsLocked()
+        outputDevice = defaultOutputName()
+        lock.unlock()
+        guard resumePlayback else {
+            // 暂停状态下切耳机：把片段起点留在原处，下一次 play() 从暂停位置继续，
+            // 而不是因为 invalidate 把起点清成 0 从头播。
+            lock.lock()
+            segmentStartFrame = AVAudioFramePosition(
+                max(0, resumeAt) * (fileRate > 0 ? fileRate : 44100))
+            segmentAnchorPending = false
+            lock.unlock()
+            emitState()
+            return true
+        }
+        scheduleCurrent(fromSeconds: max(0, resumeAt))
+        player.play()
+        lock.lock()
+        if let renderTime = player.lastRenderTime,
+           let nodeTime = player.playerTime(forNodeTime: renderTime) {
+            segmentStartPlayerSample = nodeTime.sampleTime
+            segmentAnchorPending = false
+        } else {
+            segmentAnchorPending = true
+        }
+        segmentActive = true
+        playing = true
+        playStartPosition = Double(segmentStartFrame) / (fileRate > 0 ? fileRate : 44100)
+        playStartedAt = Date()
+        lastAdvanceAt = Date()
+        lastAdvancePosition = positionSecondsLocked()
+        lock.unlock()
+        emitState()
+        return true
+    }
+
     private func play() {
         let index = currentIndex()
         lock.lock()
@@ -478,6 +627,16 @@ final class Player {
         let prepared = segmentPrepared
         lock.unlock()
         if !hasFile && !loadFile(index: index) { return }
+        if !engine.isRunning {
+            // 输出设备切换后引擎可能已经停了；此时 player 队列里的 buffer 也已作废，
+            // 直接 player.play() 会在空队列上"播放"（位置恒 0、没有声音）。重启后从
+            // 最后已知位置继续（positionSeconds 此时只能给片段起点）。
+            let fallback = max(positionSeconds(), lastAdvancePosition)
+            lock.lock(); invalidateSegmentLocked(); lock.unlock()
+            player.stop()
+            _ = recoverEngine(resumeAt: fallback, resumePlayback: true)
+            return
+        }
         if !player.isPlaying {
             if prepared {
                 // 暂停后继续，或 seek 之后接着放：节点会从暂停处继续走，所以把"片段起点"
@@ -488,16 +647,25 @@ final class Player {
                 segmentStartFrame = AVAudioFramePosition(resumeAt * (fileRate > 0 ? fileRate : 44100))
                 lock.unlock()
             } else {
-                scheduleCurrent(fromSeconds: 0)
+                // 平时这里就是 0（新曲目/首次播放）。只有"暂停中切过耳机、片段被作废"
+                // 这一种情况会指向暂停位置——那种情况应该接着放，而不是从头开始。
+                scheduleCurrent(fromSeconds: max(0, positionSeconds()))
             }
             player.play()
             lock.lock()
             if let renderTime = player.lastRenderTime,
                let nodeTime = player.playerTime(forNodeTime: renderTime) {
                 segmentStartPlayerSample = nodeTime.sampleTime
+                segmentAnchorPending = false
+            } else {
+                segmentAnchorPending = true
             }
             segmentActive = true
             playing = true
+            playStartPosition = Double(segmentStartFrame) / (fileRate > 0 ? fileRate : 44100)
+            playStartedAt = Date()
+            lastAdvanceAt = Date()
+            lastAdvancePosition = positionSecondsLocked()
             lock.unlock()
         }
         emitState()
@@ -514,6 +682,8 @@ final class Player {
         segmentStartFrame = AVAudioFramePosition(frozen * rate)
         segmentStartPlayerSample = 0
         segmentActive = false   // 暂停期间位置就冻在这个 base 上
+        segmentAnchorPending = false
+        playStartedAt = nil
         playing = false
         lock.unlock()
         emitState()
@@ -527,6 +697,8 @@ final class Player {
         playing = false
         segmentStartFrame = 0
         segmentStartPlayerSample = 0
+        segmentAnchorPending = false
+        playStartedAt = nil
         segmentFrames = 0
         segmentActive = false
         segmentPrepared = false
@@ -571,7 +743,7 @@ final class Player {
         // 本段没在走（刚换曲、刚 seek、刚停止）时位置就是片段起点。**不能拿累计的
         // playerTime 去减锚点**：它可能还停在上一段的读数上，差值会把位置推到文件末尾，
         // 于是"每 0.5 秒播完一次" → 自动下一首自激。2026-10-14 实测撞到过。
-        guard segmentActive,
+        guard segmentActive, !segmentAnchorPending,
               let nodeTime = player.lastRenderTime,
               let playerTime = player.playerTime(forNodeTime: nodeTime) else {
             return max(0, min(base, duration))
@@ -579,7 +751,18 @@ final class Player {
         let played = max(0, playerTime.sampleTime - segmentStartPlayerSample)
         // 差值同样夹在本段长度内：任何残留累计都不允许越过本段。
         let limit = segmentFrames > 0 ? Double(segmentFrames) / rate : duration
-        return max(0, min(base + min(Double(played) / rate, limit), duration))
+        let candidate = max(0, min(base + min(Double(played) / rate, limit), duration))
+        if let startedAt = playStartedAt {
+            let wall = playStartPosition + Date().timeIntervalSince(startedAt)
+            if abs(candidate - wall) > 1.0 {
+                // 节点时间轴不可信（引擎重启后累计时间没清零）。把锚点重新对到墙钟位置，
+                // 下一拍读数就回到真实进度；本次直接返回墙钟位置。
+                segmentStartPlayerSample = playerTime.sampleTime
+                    - AVAudioFramePosition(max(0, wall - base) * rate)
+                return max(0, min(wall, duration))
+            }
+        }
+        return candidate
     }
 
     private func positionSeconds() -> Double {

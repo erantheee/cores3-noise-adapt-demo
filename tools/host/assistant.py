@@ -44,7 +44,9 @@ _FILLER_WORDS = {"嗯", "啊", "哦", "哎", "唉", "诶", "呃", "嗯嗯", "啊
                  "就是", "那个", "然后", "这个", "但是", "所以", "其实"}
 #: 真实短应答（不是语气词）。合并后的 1.5 s 轮次里"好/对/行"这类回答不能被当成噪声。
 _SHORT_ANSWER_WORDS = {"好", "对", "行", "是", "收到", "可以", "好的", "对的", "行的",
-                       "谢谢", "不用", "没事", "在", "有", "没有", "不", "要", "好嘞"}
+                       "谢谢", "不用", "没事", "在", "有", "没有", "不", "要", "好嘞",
+                       "嗯嗯", "哦哦", "对啊", "是的", "行吧", "好吧", "好呀", "可以呀",
+                       "对的呀", "是啊", "在的", "稍等", "等一下"}
 
 
 def _cjk_len(text: str) -> int:
@@ -88,10 +90,12 @@ class AssistantService:
     _MAX_ASR_TOKENS = 160
 
     def __init__(self, voiceprint_snapshot: Callable[[], dict] | None = None,
-                 training=None) -> None:
+                 training=None,
+                 memo_context: Callable[[], str] | None = None,
+                 on_decision: Callable[[dict], None] | None = None) -> None:
         self.base_url = os.environ.get("ANTHROPIC_BASE_URL", "").rstrip("/")
         self.api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        self.model = os.environ.get("ANTHROPIC_MODEL", "claude-opus-5-5")
+        self.model = os.environ.get("ANTHROPIC_MODEL", "gpt-5.6-sol")
         # 重入锁：snapshot() 持锁时还会调用 ambient_authorization()。
         self._lock = threading.RLock()
         self._state = "checking" if self.configured else "not_configured"
@@ -109,7 +113,7 @@ class AssistantService:
         self._conversation_started_wall = ""
         self._last_conversation_at: float | None = None
         self._capture_started_wall = ""
-        self._segment_history: deque[dict[str, object]] = deque(maxlen=8)
+        self._segment_history: deque[dict[str, object]] = deque(maxlen=24)
         self._audio_rate = 16000
         self._voiceprint_snapshot = voiceprint_snapshot
         self._stream_sample_cursor = 0
@@ -139,11 +143,20 @@ class AssistantService:
         self._new_episode_pending = True
         #: 训练数据落盘（tools/host/training.py 的鸭子接口）。None = 不采集。
         self._training = training
+        #: 用户记忆（tools/host/memo.py）的注入与记录回调。None = 本次运行没有记忆。
+        #: 记忆只作**弱先验**：prompt 里会写明与本段证据冲突时以本段为准。
+        self._memo_context = memo_context
+        self._on_decision = on_decision
         self._training_pending: dict[int, dict] = {}
         #: LLM 的跨片段上下文：同一轮对话里最近几轮转写 + 最近几次判定。
         #: 6 s 分段会把一来一回切到两个请求里，没有它 LLM 每段都是"单方发言"。
         self._llm_context: deque[dict[str, object]] = deque(maxlen=24)
         self._llm_context_verdicts: deque[dict[str, object]] = deque(maxlen=4)
+        #: ASR 吞吐/通过率遥测（2026-10-22）：让"只录到几句话"有数字可查。
+        self._asr_stats: dict[str, int] = {
+            "segments": 0, "passed": 0, "skipped": 0, "filtered": 0,
+        }
+        self._asr_latency_ms: deque[float] = deque(maxlen=50)
 
     @property
     def configured(self) -> bool:
@@ -191,7 +204,10 @@ class AssistantService:
                     pending = self._pending.pop(request_id, None)
                 if pending is None:
                     continue
-                event_id, segment_index, speaker, turn_seconds = pending
+                event_id, segment_index, speaker, turn_seconds, sent_at = pending
+                asr_latency_ms = max(0.0, (time.monotonic() - sent_at) * 1000.0)
+                with self._lock:
+                    self._asr_latency_ms.append(asr_latency_ms)
                 transcript = str(message.get("text") or "").strip()
                 if kind == "transcript_error":
                     with self._lock:
@@ -206,7 +222,9 @@ class AssistantService:
                     raw_results = event.setdefault("raw_results", {})
                     assert isinstance(raw_results, dict)
                     raw_results[segment_index] = transcript[:120]
-                    cleaned, note = self._filter_asr_text(transcript, turn_seconds)
+                    cleaned, note = self._filter_asr_text(
+                        transcript, turn_seconds, speaker
+                    )
                     if note:
                         notes = event.setdefault("asr_notes", [])
                         assert isinstance(notes, list)
@@ -225,8 +243,15 @@ class AssistantService:
                             f"{who}：{text}" for who, text in ordered if text
                         )
                         notes = [str(item) for item in event.get("asr_notes") or []]
+                        event.setdefault("asr_latency_ms", []).append(round(asr_latency_ms, 1))
+                        if any(text for _, text in ordered):
+                            self._asr_stats["passed"] += 1
+                        else:
+                            self._asr_stats["filtered"] += 1
                         if not attributed:
-                            attributed = "未识别到有效语音（ASR 输出被判为噪声/重复，已丢弃）"
+                            # 对用户不要说"噪声/重复/丢弃"（2026-10-22 用户反馈：这是
+                            # 内部诊断语言，且比实际判定"不确定"下结论更重）。
+                            attributed = "这段没听出有效内容，未转写（详情见 asr_note）"
                         number = int(event["number"])
                         event_epoch = int(event.get("epoch_id", 0))
                         # 上一轮对话的 ASR 晚归：转写与摘要也不能覆盖当前轮次的状态。
@@ -258,6 +283,7 @@ class AssistantService:
                                 ],
                                 "transcript": attributed,
                                 "notes": notes,
+                                "latency_ms": event.get("asr_latency_ms") or [],
                             },
                         })
                         launch = (
@@ -526,6 +552,7 @@ class AssistantService:
                     # 真正的对话结束：下一段重新开口时推进授权轮次。
                     self._new_episode_pending = True
                 self._today_sessions += 1
+                self._asr_stats["segments"] += 1
                 number = self._today_sessions
                 duration = segment_duration
                 telemetry = list(self._telemetry)
@@ -563,6 +590,7 @@ class AssistantService:
                 self._continuous_stream = False
                 return
             self._today_sessions += 1
+            self._asr_stats["segments"] += 1
             session_number = self._today_sessions
             telemetry = list(self._telemetry)
             audio = bytes(self._session_audio)
@@ -613,12 +641,14 @@ class AssistantService:
             if int(epoch_id) != self._authorization_epoch_id:
                 return
             for speaker, text in turns:
-                if not text:
+                if not text and speaker != "self":
                     continue
                 self._llm_context.append({
                     "segment": number,
                     "speaker": speaker,
-                    "text": str(text)[:160],
+                    # self 说了话但内容被过滤时也要留下轮次证据：LLM 判"无 self 回应"
+                    # 是环境声门不开的主因（2026-10-22 事故复盘）。
+                    "text": str(text)[:160] if text else "（短应答，内容未识别）",
                 })
 
     def _update_training(self, number: int, extra: dict[str, object]) -> None:
@@ -756,6 +786,7 @@ class AssistantService:
         if speech_s < self._MIN_SPEECH_S:
             # 关键修复：没有人声证据就不送 ASR。旧版把 15 s 噪声放大后送进模型，
             # 输出会是一长串重复幻觉（现场截图里满屏的"就是"）。
+            self._asr_stats["skipped"] += 1
             reason = f"未检测到有效人声（{evidence}），跳过 ASR"
             with self._lock:
                 if number >= self._transcript_number:
@@ -788,6 +819,7 @@ class AssistantService:
                 if number >= self._transcript_number:
                     self._transcript_number = number
                     self._transcript = f"第 {number} 段语音证据不足，已跳过转写"
+                self._asr_stats["skipped"] += 1
                 self._task = "等待下一段 S3 候选人声"
             self._publish_decision(
                 number, "no", "close", 0.8, "语音证据不足，跳过 ASR", "local",
@@ -809,6 +841,7 @@ class AssistantService:
                 if number >= self._transcript_number:
                     self._transcript_number = number
                     self._transcript = f"ASR 不可用，第 {number} 段未转写"
+                self._asr_stats["skipped"] += 1
                 self._task = "等待 ASR 就绪"
                 for item in self._segment_history:
                     if item.get("number") == number:
@@ -863,7 +896,9 @@ class AssistantService:
                 segment_audio, asr_gain_db = self._prepare_asr_audio(segment_audio)
                 turn_seconds = len(segment_audio) / 2 / max(rate, 1)
                 with self._lock:
-                    self._pending[request_id] = (event_id, index, speaker, turn_seconds)
+                    self._pending[request_id] = (
+                        event_id, index, speaker, turn_seconds, time.monotonic(),
+                    )
                     for item in self._segment_history:
                         if item.get("number") == number:
                             item["asr_gain_db"] = max(
@@ -927,7 +962,18 @@ class AssistantService:
 
     def _speaker_segments(self, audio: bytes, rate: int,
                           start_sample: int) -> list[tuple[str, bytes]]:
-        """按声纹窗口切分候选音频；冲突、缺失和旧结果全部归 unknown。"""
+        """按声纹窗口切分候选音频，并把同一句里的 unknown 碎片并回两侧身份。
+
+        2026-10-22 修正（用户现场："我对着说话，你告诉我 unknown？"）：
+        旧实现按 0.75 s 切片逐片贴标签，标签一变就切段送 ASR。用户一句 1–2 s 的自说，
+        前半片落在 self 窗、后半片落在混音/静音窗，同一句就被切成 `self` + `unknown`
+        两段，面板上看起来"没分清"。
+
+        现在保留逐片判定（声纹窗中点落在片内才投票，冲突/缺失为 unknown），再做一次
+        **边界平滑**：短 unknown 片如果只挨着一侧明确身份（self 或 other），就并入那一侧；
+        self 与 other 相邻的 unknown 片保持 unknown（那是未解决的边界，不能猜）。
+        只改归属、不改 WavLM 判定；混音轮次仍可能判错，但同一句不再被切碎。
+        """
         snapshot = {}
         if self._voiceprint_snapshot is not None:
             try:
@@ -937,6 +983,8 @@ class AssistantService:
         windows = snapshot.get("history") if snapshot.get("ready") else []
         windows = windows if isinstance(windows, list) else []
         total_samples = len(audio) // 2
+        if total_samples <= 0:
+            return [("unknown", audio)]
         slice_samples = max(1, int(rate * 0.75))
         slices: list[tuple[str, bytes]] = []
         for offset in range(0, total_samples, slice_samples):
@@ -950,18 +998,47 @@ class AssistantService:
                 < int(window.get("end_sample", -1))
                 and window.get("verdict") in ("self", "other")
             }
-            # Two overlapping windows disagreeing means the boundary is unresolved.
+            # 两个重叠窗给出不同身份 = 边界未解决；没有窗 = 没有证据。
             label = next(iter(labels)) if len(labels) == 1 else "unknown"
             part = audio[offset * 2:end * 2]
             if slices and slices[-1][0] == label:
                 slices[-1] = (label, slices[-1][1] + part)
             else:
                 slices.append((label, part))
+
+        # 边界平滑：一片以内（约 1.5 s）的 unknown，如果左右只有一侧是明确身份，
+        # 就并入那一侧；左右身份不同则保留 unknown。最多迭代到稳定。
+        bridge_limit = int(rate * 0.8) * 2  # 一片 0.75 s，留一点容差
+        for _ in range(3):
+            bridged: list[tuple[str, bytes]] = []
+            for index, (label, part) in enumerate(slices):
+                if label == "unknown" and len(part) <= bridge_limit:
+                    left = slices[index - 1][0] if index > 0 else None
+                    right = slices[index + 1][0] if index + 1 < len(slices) else None
+                    left_id = left in ("self", "other")
+                    right_id = right in ("self", "other")
+                    if left_id and right_id:
+                        if left == right:
+                            label = left
+                    elif left_id:
+                        label = left
+                    elif right_id:
+                        label = right
+                if bridged and bridged[-1][0] == label:
+                    bridged[-1] = (label, bridged[-1][1] + part)
+                else:
+                    bridged.append((label, part))
+            if bridged == slices:
+                break
+            slices = bridged
+
         # Very short turns are unreliable for both WavLM and ASR; retain their audio but
-        # remove the identity claim by folding them into unknown.
+        # remove the identity claim by folding them into unknown. Exception: self ——
+        # 佩戴者的短应答（"嗯""好"）恰恰是 voice 门/LLM 要的证据，折叠成 unknown 等于
+        # 主动销毁它（2026-10-22 事故复盘：全段 speaker 只有 other/unknown，门永不 latch）。
         minimum = int(rate * 0.45) * 2
         normalized = [
-            (speaker if len(pcm) >= minimum else "unknown", pcm)
+            (speaker if (len(pcm) >= minimum or speaker == "self") else "unknown", pcm)
             for speaker, pcm in slices if pcm
         ]
         merged: list[tuple[str, bytes]] = []
@@ -1015,7 +1092,7 @@ class AssistantService:
             end = max(0, min(total_samples, center + half_window))
             if end > begin:
                 intervals.append((begin, end))
-        return _merge_intervals(intervals, int(rate * 0.35))
+        return _merge_intervals(intervals, int(rate * 0.50))
 
     @staticmethod
     def _audio_speech_regions(pcm: bytes, rate: int) -> list[tuple[int, int]]:
@@ -1050,7 +1127,7 @@ class AssistantService:
         voiced = [(begin, begin + frame) for begin, level in levels if level >= threshold]
         if not voiced:
             return []
-        merged = _merge_intervals(voiced, int(rate * 0.3))
+        merged = _merge_intervals(voiced, int(rate * 0.50))
         minimum = int(rate * 0.5)
         return [(begin, end) for begin, end in merged if end - begin >= minimum]
 
@@ -1125,8 +1202,15 @@ class AssistantService:
     # ------------------------------------------------------------------ 去幻觉
 
     @classmethod
-    def _filter_asr_text(cls, text: str, duration_s: float = 0.0) -> tuple[str, str]:
-        """过滤 ASR 幻觉：重复循环、纯语气词、单字噪声。返回 (可显示文本, 说明)。"""
+    def _filter_asr_text(cls, text: str, duration_s: float = 0.0,
+                         speaker: str | None = None) -> tuple[str, str]:
+        """过滤 ASR 幻觉：重复循环、纯语气词、单字噪声。返回 (可显示文本, 说明)。
+
+        speaker == "self" 时放宽：佩戴者的短应答（"嗯""啊"）是 voice 门和 LLM
+        判定"你接话了"的关键证据，只折叠、不整句丢弃（2026-10-22 事故复盘：
+        self 的"嗯"被语气词过滤抹掉，LLM 因此全程判"无 self 回应"，环境声门
+        从未 latch）。other/unknown 仍按旧规则过滤，防噪声幻觉污染。
+        """
         cleaned = (text or "").strip()
         if not cleaned:
             return "", "空输出"
@@ -1152,8 +1236,12 @@ class AssistantService:
         if effective in _SHORT_ANSWER_WORDS:
             return collapsed.strip(), "短应答保留"
         if all(char in _FILLER_CHARS for char in effective) or effective in _FILLER_WORDS:
+            if speaker == "self":
+                return collapsed.strip(), "语气词·self保留"
             return "", "只有语气词"
         if len(effective) <= 1 and duration_s >= 1.0:
+            if speaker == "self":
+                return collapsed.strip(), "单字·self保留"
             return "", "有效字数不足"
         truncated = False
         if len(effective) > cls._MAX_TRANSCRIPT_CHARS:
@@ -1203,6 +1291,14 @@ class AssistantService:
                 "reason": str(self._decision["reason"])[:80],
             })
             self._task = "等待下一段 S3 候选人声"
+            decision = dict(self._decision)
+        # 记忆写入放在锁外：memo 有自己的锁，也不能因为它失败而影响判定/授权。
+        callback = self._on_decision
+        if callback is not None:
+            try:
+                callback(decision)
+            except Exception:  # noqa: BLE001 - 记忆是旁路，失败不改变判定
+                pass
 
     @staticmethod
     def _verdict_text(dialogue: str) -> str:
@@ -1341,6 +1437,36 @@ class AssistantService:
             "reason": reason,
         }
 
+    @staticmethod
+    def _interaction_features(speaker_turns, llm_context) -> dict:
+        """把声纹轮次压成"对话交互"特征，辅助 LLM 判断。
+
+        LLM 原来只能从零碎文本猜是不是一问一答；这里显式给出本段与跨段的
+        self/other 交替结构。unknown 不计入交替（身份不明不能当轮次证据）。
+        """
+        turns = speaker_turns or []
+        counts = {"self": 0, "other": 0, "unknown": 0}
+        order: list[str] = []
+        for speaker, _text in turns:
+            if speaker in counts:
+                counts[speaker] += 1
+            if speaker in ("self", "other"):
+                order.append(speaker)
+        alternating = any(a != b for a, b in zip(order, order[1:]))
+        recent: list[str] = []
+        if isinstance(llm_context, dict):
+            for item in (llm_context.get("recent_turns") or [])[-8:]:
+                if isinstance(item, dict) and item.get("speaker") in ("self", "other"):
+                    recent.append(str(item["speaker"]))
+        recent_alternating = any(a != b for a, b in zip(recent, recent[1:]))
+        return {
+            "self_turns": counts["self"],
+            "other_turns": counts["other"],
+            "unknown_turns": counts["unknown"],
+            "alternating": alternating,
+            "recent_alternating": recent_alternating,
+        }
+
     def _summarize_event(self, number: int, seconds: float, chunks: int,
                          chunks_lost: int, telemetry: list[dict[str, object]],
                          transcript: str = "",
@@ -1375,11 +1501,16 @@ class AssistantService:
             "s3_ambient_open_intent_frames": opened,
             "mean_voice_likelihood": round(sum(voice_values) / len(voice_values), 3)
             if voice_values else None,
+            #: 用户记忆摘要（≤300 字）。空串 = 没有可用记忆；LLM 只把它当弱先验。
+            "memo": self._memo_context() if self._memo_context is not None else "",
             "transcript": transcript,
             "speaker_turns": speaker_turns or [],
             "identity_available": any(
                 speaker in ("self", "other") for speaker, _ in (speaker_turns or [])
             ),
+            # 声纹轮次结构（2026-10-23 用户要求"对话交互辅助 LLM 判断"）：
+            # 只统计身份明确的 self/other；unknown 不参与交替判断。
+            "interaction": self._interaction_features(speaker_turns, llm_context),
             # 跨片段上下文：同一轮对话此前最近的转写轮次与判定。6 s 分段常把
             # "对方一句/我一句"切到两个请求里，没有它每段都像单方独白。
             "context": llm_context or {"turn_count": 0, "recent_turns": [],
@@ -1399,10 +1530,16 @@ class AssistantService:
             "若 identity_available=false（声纹全是 unknown），但逐字稿里出现至少两个由静音分开、"
             "语义上像问答或接话的轮次，可以判对话并开放；单向独白、电视/播客播音、"
             "重复幻觉、只有一句短话都不算。"
+            "facts.interaction 是声纹轮次结构：self_turns>0 且 other_turns>0 且"
+            "（alternating 或 recent_alternating）=true，说明佩戴者与对方在轮流开口；"
+            "此时只要语义像问答/接话（other 的话短或部分 unknown 也算），可以判对话并开放；"
+            "但佩戴者单向独白、对方只是零星噪声/语气词时仍判非对话或不确定。"
             "使用 context.recent_turns / context.previous_verdicts 保持跨片段一致："
             "若前文已确认对话，本段单独看不清时不要轻易改判 no（除非明确是媒体/独白/换人）；"
             "若前文已判非对话，保持 no 除非出现明确的一来一回。"
-            "s3_ambient_open_intent_frames 只是 S3 意图，不等于对话证据，也不等于实际执行。数据："
+            "s3_ambient_open_intent_frames 只是 S3 意图，不等于对话证据，也不等于实际执行。"
+            "facts.memo 是历史记忆（可能有偏/过期），只作弱先验；与本段逐字稿/遥测冲突时"
+            "以本段为准，不能凭记忆判对话或开放环境声。数据："
             + json.dumps(facts, ensure_ascii=False)
         )
         payload = json.dumps({
@@ -1565,6 +1702,13 @@ class AssistantService:
             "asr_ready": self._asr_ready,
             "asr_model": self._asr_model,
             "asr_error": self._asr_error,
+            "asr_stats": {
+                **dict(self._asr_stats),
+                "latency_p50_ms": round(
+                    sorted(self._asr_latency_ms)[len(self._asr_latency_ms) // 2], 0
+                ) if self._asr_latency_ms else None,
+                "latency_n": len(self._asr_latency_ms),
+            },
             "llm_warning": self._llm_warning,
             "decision": decision_snapshot,
             "ambient_authorization": authorization,

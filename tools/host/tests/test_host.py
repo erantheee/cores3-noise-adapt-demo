@@ -22,6 +22,7 @@ import struct
 import sys
 import tempfile
 import time
+import wave
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]  # tools/
@@ -31,8 +32,10 @@ from host.protocol import (  # noqa: E402
     CONTEXT_CLASSES,
     EVENT_VALID_CLASSES,
     DEMO_SPEECH_GAIN_DB,
+    MAX_BAND_GAIN_DB,
     MAX_NOISE_REDUCTION_DB,
     MAX_SPEECH_GAIN_DB,
+    MIN_BAND_GAIN_DB,
     SCHEMA_VERSION,
     CaptureEvent,
     CommandFrame,
@@ -43,13 +46,20 @@ from host.protocol import (  # noqa: E402
     iter_json_objects,
     parse_line,
 )
-from host.mac_audio import parse_default_output, route_command  # noqa: E402
+from host.mac_audio import (  # noqa: E402
+    DEFAULT_EARPHONES,
+    Earphone,
+    match_earphone,
+    parse_default_output,
+    route_command,
+)
 from host.voiceprint import VoiceprintService  # noqa: E402
 from host.server import (  # noqa: E402
     Broadcaster,
     CommandError,
     INDEX_FILE,
     build_command,
+    make_server,
     pick_port,
 )
 from host.simulating import MockDevice  # noqa: E402
@@ -63,12 +73,18 @@ from host.state import (  # noqa: E402
     state_text,
 )
 from host.ambient import AmbientError, AmbientService, RelayAmbient  # noqa: E402
+from host.memo import PROMPT_MAX_CHARS, MemoStore  # noqa: E402
 from host.assistant import AssistantService, _intervals_seconds  # noqa: E402
 from host.training import TrainingWriter  # noqa: E402
+from host.continuous_audio import ContinuousAudioWriter  # noqa: E402
 from host.__main__ import (  # noqa: E402
     DialogueTurnGate,
+    ambient_gate_allows,
     fresh_self_veto,
     llm_ambient_authorization,
+    parse_args,
+    parse_earphone,
+    relay_reports_audio,
     voiceprint_allows_ambient,
 )
 
@@ -118,13 +134,124 @@ def test_d2_matches_c_printf() -> None:
 
 
 def test_mac_default_output_route() -> None:
-    report = """Audio:\n\n    Devices:\n\n        MacBook Air扬声器:\n\n          Output Channels: 2\n\n        AirPods Pro:\n\n          Default Output Device: Yes\n          Output Channels: 2\n"""
-    eq(parse_default_output(report), "AirPods Pro", "识别 Mac 默认音频输出")
-    eq(route_command("AirPods Pro"), b"route active AirPods Pro\r\n", "生成路由回传命令")
-    eq(route_command(None), b"route inactive AirPods Pro\r\n", "AirPods 不是默认输出时明确未连接")
-    parsed = parse_line('{"type":"route","state":"active","device":"AirPods Pro"}')
+    report = """Audio:\n\n    Devices:\n\n        MacBook Air扬声器:\n\n          Output Channels: 2\n\n        Xiaomi 耳夹式耳机:\n\n          Default Output Device: Yes\n          Output Channels: 2\n"""
+    eq(parse_default_output(report), "Xiaomi 耳夹式耳机", "识别 Mac 默认音频输出（OWS 耳夹）")
+    eq(tuple(e.label for e in DEFAULT_EARPHONES), ("Xiaomi OWS", "AirPods Pro"), "默认同时支持两副耳机")
+    eq(match_earphone("Xiaomi 耳夹式耳机").label, "Xiaomi OWS", "识别 Xiaomi 耳夹")
+    eq(match_earphone("AirPods Pro").label, "AirPods Pro", "识别 AirPods Pro")
+    eq(match_earphone("airpods pro 2").label, "AirPods Pro", "大小写不敏感、容忍型号后缀")
+    eq(match_earphone("MacBook Air扬声器"), None, "扬声器不是耳机")
+    eq(route_command("Xiaomi 耳夹式耳机"), b"route active Xiaomi OWS\r\n", "OWS 在位时 active 且显示短名")
+    eq(route_command("AirPods Pro"), b"route active AirPods Pro\r\n", "TWS 在位时 active 且显示 AirPods Pro")
+    eq(route_command("MacBook Air扬声器"), b"route inactive Earphone\r\n", "扬声器：未连接 + 回退名")
+    eq(route_command(None), b"route inactive Earphone\r\n", "没有默认输出时明确未连接")
+    eq(
+        route_command("Bose QC Ultra", earphones=(Earphone("Bose", "Bose QC"),)),
+        b"route active Bose QC\r\n",
+        "自定义耳机注册表：加新耳机不改代码",
+    )
+    parsed = parse_line('{"type":"route","state":"active","device":"Xiaomi OWS"}')
     check(isinstance(parsed.value, RouteEvent), "route 回执能解析")
     eq(parsed.error, None, "route 回执不再记为坏帧")
+
+
+def test_earphone_cli_parsing() -> None:
+    import argparse
+
+    eq(parse_earphone("Bose=Bose QC").label, "Bose QC", "解析 MATCH=LABEL")
+    eq(parse_earphone(" Xiaomi = Xiaomi OWS ").match, "Xiaomi", "去掉两端空白")
+    for bad in ("Xiaomi", "=Xiaomi OWS", "Xiaomi="):
+        try:
+            parse_earphone(bad)
+        except argparse.ArgumentTypeError:
+            continue
+        check(False, f"坏参数应被拒绝：{bad!r}")
+    try:
+        parse_earphone("Xiaomi=耳夹")
+    except argparse.ArgumentTypeError:
+        pass  # 中文显示名会被 S3 字库渲染成方框，必须拒绝
+    else:
+        check(False, "非 ASCII 显示名必须被拒绝（设备字库是固定子集）")
+    args = parse_args(["--mock"])
+    eq(tuple(e.label for e in args.earphones), ("Xiaomi OWS", "AirPods Pro"), "不传时用默认两副")
+    args = parse_args(["--mock", "--earphone", "Bose=Bose QC"])
+    eq(tuple(e.label for e in args.earphones), ("Bose QC",), "传了就覆盖默认注册表")
+
+
+def test_memo_persists_injects_and_finalizes() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        clock = [1000.0]
+        memo = MemoStore(folder, now=lambda: clock[0])
+        eq(memo.snapshot()["events"], 0, "新目录没有历史记忆")
+        memo.record_decision(
+            {"dialogue": "yes", "ambient": "open", "confidence": 0.9,
+             "source": "llm", "reason": "两个人一问一答", "number": 1},
+            scene="近处人声", environment="人声嘈杂",
+        )
+        memo.record_ambient(open=True, scene="近处人声", environment="人声嘈杂",
+                            intent=True, authorization={"state": "fast_local", "allow": True})
+        clock[0] += 1.0
+        memo.record_ambient(open=False, scene="近处人声", environment="人声嘈杂",
+                            intent=False, authorization={"state": "llm_veto", "veto": True},
+                            duration_s=1.0)
+        memo.record_correction(verdict="open_bad", scene="近处人声", reason="这不是在跟我说话")
+        memo.sample_frame(scene="近处人声", environment="人声嘈杂", broadband_dbfs=-40.0)
+        prompt = memo.prompt_context(scene="近处人声")
+        check(prompt.startswith("【用户记忆】"), "记忆摘要带固定前缀")
+        check(len(prompt) <= PROMPT_MAX_CHARS, f"记忆摘要不超过 {PROMPT_MAX_CHARS} 字（实得 {len(prompt)}）")
+        check("近处人声" in prompt, "摘要里带场景")
+        check("yes 1" in prompt, "摘要里带对话判定计数")
+
+        # 收尾先写本次运行的会话摘要（摘要按"本次运行"计数，不跨重启合并）
+        memo.finalize_session()
+        sessions = Path(folder) / "sessions.jsonl"
+        check(sessions.exists(), "收尾写 sessions.jsonl")
+        summary = json.loads(sessions.read_text(encoding="utf-8").splitlines()[-1])
+        eq(summary["ambient_opens"], 1, "会话摘要记录环境声开启次数")
+        eq(summary["ambient_short_opens"], 1, "1 秒就关算一次可疑短开")
+        eq(summary["ambient_veto_opens"], 1, "被 LLM 否决的开启单独计数")
+        eq(summary["corrections"], 1, "会话摘要记录用户纠正")
+
+        # 影子建议要求最小样本量（8）：先补足样本，再验证"记忆足够时才给方向"。
+        for index in range(7):
+            memo.record_decision(
+                {"dialogue": "yes", "ambient": "close", "confidence": 0.8,
+                 "source": "llm", "reason": "补充样本", "number": index + 2},
+                scene="近处人声", environment="人声嘈杂",
+            )
+        advice = memo.shadow_advice(scene="近处人声")
+        eq(advice["state"], "shadow", "样本足够时影子建议生效")
+        eq(advice["ambient_bias"], "conservative", "1 秒就关 + 被否决 → 影子建议偏保守")
+        eq(advice["conversation_prior"], "likely", "唯一样本判 yes → 对话先验偏 likely")
+
+        # 换一个进程实例，模拟上位机重启：rolling 与 profile 必须从磁盘恢复
+        clock[0] += 60.0
+        restored = MemoStore(folder, now=lambda: clock[0])
+        eq(restored.snapshot()["events"], memo.snapshot()["events"], "重启后事件从磁盘恢复")
+        check(restored.prompt_context(scene="近处人声").startswith("【用户记忆】"),
+              "重启后仍能注入记忆")
+
+
+def test_memo_retention_and_decay() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        clock = [0.0]
+        memo = MemoStore(folder, retention_days=1, half_life_days=1.0, now=lambda: clock[0])
+        clock[0] = 100.0
+        memo.record_decision({"dialogue": "yes", "number": 1}, scene="安静")
+        clock[0] += 86400.0  # 一个半衰期
+        memo.record_decision({"dialogue": "no", "number": 2}, scene="安静")
+        entry = memo.profile_entry("安静")
+        eq(round(entry["decisions"]["yes"], 2), 0.5, "旧计数按半衰期衰减到 0.5")
+        eq(round(entry["decisions"]["no"], 2), 1.0, "新计数是 1")
+
+        # 超过保留期的事件在重启加载时被清掉
+        clock[0] += 2 * 86400.0
+        aged = MemoStore(folder, retention_days=1, half_life_days=1.0, now=lambda: clock[0])
+        eq(aged.snapshot()["events"], 0, "超过保留期的事件不再恢复（profile 保留并继续衰减）")
 
 
 def test_command_frame_full() -> None:
@@ -204,6 +331,98 @@ def test_new_firmware_frame_carries_tuning() -> None:
     check(not sparse.tuning.shape_is_speech_band, "不连续的抬升不应被判成语音段形状")
 
 
+def test_signed_tuning_is_backward_compatible() -> None:
+    """24 段调音是**有符号**的：正=抬、负=削。
+
+    现场调音要"低频更结实、人声更靠前、高频更细、整体不糊"，新曲线一定会削掉糊的中低频与
+    被噪声主导的频段。这里钉住三件事：
+      1. 旧固件（只发 0…+4）下既有字段含义与行为**一个字都不变**——新增字段全部是"加"的；
+      2. 负值端到端透传：band_gain_db 原样保留，cut_bands/max_cut_db/peak_abs_db 数得对；
+      3. 越界的建议保留原始值并报异常（本项目的纪律：不许替固件钳成"看起来正常"）。
+    """
+
+    def frame(gains: list[float], sequence: int = 20) -> str:
+        return json.dumps(
+            {
+                "type": "earbud_command",
+                "schema": 4,
+                "sequence": sequence,
+                "timestamp_ms": 2000,
+                "speech_gain_db": 0.0,
+                "external_voice_gain_db": 0.0,
+                "media_percent": 100,
+                "state": "ADJUSTING",
+                "environment": "NOISY",
+                "confidence": 0.9,
+                "link": "simulated",
+                "eq_gain_db": gains,
+            }
+        )
+
+    # ---- 1) 旧固件形状：既有字段与旧行为逐项不变 -------------------------------
+    legacy_gains = [0.0] * 24
+    for band in range(8, 17):
+        legacy_gains[band] = 4.0
+    legacy = parse_line(frame(legacy_gains)).value
+    eq(legacy.tuning.lifted_bands, 9, "旧固件的抬起段数不变")
+    close(legacy.tuning.peak_gain_db, 4.0, "旧固件的抬起峰值不变")
+    eq(legacy.tuning.cut_bands, 0, "旧固件没有削减段（新字段默认 0）")
+    eq(legacy.tuning.max_cut_db, 0.0, "旧固件最大削减为 0（新字段默认 0.0）")
+    eq(legacy.tuning.has_cuts, False, "旧固件 has_cuts=false")
+    close(legacy.tuning.peak_abs_db, 4.0, "旧固件峰绝对值=最大抬升")
+    check(legacy.tuning.shape_is_speech_band, "旧固件的「只抬语音段」形状判断不变")
+
+    # ---- 2) 有符号曲线：削中低频、抬人声与空气感 -------------------------------
+    gains = [0.0] * 24
+    gains[2], gains[3], gains[4] = -3.0, -2.5, -1.5  # 削糊的中低频
+    for band in range(8, 13):
+        gains[band] = 2.0  # 人声 presence 抬
+    for band in range(20, 24):
+        gains[band] = 1.5  # 空气感抬
+    parsed = parse_line(frame(gains))
+    check(not parsed.problems, f"有符号曲线不应被标异常（实得 {parsed.problems}）")
+    tuning = parsed.value.tuning
+    eq(len(tuning.band_gain_db), 24, "24 段全部保留")
+    eq(tuning.band_gain_db[2], -3.0, "负增益原样保留（设备原始建议，不钳成 0）")
+    eq(tuning.lifted_bands, 9, "只数正值：5 + 4 段")
+    eq(tuning.cut_bands, 3, "只数负值：3 段在削")
+    close(tuning.max_cut_db, -3.0, "最大削减取最小值")
+    close(tuning.peak_gain_db, 2.0, "peak_gain_db 旧含义不变=各段最大（正）值")
+    close(tuning.peak_abs_db, 3.0, "峰绝对值=抬/削里绝对最大")
+    check(tuning.has_cuts, "has_cuts 为真")
+    check(not tuning.shape_is_speech_band, "有削减就不是「只抬语音段」形状")
+
+    state = HostState(source="serial")
+    state.feed_line(frame(gains))
+    snapshot_tuning = state.snapshot()["frame"]["tuning"]
+    eq(snapshot_tuning["cut_bands"], 3, "快照带上削减段数")
+    eq(snapshot_tuning["max_cut_db"], -3.0, "快照带上最大削减")
+    eq(snapshot_tuning["peak_abs_db"], 3.0, "快照带上峰绝对值")
+    eq(snapshot_tuning["has_cuts"], True, "快照带上 has_cuts")
+    eq(snapshot_tuning["band_gain_db"][2], -3.0, "快照的 band_gain_db 保留负值")
+    caps = state.snapshot()["caps"]["band_gain_db"]
+    eq(caps["min"], MIN_BAND_GAIN_DB, "面板量程下限来自协议常量")
+    eq(caps["max"], MAX_BAND_GAIN_DB, "面板量程上限来自协议常量")
+
+    # ---- 3) 全是削的曲线：不能因为"没有正值"就落回「只抬语音段」 ---------------
+    cuts_only = parse_line(frame([-2.0] * 24, sequence=21)).value.tuning
+    eq(cuts_only.lifted_bands, 0, "没有抬升段")
+    close(cuts_only.peak_gain_db, -2.0, "peak_gain_db 此时是那个众数（负数）")
+    eq(cuts_only.cut_bands, 24, "24 段全在削")
+    close(cuts_only.peak_abs_db, 2.0, "峰绝对值=2.0")
+    check(not cuts_only.shape_is_speech_band, "全削曲线不是语音段形状（旧逻辑会误判为是）")
+
+    # ---- 4) 越界建议：保留原值 + 报异常 ---------------------------------------
+    out_of_range = parse_line(frame([-13.0, 11.0] + [0.0] * 22, sequence=22))
+    check(bool(out_of_range.problems), "越界建议必须报异常")
+    check(
+        any("调音建议越界" in item for item in out_of_range.problems),
+        f"异常里要点名调音越界（实得 {out_of_range.problems}）",
+    )
+    eq(out_of_range.value.tuning.band_gain_db[0], -13.0, "越界值保留原始值，不钳掉")
+    eq(out_of_range.value.tuning.band_gain_db[1], 11.0, "越界正值同样保留")
+
+
 def test_context_model_frame() -> None:
     """融合第二轮（2026-10-16）起，帧里多了端侧情境模型的四个字段。
 
@@ -247,6 +466,166 @@ def test_context_model_frame() -> None:
     check(not legacy.problems, f"没有情境字段的旧帧不应有异常（实得 {legacy.problems}）")
     eq(legacy.value.context, None, "旧帧的 context 为 None（不是空串）")
     eq(legacy.value.context_valid, None, "旧帧的 context_valid 为 None：区分没报与报了假")
+
+
+def test_context_mixed_fields() -> None:
+    """D46 混合环境识别：帧里追加 context_top2 / context_top2_score / context_mixed。
+
+    三键与 context 组同纪律：要么全不报（旧固件），要么成组。mixed 是布尔、top2 必须是
+    9 类之一、top2 分数在 [0,1]、top2 不能与 top1 相同。
+    """
+    base = (
+        '"type":"earbud_command","schema":4,"sequence":7,"timestamp_ms":700,'
+        '"speech_gain_db":0.00,"external_voice_gain_db":0.00,"media_percent":100,'
+        '"state":"OBSERVING","environment":"VOICE","confidence":0.80,'
+        '"own_voice_confidence":0.05,"link":"simulated","context":"near_voice",'
+        '"context_score":0.620,"context_valid":true,"context_us":158'
+    )
+    # 混合窗：near_voice + babble，top2 过门槛。
+    mixed = parse_line(
+        "{" + base + ',"context_top2":"babble","context_top2_score":0.210,"context_mixed":true}'
+    )
+    check(not mixed.problems, f"混合情境帧不应有异常（实得 {mixed.problems}）")
+    eq(mixed.value.context_top2, "babble", "第二候选类别原样读出")
+    close(mixed.value.context_top2_score, 0.21, "第二候选置信度按两位小数读入")
+    eq(mixed.value.context_mixed, True, "context_mixed 读为布尔真")
+
+    # 单标签窗：top2 很低、mixed=false。
+    single = parse_line(
+        "{" + base
+        + ',"context":"quiet","context_score":0.930,'
+        '"context_top2":"other","context_top2_score":0.040,"context_mixed":false}'
+    )
+    check(not single.problems, f"单标签情境帧不应有异常（实得 {single.problems}）")
+    eq(single.value.context_mixed, False, "context_mixed 读为布尔假")
+
+    # 预热帧：top2 报占位 unknown/0.0/false，与 context 组同构，不应有异常。
+    warmup = parse_line(
+        '{"type":"earbud_command","schema":4,"sequence":1,"timestamp_ms":100,'
+        '"speech_gain_db":0.00,"external_voice_gain_db":0.00,"media_percent":100,'
+        '"state":"OBSERVING","environment":"QUIET","confidence":0.80,'
+        '"own_voice_confidence":0.05,"link":"simulated","context":"unknown",'
+        '"context_score":0.000,"context_valid":false,"context_us":0,'
+        '"context_top2":"unknown","context_top2_score":0.000,"context_mixed":false}'
+    )
+    check(not warmup.problems, f"预热帧的占位 top2 不应有异常（实得 {warmup.problems}）")
+    eq(warmup.value.context_top2, "unknown", "预热帧报占位第二候选")
+
+    # 旧固件：三个键都没有 → None，且不算缺字段。
+    legacy = parse_line(
+        '{"type":"earbud_command","schema":4,"sequence":1,"timestamp_ms":0,'
+        '"speech_gain_db":1.50,"external_voice_gain_db":0.00,"media_percent":92,'
+        '"state":"ADJUSTING","environment":"NOISY","confidence":0.90,'
+        '"own_voice_confidence":0.05,"link":"simulated"}'
+    )
+    check(not legacy.problems, f"旧帧没有混合键不应有异常（实得 {legacy.problems}）")
+    eq(legacy.value.context_top2, None, "旧帧的 context_top2 为 None")
+    eq(legacy.value.context_mixed, None, "旧帧的 context_mixed 为 None：区分没报与报了假")
+
+    # 只报了一部分 → 异常（三键是一组）。
+    partial = parse_line(
+        "{" + base + ',"context_top2":"babble","context_top2_score":0.210}'
+    )
+    check(any("混合情境字段只报了一部分" in p for p in partial.problems),
+          f"三键只报两个必须点名（实得 {partial.problems}）")
+
+    # top2 不是 9 类之一 → 异常。
+    unknown_top2 = parse_line(
+        "{" + base + ',"context_top2":"siren","context_top2_score":0.210,"context_mixed":true}'
+    )
+    check(any("未知第二候选情境类别" in p for p in unknown_top2.problems),
+          f"第二候选类别越界必须点名（实得 {unknown_top2.problems}）")
+
+    # top2 分数越界 → 异常。
+    bad_score = parse_line(
+        "{" + base + ',"context_top2":"babble","context_top2_score":1.4,"context_mixed":true}'
+    )
+    check(any("第二候选置信度" in p for p in bad_score.problems),
+          f"第二候选置信度越界必须点名（实得 {bad_score.problems}）")
+
+    # top2 与 top1 相同 → 异常（第二名不该是第一名）。
+    same_class = parse_line(
+        "{" + base + ',"context_top2":"near_voice","context_top2_score":0.210,'
+        '"context_mixed":true}'
+    )
+    check(any("与第一名相同" in p for p in same_class.problems),
+          f"第二候选与第一名相同必须点名（实得 {same_class.problems}）")
+
+    # valid=false 却报真类别 top2 → 异常（占位符应是 unknown）。
+    contradiction = parse_line(
+        "{" + base.replace('"context_valid":true', '"context_valid":false')
+        + ',"context":"unknown","context_score":0.000,'
+        '"context_top2":"music","context_top2_score":0.210,"context_mixed":true}'
+    )
+    check(any("context_valid=false 却报了第二候选" in p for p in contradiction.problems),
+          f"valid=false 却报真类别 top2 必须点名（实得 {contradiction.problems}）")
+
+
+def test_dual_mic_telemetry() -> None:
+    """D47 双麦遥测：mic2_broadband_dbfs / mic_diff_db / mic_coherence / mic2_valid。
+
+    四键一组（旧固件不发 → 全 None）；值域：电平 ≤ 0 dBFS、相关系数 ∈ [-1,1]、
+    电平差 ∈ ±80 dB。valid=false 时报 -120/0/0，是合法占位不是异常。
+    """
+    base = (
+        '"type":"earbud_command","schema":4,"sequence":7,"timestamp_ms":700,'
+        '"speech_gain_db":0.00,"external_voice_gain_db":0.00,"media_percent":100,'
+        '"state":"OBSERVING","environment":"VOICE","confidence":0.80,'
+        '"own_voice_confidence":0.05,"link":"simulated"'
+    )
+    near = parse_line(
+        "{" + base + ',"mic2_broadband_dbfs":-33.4,"mic_diff_db":2.40,'
+        '"mic_coherence":0.350,"mic2_valid":true}'
+    )
+    check(not near.problems, f"近场双麦帧不应有异常（实得 {near.problems}）")
+    close(near.value.mic2_broadband_dbfs, -33.4, "第二路麦电平按两位小数读入")
+    close(near.value.mic_diff_db, 2.40, "电平差按两位小数读入（L − R）")
+    close(near.value.mic_coherence, 0.35, "相关系数按两位小数读入")
+    eq(near.value.mic2_valid, True, "mic2_valid 读为布尔真")
+
+    # 占位帧：valid=false 时报 -120/0/0，合法。
+    placeholder = parse_line(
+        "{" + base + ',"mic2_broadband_dbfs":-120.0,"mic_diff_db":0.00,'
+        '"mic_coherence":0.000,"mic2_valid":false}'
+    )
+    check(not placeholder.problems, f"双麦占位帧不应有异常（实得 {placeholder.problems}）")
+    eq(placeholder.value.mic2_valid, False, "mic2_valid 读为布尔假")
+
+    # 旧固件：四键都没有 → 全 None，不算缺字段。
+    legacy = parse_line(
+        '{"type":"earbud_command","schema":4,"sequence":1,"timestamp_ms":0,'
+        '"speech_gain_db":1.50,"external_voice_gain_db":0.00,"media_percent":92,'
+        '"state":"ADJUSTING","environment":"NOISY","confidence":0.90,'
+        '"own_voice_confidence":0.05,"link":"simulated"}'
+    )
+    check(not legacy.problems, f"旧帧没有双麦键不应有异常（实得 {legacy.problems}）")
+    eq(legacy.value.mic2_broadband_dbfs, None, "旧帧的第二路电平为 None")
+    eq(legacy.value.mic2_valid, None, "旧帧的 mic2_valid 为 None：区分没报与报了假")
+
+    # 只报了一部分 → 异常（四键是一组）。
+    partial = parse_line("{" + base + ',"mic2_broadband_dbfs":-33.4,"mic_diff_db":2.40}')
+    check(any("双麦遥测字段只报了一部分" in p for p in partial.problems),
+          f"双麦四键只报两个必须点名（实得 {partial.problems}）")
+
+    # 值域越界 → 异常。
+    bad_coh = parse_line(
+        "{" + base + ',"mic2_broadband_dbfs":-33.4,"mic_diff_db":2.40,'
+        '"mic_coherence":1.5,"mic2_valid":true}'
+    )
+    check(any("相关系数" in p for p in bad_coh.problems),
+          f"相关系数越界必须点名（实得 {bad_coh.problems}）")
+    bad_level = parse_line(
+        "{" + base + ',"mic2_broadband_dbfs":3.0,"mic_diff_db":2.40,'
+        '"mic_coherence":0.3,"mic2_valid":true}'
+    )
+    check(any("第二路麦电平" in p for p in bad_level.problems),
+          f"第二路电平超过 0 dBFS 必须点名（实得 {bad_level.problems}）")
+    bad_diff = parse_line(
+        "{" + base + ',"mic2_broadband_dbfs":-33.4,"mic_diff_db":-95.0,'
+        '"mic_coherence":0.3,"mic2_valid":true}'
+    )
+    check(any("双麦电平差" in p for p in bad_diff.problems),
+          f"电平差超出 ±80 dB 必须点名（实得 {bad_diff.problems}）")
 
 
 def test_event_frame() -> None:
@@ -1123,7 +1502,7 @@ def test_web_assets_contract() -> None:
     html = INDEX_FILE.read_text(encoding="utf-8")
     for element in ("chart", "latency-body", "problems", "events", "raw", "stats-body",
                     "capture-text", "btn-rec-start", "btn-rec-stop", "rec-seconds",
-                    "llm-state", "llm-task", "llm-transcript", "llm-summary", "llm-sessions",
+                    "llm-state", "llm-task", "llm-asr", "llm-windows", "llm-summary", "llm-sessions",
                     "llm-decision", "llm-context",
                     "conn-dot", "conn-text", "source-text", "age", "gain", "media",
                     "link", "env", "state", "conf", "seq", "toast", "eq", "control-warn"):
@@ -1408,6 +1787,32 @@ def test_relay_snapshot_reaches_the_panel() -> None:
     relay_block = state.snapshot()["relay"]
     eq(relay_block["measurable"], True, "中继读数进了快照")
     eq(relay_block["queued_ms"], 20.0, "排队深度原样带出")
+
+
+def test_voiceprint_only_does_not_report_relay_as_live() -> None:
+    """只开 --voiceprint 时不能把 relay 说成"中继已开"（2026-10-23 真机审计）。
+
+    main() 只在 --relay-audio / --ambient-executor relay|observe 时喂音频；只开
+    --voiceprint 时建 Relay 只是为了触发设备持续采集（base_feed=None）。旧实现拿
+    `relay is not None` 当"中继已开"，面板于是显示一个永远 0 字节的 24 ms 延迟，
+    还会误报"声音不会进到你戴的耳机里"。这里钉住上报口径。
+    """
+
+    class FakeRelayAmbient:
+        pass
+
+    check(
+        not relay_reports_audio(relay_audio=False, relay_ambient=None),
+        "voiceprint-only：relay 对象存在也不得当中继已开上报",
+    )
+    check(
+        relay_reports_audio(relay_audio=True, relay_ambient=None),
+        "--relay-audio：必须上报中继已开",
+    )
+    check(
+        relay_reports_audio(relay_audio=False, relay_ambient=FakeRelayAmbient()),
+        "--ambient-executor relay/observe：必须上报中继已开",
+    )
 
 
 def test_main_starts_with_relay_attached() -> None:
@@ -1733,6 +2138,148 @@ def test_player_decision_path_is_not_silently_dropped() -> None:
     check("串口断了" in service.last_error, "失败原因必须留下来给人看，不能吞掉")
     check("串口断了" in service.snapshot()["last_error"], "失败原因要进快照，面板才看得见")
 
+    # ---- 有符号（负=削）决策端到端 -------------------------------------------
+    # 播放器已经支持 -12 dB（player.swift minAppliedGainDb）；上位机这条通路必须把负值
+    # **原样**发出去，不能仍然按"只抬不削"把负段钳成 0。播放器自己会乘深度再钳位。
+    service._send = lambda payload: sent.append(payload)  # type: ignore[assignment]
+    service._last_decision = (0.0, [], 0.0)  # 清掉节流，确保这一发真的发出去
+    signed = [0.0] * 24
+    signed[2:5] = [-3.0, -2.5, -1.5]
+    signed[8:13] = [2.0] * 5
+    check(service.apply_decision(signed, 80.0), "含负增益的曲线也要能下发")
+    eq(sent[-1]["bands"][2], -3.0, "负增益必须原样透传给播放器（不钳成 0）")
+    eq(sent[-1]["bands"][8], 2.0, "正增益照旧")
+    eq(service.last_error, "", "有符号曲线下发成功时不得留下错误")
+
+    # 快照要能把"抬多少/削多少"分开报出来，面板才不必自己从数组里猜。
+    from host.player import MAX_APPLIED_GAIN_DB as _PLAYER_MAX_DB
+
+    service._process = _FakePlayerProcess()  # type: ignore[assignment]
+    service._send = lambda payload: sent.append(payload)  # type: ignore[assignment]
+    service._state = {
+        "playing": True,
+        "bypass": False,
+        "peak_db": -20.0,
+        "applied_bands": [-3.0, 0.0, 2.0] * 8,
+        "source_bands": [-3.0, 0.0, 2.0] * 8,
+        "depth": 2.5,
+        "volume_percent": 150.0,
+    }
+    service._state_at = time.monotonic()
+    snapshot = service.snapshot()
+    close(snapshot["applied_peak_abs_db"], 3.0, "快照报出绝对值最大的那一段")
+    close(snapshot["applied_max_cut_db"], -3.0, "快照报出最大削减（负数）")
+    eq(snapshot["applied_lifted_bands"], 8, "快照报出被抬的段数（每 3 段 1 个正值 → 8）")
+    eq(snapshot["applied_cut_bands"], 8, "快照报出被削的段数")
+    close(snapshot["applied_peak_db"], 2.0, "旧字段 applied_peak_db 含义不变=各段最大值")
+    eq(snapshot["min_applied_gain_db"], -12.0, "快照给出有符号量程下限（面板刻度用）")
+    eq(snapshot["max_applied_gain_db"], _PLAYER_MAX_DB, "快照给出量程上限")
+
+
+def test_eq_mode_and_bypass_control() -> None:
+    """面板 EQ 三档（基础/激进/关闭EQ）的 HTTP 路由，2026-10-22。
+
+    三档是为了 A/B 听感测试：mode 只属于 systemeq（demo 基线档位）；
+    bypass（关闭EQ=执行端直通）对 systemeq 可用；没有执行端时必须明确拒绝，
+    而不是"点过了"却什么都没发生。
+    """
+    from host.systemeq import SystemEqError, SystemEqService
+    import threading
+    import urllib.error
+    import urllib.request
+
+    class FakeSystemEq:
+        def __init__(self) -> None:
+            self.mode = "aggressive"
+            self.sent: list[dict] = []
+
+        def command(self, name: str, **fields):
+            if name == "mode":
+                value = fields.get("value")
+                if value not in ("basic", "aggressive"):
+                    raise SystemEqError("字段 value 只接受 basic / aggressive")
+                self.mode = value
+            self.sent.append({"cmd": name, **fields})
+            return {"ok": True, "sent": {"cmd": name, **fields}}
+
+        def snapshot(self):
+            return {
+                "available": True,
+                "demo": True,
+                "mode": self.mode,
+                "bypass": False,
+                "execution": "idle",
+                "depth": 2.5,
+            }
+
+    def post(base: str, payload: dict):
+        request = urllib.request.Request(
+            f"{base}/api/player",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read())
+
+    state = HostState(source="test", detail={}, on_mic_chunk=None)
+    broadcaster = Broadcaster(state, min_interval=0.0)
+    systemeq = FakeSystemEq()
+    httpd = make_server(state, broadcaster, pick_port(19000), systemeq=systemeq)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        status, result = post(base, {"cmd": "mode", "value": "basic"})
+        eq(status, 200, "切基础档返回 200")
+        check(result["ok"], "切基础档 ok")
+        eq(systemeq.sent[-1], {"cmd": "mode", "value": "basic"}, "mode 命令原样透传给 systemeq")
+        eq(result["systemeq"]["mode"], "basic", "回执快照带当前档位")
+
+        status, result = post(base, {"cmd": "mode", "value": "loud"})
+        eq(status, 400, "非法档位返回 400")
+        check(not result["ok"] and "basic" in result["error"], "错误写明允许的档位")
+
+        status, result = post(base, {"cmd": "bypass", "on": True})
+        eq(status, 200, "关闭EQ（bypass）返回 200")
+        eq(systemeq.sent[-1]["cmd"], "bypass", "bypass 透传给 systemeq")
+        check(result["systemeq"] is not None, "回执快照带 systemeq")
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=3)
+
+    # 没有执行端：mode 与 bypass 都必须 409，不能假装点过了。
+    httpd = make_server(state, broadcaster, pick_port(19010))
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        for payload in ({"cmd": "mode", "value": "basic"}, {"cmd": "bypass", "on": True}):
+            status, result = post(base, payload)
+            eq(status, 409, f"没有执行端时 {payload['cmd']} 返回 409")
+            check(not result["ok"], "并如实报错")
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=3)
+
+    # systemeq 服务的字段校验：非法档位在发进程之前就被拒。
+    service = SystemEqService(autostart=False)
+    try:
+        service.command("mode", value="loud")
+        check(False, "非法档位必须被拒")
+    except SystemEqError as exc:
+        check("basic" in str(exc), "错误写明允许的档位")
+    try:
+        service.command("mode", value="basic")
+        check(False, "没有进程时不得假装发送成功")
+    except SystemEqError as exc:
+        check("没有在运行" in str(exc), "合法档位也会因进程不在而如实报错")
+
 
 def test_voiceprint_shadow_snapshot_is_harmless() -> None:
     """self/other 对话门控：未启用/缺依赖时必须安全，不得影响主链路。"""
@@ -1754,6 +2301,40 @@ def test_voiceprint_shadow_snapshot_is_harmless() -> None:
     state.attach_voiceprint(Fake())
     section = state.snapshot()["voiceprint"]
     check(section["verdict"] == "self" and section["mode"] == "self-veto", "声纹进快照")
+
+
+def test_voiceprint_energy_activity_fallback() -> None:
+    """S3 的 voice_likelihood 漏报"近场小声"时，声纹不能永远收到 speech_active=false。
+
+    2026-10-22 真机：用户对着设备说话，设备端 voice_likelihood 只有 0.2；同一段音频
+    离线喂 WavLM 的 self 相似度却是 0.95。根因是 activity_provider 只看 S3 判据，
+    声纹 worker 的 speech_ratio 永远为 0，只能回 unknown。能量兜底用来解耦这两层。
+    """
+    import array
+
+    class _Chunk:
+        def __init__(self, pcm: bytes, rate: int = 16000) -> None:
+            self.pcm = pcm
+            self.rate = rate
+
+    def synth(dbfs: float, count: int = 1600) -> _Chunk:
+        amplitude = int(32768 * 10 ** (dbfs / 20.0))
+        samples = array.array(
+            "h", [amplitude if index % 2 == 0 else -amplitude for index in range(count)]
+        )
+        return _Chunk(samples.tobytes())
+
+    check(abs(VoiceprintService._chunk_dbfs(synth(-20.0)) + 20.0) < 0.3,
+          "块 RMS dBFS 要算得准")
+    service = VoiceprintService(enabled=False)
+    check(service.snapshot()["energy_floor_dbfs"] is None, "本底不足时不能编造能量本底")
+    for _ in range(40):
+        service._energy_history.append(VoiceprintService._chunk_dbfs(synth(-50.0)))  # type: ignore[attr-defined]
+    floor = service.snapshot()["energy_floor_dbfs"]
+    check(floor is not None and -51.0 < floor < -49.0, "本底估计要接近 -50 dBFS")
+    check(VoiceprintService._chunk_dbfs(synth(-40.0)) >= floor + 6.0,
+          "比本底高 10 dB 的块应能作为语音活动证据")
+    check(VoiceprintService._chunk_dbfs(_Chunk(b"")) is None, "空块不得报活动")
 
 
 def test_ambient_executor_and_intent_parsing() -> None:
@@ -1880,6 +2461,59 @@ def test_ambient_executor_and_intent_parsing() -> None:
     state = HostState(source="serial")
     state.attach_ambient(service)
     check(state.snapshot()["ambient"] is not None, "环境声执行端必须进快照")
+
+
+def test_ambient_gate_dual_turn_trigger() -> None:
+    """2026-10-23 B 方案：声纹双向交替可作为触发源；自言自语不触发；LLM veto 优先。"""
+    check(ambient_gate_allows(device_intent=False, llm_ok=False, self_ok=False,
+                              intent_recent=False, evidence_recent=False,
+                              dual_turn=True),
+          "声纹双向交替（self+other）即使 S3 意图为 false 也放行")
+    check(not ambient_gate_allows(device_intent=False, llm_ok=False, self_ok=True,
+                                  intent_recent=False, evidence_recent=False,
+                                  dual_turn=False),
+          "只有 self（自言自语）不触发")
+    check(not ambient_gate_allows(device_intent=False, llm_ok=False, self_ok=False,
+                                  intent_recent=False, evidence_recent=False,
+                                  dual_turn=True, llm_veto=True),
+          "LLM 明确否决时 dual_turn 也不能放行（D34 迟到否决优先）")
+    check(not ambient_gate_allows(device_intent=True, llm_ok=False, self_ok=False,
+                                  intent_recent=False, evidence_recent=False,
+                                  dual_turn=False),
+          "S3 意图 + 无门证据时仍被门否决（门还是否决器）")
+
+
+def test_ambient_gate_allows() -> None:
+    """门是否决器：S3 意图是触发器；self/LLM 只批准，不发起；LLM veto 最高优先。
+
+    2026-10-23 用户现场质疑"为什么我说话的时候把环境音拉起来"——self 证据不能
+    独立触发环境声，只能批准 S3 已经发起的对话。
+    """
+    check(not ambient_gate_allows(device_intent=False, llm_ok=False, self_ok=True,
+                                  intent_recent=False, evidence_recent=False),
+          "你说话（self）不能触发环境声：S3 意图为 false 时必须关闭")
+    check(ambient_gate_allows(device_intent=True, llm_ok=False, self_ok=True,
+                              intent_recent=False, evidence_recent=False),
+          "S3 意图 + 你接话时放行")
+    check(ambient_gate_allows(device_intent=True, llm_ok=True, self_ok=False,
+                              intent_recent=False, evidence_recent=False),
+          "S3 意图 + LLM 确认时放行")
+    check(ambient_gate_allows(device_intent=True, llm_ok=False, self_ok=False,
+                              intent_recent=False, evidence_recent=True),
+          "S3 意图 + 8 秒内门证据时放行（避免一句一关）")
+    check(ambient_gate_allows(device_intent=True, llm_ok=False, self_ok=False,
+                              intent_recent=True, evidence_recent=False),
+          "S3 意图新鲜时放行")
+    check(not ambient_gate_allows(device_intent=False, llm_ok=False, self_ok=False,
+                                  intent_recent=False, evidence_recent=False),
+          "没有任何证据时必须关闭")
+    check(not ambient_gate_allows(device_intent=True, llm_ok=False, self_ok=False,
+                                  intent_recent=False, evidence_recent=False),
+          "S3 意图单独不足以放行（门必须监督）")
+    check(not ambient_gate_allows(device_intent=True, llm_ok=False, self_ok=True,
+                                  intent_recent=True, evidence_recent=True,
+                                  llm_veto=True),
+          "LLM 明确否决时即使 self 证据在场也不放行（D34 迟到否决优先）")
 
 
 def test_relay_ambient_gate() -> None:
@@ -2164,6 +2798,17 @@ def test_assistant_snapshot_is_truthful_without_asr() -> None:
     unknown = AssistantService()._speaker_segments(b"\0\0" * 12000, 16000, 0)
     eq(unknown[0][0], "unknown", "缺失声纹证据时不得把转录归给任何人")
 
+    # 2026-10-22 事故复盘：<0.45 s 的短轮次不再折叠身份；self 短应答是 voice 门的证据。
+    short_self = AssistantService(voiceprint_snapshot=lambda: {
+        "ready": True,
+        "history": [
+            {"verdict": "self", "start_sample": 0, "end_sample": 4800},
+        ],
+    })
+    segments = short_self._speaker_segments(b"\0\0" * 4800, 16000, 0)
+    eq([speaker for speaker, _ in segments], ["self"],
+       "短于 0.45 s 的 self 轮次必须保留身份，不能折叠成 unknown")
+
     fallback = service._local_summary({
         "session": 3, "audio_seconds": 4.2, "chunks_lost": 0,
         "s3_ambient_open_intent_frames": 7, "transcript": "self：你好，这是一段测试。",
@@ -2274,10 +2919,37 @@ def test_assistant_filters_asr_noise_hallucinations() -> None:
         check(bool(kept), f"真实短应答不能被当成噪声丢弃：{answer}")
     dropped, _ = service._filter_asr_text("嗯", 1.5)
     eq(dropped, "", "单字语气词仍应丢弃")
+    # 2026-10-22 事故复盘：self 的短应答/语气词是"你接话了"的证据，必须保留。
+    for answer in ("嗯", "嗯。", "啊", "喔"):
+        kept, note = service._filter_asr_text(answer, 1.5, speaker="self")
+        check(bool(kept) and "self保留" in note, f"self 短应答必须保留：{answer}")
+    # other/unknown 的短应答仍按旧规则丢弃，防噪声幻觉污染 LLM。
+    dropped_other, _ = service._filter_asr_text("嗯", 1.5, speaker="other")
+    eq(dropped_other, "", "other 的单字语气词仍应丢弃")
     folded, note = service._filter_asr_text(
         "不会被patched，until tomorrow。", 3.0
     )
     check("patched" in folded, "单次正常句子必须保留")
+
+
+def test_assistant_interaction_features() -> None:
+    """对话交互结构必须显式给出，辅助 LLM 判断"是不是轮流开口"。"""
+    service = AssistantService()
+    features = service._interaction_features(
+        [("self", "我讲一段"), ("other", "嗯"), ("self", "然后")], None
+    )
+    eq(features["self_turns"], 2, "本段 self 轮次数")
+    eq(features["other_turns"], 1, "本段 other 轮次数")
+    check(features["alternating"], "self→other→self 必须识别为交替")
+    unknown = service._interaction_features(
+        [("self", "我讲一段"), ("unknown", "x"), ("self", "继续")], None
+    )
+    check(not unknown["alternating"], "unknown 不参与交替判断（身份不明不能算轮次证据）")
+    history = service._interaction_features(
+        [("self", "好")],
+        {"recent_turns": [{"speaker": "self"}, {"speaker": "other"}]},
+    )
+    check(history["recent_alternating"], "跨段 recent_turns 的交替必须识别")
 
 
 def test_assistant_gates_asr_on_speech_evidence() -> None:
@@ -2482,6 +3154,50 @@ def test_assistant_asr_death_falls_back_to_fast_path() -> None:
           "ASR 退出只能降级为无 LLM 否决，不能阻塞端侧快路径")
 
 
+def test_assistant_aggregates_speaker_labels_per_turn() -> None:
+    """说话人归属按"声学轮次"聚合，不再被 0.75 s 窗口切碎（D45）。
+
+    旧逻辑：0.75 s 切片逐片贴标签，用户一句 1–2 s 的自说会切成 self+unknown 两段。
+    新逻辑：能量 VAD 切轮次，每轮用中点落在轮内的声纹窗投票；self 优先，短轮不贴身份。
+    这里用合成 PCM + 假声纹窗，锁住三件事：轮次完整、self 不被 unknown 切片切碎、
+    没有声纹证据时仍回 unknown。
+    """
+    import array
+
+    rate = 16000
+    total = rate * 3  # 3 s
+    samples = array.array("h", [200 if index % 2 == 0 else -200 for index in range(total)])
+    # 1.0–2.5 s 是一段"说话"（+32 dB 高于本底）
+    for index in range(rate, int(rate * 2.5)):
+        samples[index] = 8000 if index % 2 == 0 else -8000
+    audio = samples.tobytes()
+
+    window = int(rate * 1.5)
+    # self 窗中点 1.3 s，落在整段说话轮内；没有别的窗覆盖它。
+    history = [{
+        "verdict": "self", "score": 0.93, "dbfs": -15.0, "speech_ratio": 1.0,
+        "start_sample": int(rate * 0.5), "end_sample": int(rate * 0.5) + window,
+    }]
+    service = AssistantService(voiceprint_snapshot=lambda: {"ready": True, "history": history})
+    segments = service._speaker_segments(audio, rate, 0)  # type: ignore[attr-defined]
+    labels = [speaker for speaker, _ in segments]
+    check(labels.count("self") == 1, f"整段自说应聚合成一个 self 轮次，实际 {labels}")
+    check("unknown" not in labels, f"同一句不能被 unknown 切片切碎，实际 {labels}")
+    self_pcm = next(pcm for speaker, pcm in segments if speaker == "self")
+    check(len(self_pcm) >= int(rate * 0.45) * 2, "聚合后的 self 轮次要包含完整语音")
+
+    # 只有 unknown 窗（没有 self/other 证据）时，整轮仍是 unknown，不能猜。
+    only_unknown = [{
+        "verdict": "unknown", "score": 0.70, "dbfs": -20.0, "speech_ratio": 1.0,
+        "start_sample": int(rate * 0.5), "end_sample": int(rate * 0.5) + window,
+    }]
+    service2 = AssistantService(
+        voiceprint_snapshot=lambda: {"ready": True, "history": only_unknown}
+    )
+    segments2 = service2._speaker_segments(audio, rate, 0)  # type: ignore[attr-defined]
+    check([speaker for speaker, _ in segments2] == ["unknown"], "无身份证据时必须 unknown")
+
+
 def test_assistant_splits_unknown_speakers_into_pause_turns() -> None:
     """声纹全 unknown 时，按静音停顿切轮次，LLM 才能看到"轮次结构"。"""
     rate = 16000
@@ -2535,6 +3251,12 @@ def test_training_writer_records_segment_and_llm_context() -> None:
     service.recording_started(16000, 0)
     epoch = service._authorization_epoch_id
     service._note_context_turns(1, epoch, [("self", "你几点到？"), ("other", "七点。")])
+    service._note_context_turns(1, epoch, [("self", ""), ("other", "")])
+    facts = service._context_facts()
+    # self 空文本也要留轮次证据（other/unknown 空文本跳过）。
+    check(any(t["speaker"] == "self" and t["text"] == "（短应答，内容未识别）"
+              for t in facts["recent_turns"]),
+          "self 内容被过滤时也要留占位轮次，不能让 LLM 判成'无 self 回应'")
     service.recording_started(16000, 0)  # 新会话会推进 epoch
     epoch = service._authorization_epoch_id
     service._note_context_turns(2, epoch, [("unknown", "第一句"), ("unknown", "第二句")])
@@ -2550,18 +3272,18 @@ def test_training_writer_records_segment_and_llm_context() -> None:
 def test_assistant_uses_absolute_sample_offset_for_speakers() -> None:
     """裁剪后的 ASR 片段仍要按**绝对**流样本号对齐声纹窗口（连续中继 start_sample>0）。"""
     absolute_start = 100_000
-    # 裁剪后的片段绝对起点 108000，长 1.6 s；声纹窗口前 0.8 s self、后 0.8 s other。
+    # 裁剪后的片段绝对起点 108000，长 1.5 s；声纹窗口前 0.75 s self、后 0.75 s other。
     trimmed_start = absolute_start + 8000
     voiceprint = AssistantService(voiceprint_snapshot=lambda: {
         "ready": True,
         "history": [
             {"verdict": "self", "start_sample": trimmed_start,
-             "end_sample": trimmed_start + 12800},
-            {"verdict": "other", "start_sample": trimmed_start + 12800,
-             "end_sample": trimmed_start + 25600},
+             "end_sample": trimmed_start + 12000},
+            {"verdict": "other", "start_sample": trimmed_start + 12000,
+             "end_sample": trimmed_start + 24000},
         ],
     })
-    pcm = b"\0\0" * 25600
+    pcm = b"\0\0" * 24000
     segments = voiceprint._speaker_segments(pcm, 16000, trimmed_start)
     eq([speaker for speaker, _ in segments], ["self", "other"],
        "裁剪后必须用绝对样本偏移切分 self/other，而不是相对偏移")
@@ -2635,13 +3357,254 @@ def test_llm_ambient_authority_helpers() -> None:
               f"other/过期/未就绪都不得触发 self 否决：{snapshot}")
 
 
+# --------------------------------------------------------------------------- 连续音频
+
+
+def _pcm_chunk(
+    sequence: int | None,
+    *,
+    samples: int = 320,
+    start: int = 0,
+    rate: int = 16_000,
+) -> MicChunk:
+    """造一块与固件同形的 16-bit PCM（值域避开 ±32767，便于逐字节比对）。"""
+    data = struct.pack(
+        f"<{samples}h", *[((start + i) % 20_000) - 10_000 for i in range(samples)]
+    )
+    return MicChunk(
+        sequence=sequence,
+        sample_count=samples,
+        rate=rate,
+        timestamp_ms=None if sequence is None else sequence * 20,
+        pcm=data,
+    )
+
+
+def test_continuous_audio_writes_one_contiguous_wav() -> None:
+    """连续音频必须"整段连续"：样本顺序逐字节一致、WAV 头合法、summary 与统计对得上。"""
+    with tempfile.TemporaryDirectory() as folder:
+        writer = ContinuousAudioWriter(folder, chunk_seconds=1.0)
+        chunks = [_pcm_chunk(seq, start=seq * 320) for seq in range(5)]
+        for chunk in chunks:
+            check(writer.feed(chunk), "连续音频每块都应写入成功")
+        stats = writer.stats()
+        eq(stats["chunks"], 5, "块数")
+        eq(stats["gaps"], 0, "序号连续时不得记丢块")
+        eq(stats["lost_chunks"], 0, "序号连续时丢块数为 0")
+        eq(stats["duration_s"], 0.1, "时长（1600 点 @ 16 kHz）")
+        eq(stats["error"], "", "正常写入不得留下错误")
+        writer.close()
+        writer.close()  # 两条退出路径会各调一次，必须幂等
+
+        session = Path(stats["session_dir"])
+        meta = json.loads((session / "session.json").read_text(encoding="utf-8"))
+        eq(meta["rate"], 16_000, "会话元信息采样率")
+        summary = json.loads((session / "summary.json").read_text(encoding="utf-8"))
+        eq(summary["end_reason"], "stopped", "正常退出原因")
+        eq(summary["chunks"], 5, "summary 块数")
+        eq(summary["files"], ["audio-0001.wav"], "未到轮转阈值只应有一个文件")
+
+        with wave.open(str(session / "audio-0001.wav"), "rb") as handle:
+            eq(handle.getframerate(), 16_000, "WAV 采样率")
+            eq(handle.getnchannels(), 1, "WAV 单声道")
+            eq(handle.getsampwidth(), 2, "WAV 16-bit")
+            eq(handle.getnframes(), 1_600, "WAV 样本数")
+            check(
+                handle.readframes(handle.getnframes()) == b"".join(c.pcm for c in chunks),
+                "WAV 样本必须与写入顺序逐字节一致（收尾不得丢样本）",
+            )
+
+        lines = (session / "capture.jsonl").read_text(encoding="utf-8").splitlines()
+        eq(len(lines), 5, "时间轴每块一行")
+        first = json.loads(lines[0])
+        eq(first["file"], "audio-0001.wav", "时间轴文件名")
+        eq(first["offset_s"], 0.0, "首块在文件内的偏移")
+        eq(json.loads(lines[1])["offset_s"], 0.02, "第二块偏移 = 320/16000")
+
+
+def test_continuous_audio_rotation_keeps_samples_contiguous() -> None:
+    """轮转是文件边界，不是样本边界：拆分后拼接必须与原始顺序逐字节一致。"""
+    with tempfile.TemporaryDirectory() as folder:
+        writer = ContinuousAudioWriter(folder, chunk_seconds=0.01)  # 160 点/文件
+        chunks = [_pcm_chunk(seq, samples=100, start=seq * 100) for seq in range(4)]
+        for chunk in chunks:
+            check(writer.feed(chunk), "轮转场景下每块都应写入成功")
+        stats = writer.stats()
+        eq(
+            stats["files"],
+            ["audio-0001.wav", "audio-0002.wav"],
+            "100 点/块、160 点阈值：第 3 块前轮转，只应有两个文件",
+        )
+        writer.close()
+        session = Path(stats["session_dir"])
+        joined = b""
+        sizes: list[int] = []
+        for name in stats["files"]:
+            with wave.open(str(session / name), "rb") as handle:
+                sizes.append(handle.getnframes())
+                joined += handle.readframes(handle.getnframes())
+        eq(sizes, [200, 200], "每个文件的实际样本数")
+        check(joined == b"".join(c.pcm for c in chunks), "轮转不得丢样本或错序")
+
+
+def test_continuous_audio_gaps_and_rate_mismatch_are_explicit() -> None:
+    """丢块只记账不补零；采样率不一致拒绝写入——两种失败都不能被伪装成正常音频。"""
+    with tempfile.TemporaryDirectory() as folder:
+        writer = ContinuousAudioWriter(folder)
+        check(writer.feed(_pcm_chunk(0)), "首块写入")
+        check(writer.feed(_pcm_chunk(5)), "跳号也照写（录音不能因丢块中断）")
+        stats = writer.stats()
+        eq(stats["gaps"], 1, "跳号必须记一处丢块")
+        eq(stats["lost_chunks"], 4, "0→5 之间丢 4 块")
+        check(not writer.feed(_pcm_chunk(6, rate=8_000)), "采样率不一致必须拒绝写入")
+        check("采样率" in writer.error, f"必须给出可读原因（实得 {writer.error!r}）")
+        check(not writer.feed(_pcm_chunk(7)), "拒绝之后不得继续写入（不许污染 WAV）")
+        writer.close()
+
+        session = Path(stats["session_dir"])
+        lines = (session / "capture.jsonl").read_text(encoding="utf-8").splitlines()
+        eq(len(lines), 2, "被拒绝的块不得进时间轴")
+        check(json.loads(lines[1])["gap"] is True, "跳号行必须显式标 gap")
+        summary = json.loads((session / "summary.json").read_text(encoding="utf-8"))
+        eq(summary["gaps"], 1, "summary 里的丢块数")
+        check("采样率" in summary["error"], "summary 必须保留拒绝原因")
+        with wave.open(str(session / "audio-0001.wav"), "rb") as handle:
+            eq(handle.getnframes(), 640, "只写进了被接受的两块（不补零）")
+
+
+def test_continuous_audio_stops_at_disk_budget() -> None:
+    """磁盘预算到顶必须停写并留下原因，不能悄悄把演示机磁盘写满。"""
+    with tempfile.TemporaryDirectory() as folder:
+        writer = ContinuousAudioWriter(folder, max_bytes=2_000)
+        written = 0
+        while written < 10 and writer.feed(_pcm_chunk(written)):
+            written += 1
+        eq(written, 4, "640 B/块，写到第 4 块（2560 B）越 2000 B 预算即停")
+        check(writer.stats()["stopped_by_budget"], "必须标记磁盘预算止损")
+        check(not writer.feed(_pcm_chunk(99)), "止损后不得再写入")
+        writer.close()
+        writer.close()
+        session = Path(writer.stats()["session_dir"])
+        summary = json.loads((session / "summary.json").read_text(encoding="utf-8"))
+        eq(summary["end_reason"], "stopped_by_budget", "结束原因")
+        eq(summary["chunks"], 4, "已写入块数")
+        with wave.open(str(session / "audio-0001.wav"), "rb") as handle:
+            eq(handle.getnframes(), 4 * 320, "预算止损前的样本已正确收尾")
+
+
+def test_continuous_audio_cli_defaults() -> None:
+    """默认关闭：连续音频约 150 MB/小时，不能因为升级 host 就悄悄开始落盘。"""
+    args = parse_args([])
+    eq(args.continuous_audio, "", "默认不写连续音频")
+    eq(args.continuous_chunk_seconds, 600.0, "默认轮转 600 s")
+    args = parse_args(
+        ["--continuous-audio", "记录/连续音频", "--continuous-chunk-seconds", "60"]
+    )
+    eq(args.continuous_audio, "记录/连续音频", "显式打开时保留目录")
+    eq(args.continuous_chunk_seconds, 60.0, "轮转长度可配")
+
+
+def test_main_wires_continuous_audio_from_replay() -> None:
+    """main() 装配连续音频：回放里的 mic_chunk 要落成 WAV，退出收尾要写 summary。
+
+    这一组挡的是装配顺序问题（例如 continuous 定义在 on_mic_chunk 之后、cleanup 漏挂）
+    ——单测看不见，真机表现为启动即崩或"跑了一小时没有文件"。
+    回放源结束会让 main() 走正常退出路径（与 Ctrl+C 共用同一个 cleanup），所以不需要
+    /api/stop，也不会动到真进程。
+    """
+    import threading
+
+    import host.__main__ as main_module
+    from host.__main__ import main
+    from host.server import pick_port
+
+    with tempfile.TemporaryDirectory() as folder:
+        root = Path(folder)
+        audio_dir = root / "连续音频"
+        chunks: list[bytes] = []
+        lines: list[str] = []
+        for seq in range(8):
+            chunk = _pcm_chunk(seq)
+            chunks.append(chunk.pcm)
+            lines.append(
+                json.dumps(
+                    {
+                        "type": "mic_chunk",
+                        "sequence": seq,
+                        "timestamp_ms": seq * 20,
+                        "samples": 320,
+                        "rate": 16_000,
+                        "pcm": base64.b64encode(chunk.pcm).decode(),
+                    }
+                )
+            )
+        log = root / "mix.log"
+        log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        # main() 会装 SIGINT/SIGTERM 处理器，而 signal.signal 只能在主线程调用。
+        original_signal = main_module.signal.signal
+        main_module.signal.signal = lambda *args, **kwargs: None  # noqa: ARG005
+        port = pick_port(18970)
+        result: dict[str, int] = {}
+
+        def run() -> None:
+            result["rc"] = main(
+                [
+                    "--replay",
+                    str(log),
+                    "--quiet",
+                    "--no-browser",
+                    "--no-player",
+                    "--no-memo",
+                    "--continuous-audio",
+                    str(audio_dir),
+                    "--web-port",
+                    str(port),
+                ]
+            )
+
+        thread = threading.Thread(target=run, daemon=True)
+        try:
+            thread.start()
+            thread.join(timeout=15)
+            check(not thread.is_alive(), "回放源结束后 main() 必须正常退出")
+            eq(result.get("rc"), 0, "main() 退出码")
+            summaries = sorted(audio_dir.glob("*/summary.json"))
+            eq(len(summaries), 1, "一个会话目录一个 summary")
+            if not summaries:
+                return
+            summary = json.loads(summaries[0].read_text(encoding="utf-8"))
+            eq(summary["chunks"], 8, "回放的 8 个 mic_chunk 都要记账")
+            eq(summary["gaps"], 0, "序号连续不得记丢块")
+            eq(summary["end_reason"], "stopped", "退出路径要留下原因")
+            eq(summary["error"], "", "正常退出不得留错误")
+            wavs = sorted(summaries[0].parent.glob("audio-*.wav"))
+            eq(len(wavs), 1, "未到轮转阈值只应有一个 WAV")
+            if wavs:
+                with wave.open(str(wavs[0]), "rb") as handle:
+                    eq(handle.getframerate(), 16_000, "连续 WAV 采样率")
+                    eq(handle.getnframes(), 8 * 320, "连续 WAV 样本数")
+                    check(
+                        handle.readframes(handle.getnframes()) == b"".join(chunks),
+                        "样本顺序必须与回放顺序一致",
+                    )
+        finally:
+            main_module.signal.signal = original_signal
+            thread.join(timeout=3)
+
+
 def main() -> int:
     tests = [
         test_d2_matches_c_printf,
         test_mac_default_output_route,
+        test_earphone_cli_parsing,
+        test_memo_persists_injects_and_finalizes,
+        test_memo_retention_and_decay,
         test_command_frame_full,
         test_new_firmware_frame_carries_tuning,
         test_context_model_frame,
+        test_context_mixed_fields,
+        test_dual_mic_telemetry,
         test_event_frame,
         test_speech_gate_frame,
         test_own_voice_frame,
@@ -2677,14 +3640,19 @@ def main() -> int:
         test_server_endpoints,
         test_interval_stats_and_percentile,
         test_player_decision_path_is_not_silently_dropped,
+        test_eq_mode_and_bypass_control,
         test_voiceprint_shadow_snapshot_is_harmless,
+        test_voiceprint_energy_activity_fallback,
         test_ambient_executor_and_intent_parsing,
+        test_ambient_gate_dual_turn_trigger,
+        test_ambient_gate_allows,
         test_relay_ambient_gate,
         test_audio_relay_budget_caps_backlog,
         test_relay_measures_real_queue_depth_not_our_writes,
         test_relay_reports_unmeasurable_instead_of_guessing,
         test_relay_sink_missing_binary_says_how_to_build,
         test_relay_snapshot_reaches_the_panel,
+        test_voiceprint_only_does_not_report_relay_as_live,
         test_main_starts_with_relay_attached,
         test_control_acknowledgement_is_tracked,
         test_serial_source_survives_transient_read_errors,
@@ -2698,15 +3666,23 @@ def main() -> int:
         test_assistant_rolls_continuous_speech_into_asr_segments,
         test_assistant_boosts_only_quiet_asr_copy,
         test_assistant_filters_asr_noise_hallucinations,
+        test_assistant_interaction_features,
         test_assistant_gates_asr_on_speech_evidence,
         test_assistant_fast_path_authorization_and_late_veto,
         test_assistant_splits_unknown_speakers_into_pause_turns,
+        test_assistant_aggregates_speaker_labels_per_turn,
         test_training_writer_records_segment_and_llm_context,
         test_assistant_uses_absolute_sample_offset_for_speakers,
         test_authorization_epoch_advances_after_rolling_cap_then_silence,
         test_assistant_asr_death_falls_back_to_fast_path,
         test_llm_ambient_authority_helpers,
         test_ambient_requires_fresh_other_voiceprint,
+        test_continuous_audio_writes_one_contiguous_wav,
+        test_continuous_audio_rotation_keeps_samples_contiguous,
+        test_continuous_audio_gaps_and_rate_mismatch_are_explicit,
+        test_continuous_audio_stops_at_disk_budget,
+        test_continuous_audio_cli_defaults,
+        test_main_wires_continuous_audio_from_replay,
     ]
     for test in tests:
         try:

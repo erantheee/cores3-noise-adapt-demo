@@ -47,6 +47,14 @@ NUMERIC_FIELDS = {"index", "seconds", "percent", "depth"}
 BOOLEAN_FIELDS = {"on", "autoplay"}
 
 DEFAULT_VOLUME_PERCENT = 150.0
+#: 播放器真正能执行的逐段增益范围（dB），逐字对应 tools/player/player.swift 的
+#: `minAppliedGainDb = -12` / `maxAppliedGainDb = +10`（按深度放大后再钳位）。
+#: 这里镜像一份是为了让**快照自己说得出**面板该按什么量程画：面板不能把 -12…+10
+#: 当经验值写死在 JS 里；旧 host 的快照没有这个字段时面板才退回同一组常量。
+MIN_APPLIED_GAIN_DB = -12.0
+MAX_APPLIED_GAIN_DB = 10.0
+#: 判断"这一段算抬还是算削"的门限，与协议层 >0.05 / <-0.05 的口径一致。
+SIGNIFICANT_GAIN_DB = 0.05
 #: 决策下发的节流：设备 10 Hz、播放器 20 ms 一次斜坡，按帧发没有意义，只会刷屏。
 DECISION_MIN_INTERVAL_S = 0.2
 DECISION_MIN_DELTA_DB = 0.05
@@ -291,6 +299,8 @@ class PlayerService:
                 "execution": "unavailable",
                 "depth": self.depth,
                 "volume_percent": self.volume_percent,
+                "min_applied_gain_db": MIN_APPLIED_GAIN_DB,
+                "max_applied_gain_db": MAX_APPLIED_GAIN_DB,
             }
 
         state = state or {}
@@ -298,6 +308,14 @@ class PlayerService:
         bypass = bool(state.get("bypass"))
         peak_db = state.get("peak_db")
         applied = state.get("applied_bands") or []
+        # 有符号调音（负=削）：`applied_peak_db` 仍是"各段里的最大值"（旧字段含义不变；
+        # 全为削时它是负的那个最大值）。新增的几个字段把"抬多少/削多少"分开报出来，
+        # 面板据此写清数字，而不是自己从数组里猜——但数组本身就是播放器的实测，
+        # 面板拿它兜底展示也是"读实测"，不是造曲线。
+        lifted_applied = [value for value in applied if value > SIGNIFICANT_GAIN_DB]
+        cut_applied = [value for value in applied if value < -SIGNIFICANT_GAIN_DB]
+        applied_peak_abs = max((abs(value) for value in applied), default=None)
+        applied_max_cut = min(cut_applied) if cut_applied else 0.0
         # 回执的判据写死在这里：不在播就不算执行；直通时也不算；确实没出声同样不算。
         # "没出声"用**窗口内最大值**判断，不用瞬时值——真实歌曲有安静段（《渡口》开头
         # 就掉到 -120 dB，单点判据会把正常播放报成 silent，2026-10-14 实测撞到）。
@@ -328,15 +346,26 @@ class PlayerService:
             "media_percent": state.get("media_percent"),
             "source_bands": state.get("source_bands") or [],
             "applied_bands": applied,
+            #: 旧字段：各段里的最大值。有符号曲线全为削时它会是负数——语义没变。
             "applied_peak_db": max(applied) if applied else None,
+            #: 有符号口径（新增）：绝对值最大的那一段、最大削减（负数或 0）、抬/削段数。
+            "applied_peak_abs_db": None if applied_peak_abs is None else round(applied_peak_abs, 2),
+            "applied_max_cut_db": round(applied_max_cut, 2),
+            "applied_lifted_bands": len(lifted_applied),
+            "applied_cut_bands": len(cut_applied),
+            #: 面板画图用的有符号量程。上限优先用播放器自报值（ready 消息），没有就用契约值。
+            "min_applied_gain_db": MIN_APPLIED_GAIN_DB,
+            "max_applied_gain_db": (ready or {}).get("max_applied_gain_db", MAX_APPLIED_GAIN_DB),
             "peak_db": peak_db,
             #: 最近 PEAK_WINDOW_S 秒里的最大峰值。判"有没有出声"看这个，不看瞬时值。
             "peak_window_db": window_peak,
             "output_device": state.get("output_device") or (ready or {}).get("output_device", ""),
             "sample_rate": state.get("sample_rate"),
             "state_age_s": None if age is None else round(age, 2),
+            #: 播放器因输出设备切换而重启音频引擎的次数。>0 不一定是故障——它说明
+            #: "换个耳机/拔掉耳机后播放没有卡死"这条恢复路径真的走过。
+            "recoveries": state.get("recoveries", 0),
             "tracks": (ready or {}).get("tracks", []),
-            "max_applied_gain_db": (ready or {}).get("max_applied_gain_db"),
             "stderr_tail": stderr_tail,
             "last_error": self.last_error,
         }

@@ -86,6 +86,33 @@ def enrollment_prototype(directory: Path, embedder: WavLMEmbedder) -> tuple[np.n
     return prototype, len(vectors)
 
 
+def normalize(vector: np.ndarray) -> np.ndarray:
+    norm = float(np.linalg.norm(vector))
+    return vector / norm if norm > 0.0 else vector
+
+
+def load_learned(path: Path, dim: int) -> tuple[np.ndarray | None, int]:
+    """加载持续积累的原型（在线学习结果）；形状不符就当没有。"""
+    if not path.exists():
+        return None, 0
+    try:
+        data = np.load(path)
+        prototype = np.asarray(data["prototype"], dtype=np.float64).ravel()
+        updates = int(data["updates"])
+    except (OSError, KeyError, ValueError):
+        return None, 0
+    if prototype.shape[0] != dim or updates <= 0:
+        return None, 0
+    return normalize(prototype), updates
+
+
+def save_learned(path: Path, prototype: np.ndarray, updates: int) -> None:
+    """原子落盘：学到了新原型就持久化，重启后继续用（不污染原始注册集）。"""
+    tmp = path.with_suffix(".tmp.npz")
+    np.savez(tmp, prototype=prototype, updates=updates)
+    tmp.replace(path)
+
+
 def emit(payload: dict) -> None:
     sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
     sys.stdout.flush()
@@ -100,14 +127,41 @@ def main() -> int:
     parser.add_argument("--hop-s", type=float, default=0.75)
     parser.add_argument("--smooth", type=float, default=0.6)
     parser.add_argument("--speech-floor-dbfs", type=float, default=-45.0)
+    # 耳语级（2026-10-23 用户口径）：耳语词间停顿多、端侧 event/vl 对耳语断续，
+    # 20 ms chunk 粒度下 speech_ratio 天然只有 0.15–0.3。旧硬编码门 0.35 会把
+    # "WavLM 已打 0.90 的耳语窗"挡成 unknown。降到 0.15：仍要求窗内有真实语音
+    # 活动（防纯噪声窗），但不再系统性排除耳语。身份判定仍由 score ≥ threshold 决定。
+    parser.add_argument("--min-speech-ratio", type=float, default=0.15,
+                        help="窗口内语音活动占比门槛（低于则 unknown，默认 0.15）")
     parser.add_argument("--unknown-margin", type=float, default=0.15)
+    # 持续积累（2026-10-23 用户要求）：高置信 self 窗口在线更新声纹原型。
+    # 只学"干净的高分样本"，混合说话（两人同时）分数在中间区，不会污染原型。
+    parser.add_argument("--no-learn", action="store_true",
+                        help="关闭在线声纹积累（默认开）")
+    parser.add_argument("--learn-weight", type=float, default=0.08,
+                        help="原型向新样本靠拢的权重（默认 0.08）")
+    parser.add_argument("--learn-min-score", type=float, default=0.80,
+                        help="只有 score ≥ 该值才学习（默认等于 self 阈值；"
+                             "混合/中间区样本仍不会学）")
+    parser.add_argument("--learn-min-dbfs", type=float, default=-40.0,
+                        help="只有窗口 dBFS ≥ 该值才学习（太弱/远场不学）")
+    parser.add_argument("--learn-min-speech-ratio", type=float, default=0.5,
+                        help="只有语音活动占比 ≥ 该值才学习")
     args = parser.parse_args()
 
     emit({"type": "loading"})
     embedder = WavLMEmbedder()
     prototype, clip_count = enrollment_prototype(args.enroll_dir, embedder)
+    learn_path = args.enroll_dir / "learned-prototype.npz"
+    learn_updates = 0
+    learned: np.ndarray | None = None
+    if not args.no_learn:
+        learned, learn_updates = load_learned(learn_path, int(prototype.shape[0]))
+        if learned is not None:
+            prototype = learned
     emit({"type": "ready", "clips": clip_count, "dim": int(prototype.shape[0]),
-          "threshold": args.threshold})
+          "threshold": args.threshold, "learn_updates": learn_updates,
+          "learned_from": str(learn_path.name) if learned is not None else ""})
 
     window = int(args.window_s * 16000)
     hop = int(args.hop_s * 16000)
@@ -115,8 +169,11 @@ def main() -> int:
     activity_buffer = np.zeros(0, dtype=np.uint8)
     buffer_start_sample = 0
     smoothed: float | None = None
+    peak_scores: list[float] = []
     windows = 0
     last_emit = 0.0
+    last_save = 0.0
+    learn_threshold = max(args.learn_min_score, args.threshold)
 
     for line in sys.stdin:
         line = line.strip()
@@ -161,14 +218,34 @@ def main() -> int:
                 args.smooth * smoothed + (1.0 - args.smooth) * score)
             windows += 1
             now = time.monotonic()
-            if speech_ratio < 0.35 or dbfs < args.speech_floor_dbfs:
+            # 耳语级（2026-10-23）：耳语窗的语音密度随时间波动（词间停顿），单窗判定
+            # 会把"条件好的峰值窗"丢掉。保留最近 ~3 s（4 个 hop）的窗口分数，判定用
+            # 峰值：耳语 6 s 里只要有一两个窗语音密度够（实测 0.90），就判 self。
+            # 峰值只进不出：新窗分数低时峰值自然滑出窗口，误判不会滞留。
+            peak_scores.append(score)
+            while len(peak_scores) > 4:
+                peak_scores.pop(0)
+            peak = max(peak_scores)
+            if speech_ratio < args.min_speech_ratio or dbfs < args.speech_floor_dbfs:
                 verdict = "unknown"
-            elif score >= args.threshold:
+            elif peak >= args.threshold:
                 verdict = "self"
-            elif score <= args.threshold - args.unknown_margin:
+            elif peak <= args.threshold - args.unknown_margin:
                 verdict = "other"
             else:
                 verdict = "unknown"
+            # 在线积累：判定用的还是旧原型（score 在上方算好），只把干净的高分
+            # self 样本并进原型；混合/中间区样本不学，避免把对方声纹吃进来。
+            if (not args.no_learn
+                    and score >= learn_threshold
+                    and speech_ratio >= args.learn_min_speech_ratio
+                    and dbfs >= args.learn_min_dbfs):
+                prototype = normalize(
+                    prototype * (1.0 - args.learn_weight) + vector * args.learn_weight)
+                learn_updates += 1
+                if learn_updates == 1 or learn_updates % 4 == 0 or now - last_save >= 30.0:
+                    save_learned(learn_path, prototype, learn_updates)
+                    last_save = now
             if windows == 1 or now - last_emit >= 0.25:
                 last_emit = now
                 emit({"type": "verdict", "verdict": verdict,
@@ -177,6 +254,7 @@ def main() -> int:
                       "dbfs": round(float(dbfs), 1),
                       "speech_ratio": round(speech_ratio, 3),
                       "windows": windows,
+                      "learn_updates": learn_updates,
                       "start_sample": start_sample,
                       "end_sample": end_sample,
                       "latency_ms": round((now - started) * 1000.0, 1)})

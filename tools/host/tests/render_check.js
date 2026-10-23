@@ -23,7 +23,7 @@ const REAL_IDS = new Set([...html.matchAll(/id="([^"]+)"/g)].map((m) => m[1]));
 const unknownIds = new Set();
 const elements = new Map();
 function makeElement(id) {
-  return {
+  const element = {
     id,
     textContent: "",
     innerHTML: "",
@@ -32,21 +32,34 @@ function makeElement(id) {
     value: "10",
     disabled: false,
     addEventListener() {},
+    // 画布调用记录：有符号调音要断言"负值真的画在零线下方"，所以 fillRect/fillText
+    // 不能是空函数。记在元素上（每次 getContext 新建的 ctx 共用一个数组），
+    // 断言前清空即可。
+    __rects: [],
+    __texts: [],
     getContext() {
       // 面板用了 canvas 画趋势图与 24 频段调音，所以要给全 2D 上下文的方法与属性。
       // 漏一个方法就会变成"渲染校验自己抛异常"，看起来像界面坏了。
-      return {
+      const ctx = {
         setTransform() {}, clearRect() {}, beginPath() {}, moveTo() {}, lineTo() {},
-        stroke() {}, fillText() {}, fill() {}, fillRect() {}, strokeRect() {},
+        stroke() {}, fill() {}, strokeRect() {},
         save() {}, restore() {}, closePath() {}, arc() {},
         measureText() { return { width: 0 }; },
+        fillRect(x, y, width, height) {
+          element.__rects.push({ x, y, width, height, fillStyle: ctx.fillStyle });
+        },
+        fillText(text, x, y) {
+          element.__texts.push({ text: String(text), x, y });
+        },
         strokeStyle: "", lineWidth: 1, fillStyle: "", font: "",
       };
+      return ctx;
     },
     clientWidth: 900,
     width: 900,
     height: 150,
   };
+  return element;
 }
 const document = {
   getElementById(id) {
@@ -125,6 +138,13 @@ check(text("age") !== "", "顶部显示数据年龄");
 
 if (frame) {
   check(text("env") === frame.environment_text, `环境显示为 ${frame.environment_text}`);
+  // D47 双麦遥测：设备报 mic2_valid=true 时，环境卡的原始行必须带双麦差/相关。
+  if (frame.mic2_valid === true && typeof frame.mic_diff_db === "number") {
+    check(text("env-raw").includes("双麦"),
+          "双麦帧的环境原始行必须显示双麦遥测");
+    check(text("env-raw").includes("相关"),
+          "并显示帧内相关系数");
+  }
   // 情境卡（融合第二轮）：三种状态必须被分成三种显示。把"还没判断"画成一个类别，
   // 或把"固件没报"画成一格空白，都会让看板的人以为模型给出了一个结论。
   if (frame.context_valid === null || frame.context_valid === undefined) {
@@ -140,6 +160,17 @@ if (frame) {
           "类别必须有中文映射，不得落到「未知(...)」兜底");
     const pct = Math.round(frame.context_score * 100);
     check(text("ctx-raw").includes(String(pct)), `同时显示设备实报的置信度 ${pct}%`);
+    // D46 混合环境：设备报 context_mixed=true 时，第二名候选必须显式出现，
+    // 不能只给一个单标签。
+    if (frame.context_mixed === true && frame.context_top2) {
+      const pct2 = Math.round(frame.context_top2_score * 100);
+      check(text("ctx-raw").includes(frame.context_top2),
+            `混合窗必须显示第二候选 ${frame.context_top2}`);
+      check(text("ctx-raw").includes(String(pct2)),
+            `第二候选置信度 ${pct2}% 也要显示`);
+      check(text("ctx-raw").includes("混合"), "并写明这一窗是混合环境");
+      check(text("ctx-note").includes("混合"), "说明行也要标出混合环境");
+    }
     if (frame.context_us !== null && frame.context_us !== undefined) {
       check(text("ctx-note").includes(String(frame.context_us)),
             "显示这次前向的实测耗时");
@@ -199,7 +230,7 @@ if (snapshot.relay) {
 }
 
 // Mac 播放与执行端：面板必须说清"决策已产生"与"Mac 已执行"是两件事，
-// 而且第三件（AirPods 是否已播放）本链路无法验证，不得写成已验证。
+// 而且第三件（耳机是否已播放）本链路无法验证，不得写成已验证。
 if (snapshot.player) {
   const player = snapshot.player;
   check(text("track").length > 0, "播放卡片显示曲目");
@@ -209,10 +240,12 @@ if (snapshot.player) {
   const receipt = text("receipt");
   check(receipt.includes(`设备自报 execution=${frame ? frame.execution : "unknown"}`),
         "回执写明设备自报的 execution");
-  check(receipt.includes("AirPods 是否已播放：无法验证"),
-        "回执不得声称 AirPods 已播放（本链路没有回执通路）");
+  check(receipt.includes("耳机是否已播放：无法验证"),
+        "回执不得声称耳机已播放（本链路没有回执通路）");
   if (player.available) {
-    check(text("apply-note").includes("Mac 真正设进 EQ"),
+    // 执行端可能是 systemeq（QQ 音乐 tap）或 tools/player，owner 文案不同；
+    // 共同点是"真正设进 EQ 的值"，别再写死 "Mac "（2026-10-23 系统 EQ 路径上线后失配）。
+    check(text("apply-note").includes("真正设进 EQ"),
           "必须有说明告诉读者实心柱是 Mac 真正应用的值");
     check(text("apply-note").includes("深度"),
           "面板必须写明放大倍率是本机演示参数，不是设备的建议");
@@ -325,6 +358,87 @@ if (snapshot.frame) {
   } else {
     check(note.includes("推导"), "没有 eq_gain_db 时必须标明图形是推导的");
   }
+}
+
+// ---------------------------------------------------------------- 有符号调音（负=削）
+// 现场 host 可能还是旧代码、实时快照里没有负值；新 SONG_EQ 曲线一定会出现负增益。
+// 所以在**同一份真快照**上合成一条含负值的曲线，验证 render() 真的能把负段画到零线
+// 下方、文案说清"负=削"，而不是仍按"只抬不削"把负值钳掉。
+// 注意：这里只改测试用的快照，不改面板——曲线形状仍然只能来自设备报的 tuning。
+if (snapshot.frame) {
+  const signedGains = new Array(24).fill(0);
+  signedGains[2] = -3.0;  // 削糊的中低频
+  signedGains[3] = -2.5;
+  signedGains[4] = -1.5;
+  for (let band = 8; band <= 12; band++) signedGains[band] = 2.0;  // 人声 presence
+  for (let band = 20; band <= 23; band++) signedGains[band] = 1.5;  // 空气感
+  const signedApplied = signedGains.map((value) => Math.max(-12, Math.min(10, value * 2.5)));
+  const signed = Object.assign({}, snapshot, {
+    frame: Object.assign({}, snapshot.frame, {
+      tuning: {
+        band_gain_db: signedGains,
+        lifted_bands: 9,
+        peak_gain_db: 2.0,
+        cut_bands: 3,
+        max_cut_db: -3.0,
+        peak_abs_db: 3.0,
+        has_cuts: true,
+        shape_is_speech_band: false,
+      },
+    }),
+  });
+  if (snapshot.player) {
+    signed.player = Object.assign({}, snapshot.player, {
+      applied_bands: signedApplied,
+      source_bands: signedGains,
+      applied_peak_abs_db: 7.5,
+      applied_max_cut_db: -7.5,
+      applied_lifted_bands: 9,
+      applied_cut_bands: 3,
+      min_applied_gain_db: -12,
+      max_applied_gain_db: 10,
+    });
+  }
+  const eqCanvas = elements.get("eq");
+  if (eqCanvas) { eqCanvas.__rects = []; eqCanvas.__texts = []; }
+  const appliedCanvas = elements.get("applied");
+  if (appliedCanvas) { appliedCanvas.__rects = []; appliedCanvas.__texts = []; }
+  render(signed);
+
+  const signedNote = text("eq-note");
+  check(signedNote.includes("负=削"), "有符号调音的文案必须写明「负=削」");
+  check(signedNote.includes("削减 3 个频段"), "文案要给出削减段数");
+  check(signedNote.includes("-3.0 dB"), "文案要给出最大削减的负值");
+  // 纵轴几何：量程 -12…+10 dB 时零线在 10 + 10/22×(height-20) 处（height=52）。
+  const height = 52;
+  const zeroY = 10 + ((10 - 0) / 22) * (height - 20);
+  const eqRects = (elements.get("eq") || {}).__rects || [];
+  check(
+    eqRects.some((rect) => rect.y + rect.height / 2 > zeroY + 1),
+    "设备建议的负段必须画在零线下方（削）",
+  );
+  check(
+    eqRects.some((rect) => rect.y + rect.height / 2 < zeroY - 1),
+    "设备建议的正段必须画在零线上方（抬）",
+  );
+  const eqTexts = ((elements.get("eq") || {}).__texts || []).map((item) => item.text).join(" ");
+  check(eqTexts.includes("-12 dB"), "刻度下限要能读到 -12 dB");
+  check(eqTexts.includes("0 dB"), "零线要有 0 dB 标注");
+  check(eqTexts.includes("+10 dB"), "刻度上限要能读到 +10 dB");
+  check(
+    !eqTexts.includes("+6.5 dB"),
+    "不得再画「只抬不削」的旧 6.5 dB 刻度",
+  );
+  if (snapshot.player) {
+    const appliedRects = (elements.get("applied") || {}).__rects || [];
+    check(
+      appliedRects.some((rect) => rect.y + rect.height / 2 > zeroY + 1),
+      "Mac 实际应用的负值也要画在零线下方",
+    );
+    check(text("apply-note").includes("向下=削"), "实际应用文案要写明向下=削");
+    check(text("apply-note").includes("削减"), "实际应用文案要给出削减数字");
+  }
+  render(snapshot);  // 还原：后面的收尾打印还在原快照上
 }
 
 console.log(`渲染检查：${passed} 条通过，${failed.length} 条失败`);

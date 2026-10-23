@@ -35,8 +35,10 @@ from .protocol import (
     DEMO_SPEECH_GAIN_DB,
     KNOWN_ENVIRONMENTS,
     KNOWN_STATES,
+    MAX_BAND_GAIN_DB,
     MAX_NOISE_REDUCTION_DB,
     MAX_SPEECH_GAIN_DB,
+    MIN_BAND_GAIN_DB,
     CaptureEvent,
     CommandFrame,
     LatencyReport,
@@ -258,10 +260,15 @@ class HostState:
         self.last_frame_at: float | None = None
         #: Mac 播放与执行端（tools/player）。为 None 表示本次运行没有启用它。
         self.player = None
+        #: 第三方播放器 system EQ 执行端（tools/systemeq）。为 None = 本次没启用。
+        self.systemeq = None
         #: 音频中继（S3 麦克风 → Mac 输出）。为 None = 本次运行没开中继。
         self.relay = None
         #: 环境声执行端（tools/host/ambient.py，切 AirPods 聆听模式）。为 None = 没启用。
         self.ambient = None
+        #: 用户记忆（tools/host/memo.py）。为 None = 本次运行不记录/不注入（--no-memo）。
+        #: 它只进快照给面板看，**不参与**任何实时判定；注入走 assistant 的慢层 prompt。
+        self.memo = None
 
         self.latest: CommandFrame | None = None
         self.latency: LatencyReport | None = None
@@ -357,6 +364,11 @@ class HostState:
         with self.lock:
             self.player = player
 
+    def attach_systemeq(self, systemeq: object | None) -> None:
+        """挂上第三方播放器 system EQ 执行端（tools/host/systemeq.py）。鸭子类型同上。"""
+        with self.lock:
+            self.systemeq = systemeq
+
     def attach_voiceprint(self, voiceprint: object | None) -> None:
         """挂上声纹 self-veto 门控。判定只进快照，是否影响执行由 __main__ 决定。"""
         with self.lock:
@@ -366,6 +378,10 @@ class HostState:
         """挂上转写/LLM/会话账本服务；None 表示本次运行未配置。"""
         with self.lock:
             self.assistant = assistant
+
+    def attach_memo(self, memo: object | None) -> None:
+        with self.lock:
+            self.memo = memo
 
     def attach_ambient(self, ambient: object | None) -> None:
         """挂上环境声执行端（tools/host/ambient.py）。
@@ -483,10 +499,19 @@ class HostState:
             self._last_environment = frame.environment
         # 情境只在**有效**时才记变更。预热期（窗没满）每一帧都是 unknown，若按它记变更，
         # 开机会刷出一串"情境 → 尚未判断"，把真正的那次变化埋掉。
+        # D46：top1 变化才记（混合成分 top2 的摆动不单独刷日志），但文本带上混合成分，
+        # 让"人声+音乐"这种混合窗与纯窗在日志里一眼可分。
         if frame.context_valid and frame.context != self._last_context:
+            top2_note = ""
+            if frame.context_mixed and frame.context_top2 is not None:
+                top2_note = (
+                    f" · 混合 {context_text(frame.context_top2)} "
+                    f"{frame.context_top2_score:.2f}"
+                )
             self.log(
                 "context",
-                f"情境 → {context_text(frame.context)}（模型 {frame.context_score:.2f}）",
+                f"情境 → {context_text(frame.context)}"
+                f"（模型 {frame.context_score:.2f}{top2_note}）",
                 frame.context,
             )
             self._last_context = frame.context
@@ -694,6 +719,8 @@ class HostState:
             "recording": self.recording,
             #: Mac 播放与执行端的自报状态。为 None = 本次运行没启用播放器。
             "player": self.player.snapshot() if self.player is not None else None,
+            #: 第三方播放器 system EQ 执行端。为 None = 本次运行没启用。
+            "systemeq": self.systemeq.snapshot() if self.systemeq is not None else None,
             #: 中继的实时读数。measurable=False 表示这个播放端不报告排队深度——
             #: 界面必须把"测不到"和"延迟为零"分开显示。
             "relay": self.relay.live() if self.relay is not None else None,
@@ -701,6 +728,9 @@ class HostState:
             #: 设备意图在 frame.ambient_open，两者必须分开读。
             "ambient": self.ambient.snapshot() if self.ambient is not None else None,
             "voiceprint": self.voiceprint.snapshot() if self.voiceprint is not None else None,
+            #: 用户记忆的规模与本次会话计数。挂上快照是为了一眼看出"记忆有没有真的
+            #: 落盘/恢复"；它不是执行授权的一部分。
+            "memo": self.memo.snapshot() if self.memo is not None else None,
             "assistant": self.assistant.snapshot() if self.assistant is not None else {
                 "available": False,
                 "state": "not_configured",
@@ -769,6 +799,11 @@ class HostState:
                 "spectral_flatness": frame.spectral_flatness,
                 "vocal_peakiness": frame.vocal_peakiness,
                 "excited_vocal_bands": frame.excited_vocal_bands,
+                # D47 双麦遥测（取数阶段，只显示不决策）。None = 这一帧没报（旧固件）。
+                "mic2_broadband_dbfs": frame.mic2_broadband_dbfs,
+                "mic_diff_db": frame.mic_diff_db,
+                "mic_coherence": frame.mic_coherence,
+                "mic2_valid": frame.mic2_valid,
                 "confidence": frame.confidence,
                 "state": frame.state,
                 "state_text": state_text(frame.state),
@@ -798,6 +833,12 @@ class HostState:
                 "context_score": frame.context_score,
                 "context_valid": frame.context_valid,
                 "context_us": frame.context_us,
+                # D46 混合环境识别：第二名候选与混合标志。三个都是 None 表示这一帧
+                # 没报（旧固件）；面板据此显示"混合"而不是只给一个单标签。
+                "context_top2": frame.context_top2,
+                "context_top2_text": context_text(frame.context_top2),
+                "context_top2_score": frame.context_top2_score,
+                "context_mixed": frame.context_mixed,
                 # 声音事件判断。与情境模型同一纪律：没报 / 窗未满 / 有判断三态分开。
                 "event": frame.event,
                 "event_text": event_text(frame.event),
@@ -816,12 +857,20 @@ class HostState:
                 # 调音：设备**实际**要施加的每频段增益。固件 2026-10-14 起把 eq_gain_db
                 # 发进 JSON，所以这里是设备报回来的值；旧固件不发时为 None，界面会
                 # 如实说"这一帧没有调音数据"，而不是拿标量增益去推一个形状。
+                #
+                # 有符号语义（负=削）全部走**新增字段**：band_gain_db/lifted_bands/peak_gain_db
+                # 的含义一个都没改，旧固件（只发 0…+4）下 cut_bands=0、max_cut_db=0.0、
+                # has_cuts=false，面板行为与旧版一致。面板只渲染这些字段，不自己造曲线。
                 "tuning": None
                 if frame.tuning is None
                 else {
                     "band_gain_db": list(frame.tuning.band_gain_db),
                     "lifted_bands": frame.tuning.lifted_bands,
                     "peak_gain_db": frame.tuning.peak_gain_db,
+                    "cut_bands": frame.tuning.cut_bands,
+                    "max_cut_db": frame.tuning.max_cut_db,
+                    "peak_abs_db": frame.tuning.peak_abs_db,
+                    "has_cuts": frame.tuning.has_cuts,
                     "shape_is_speech_band": frame.tuning.shape_is_speech_band,
                 },
                 "schema": frame.schema_version,
@@ -829,9 +878,12 @@ class HostState:
             #: 只保留本产品真正有动作的上限。固件的降噪硬上限不出现在界面上。
             #: speech_gain_db 用**实发**上限（8.0）：面板的增益条按它画，按 6.5 画会把
             #: 8 dB 的正常帧画成满格越界。产品策略值单独给一个字段，供界面注明出处。
+            #: band_gain_db 是 24 段建议的**有符号**量程（负=削），供面板以 0 dB 为零线
+            #: 画上下两侧；取播放器可执行范围，与「Mac 实际应用」共用同一把刻度。
             "caps": {
                 "speech_gain_db": DEMO_SPEECH_GAIN_DB,
                 "policy_speech_gain_db": MAX_SPEECH_GAIN_DB,
+                "band_gain_db": {"min": MIN_BAND_GAIN_DB, "max": MAX_BAND_GAIN_DB},
             },
             "latency": None
             if latency is None
