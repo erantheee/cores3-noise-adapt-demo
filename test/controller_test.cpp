@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include "../main/controller.hpp"
+#include "w1_timeline_golden.h"
 
 namespace {
 int passed = 0;
@@ -64,58 +65,121 @@ int main() {
         previous_low = smoothed.eq_gain_db[2];
     }
 
-    // ---- 频谱分型：只重点补当前被遮蔽的低/中/高频 ----
+    // ---- 内容优先的有符号曲线（D38）：凸显人声，而不是复读噪声谱 ----
     {
         AdaptController low_controller;
         EarbudCommand low;
         for (int i = 0; i < 12; ++i) {
-            low = low_controller.update(spectral_frame(-55.0f, 0, 6, -32.0f), 150);
+            low = low_controller.update(spectral_frame(-38.0f, 0, 6, -30.0f), 150);
         }
         check(low.noise_spectrum == NoiseSpectrum::low, "low-frequency noise is classified LOW");
-        check(low.eq_gain_db[2] > low.eq_gain_db[20] * 2.0f,
-              "LOW noise focuses compensation on low bands");
+        check(low.tuning_mode == TuningMode::song_eq, "low-frequency noise still selects song EQ");
+        check(low.eq_gain_db[14] > 0.5f,
+              "content prior lifts the 2.5 kHz presence band even in low-frequency rumble");
+        check(low.eq_gain_db[14] > low.eq_gain_db[1],
+              "presence outranks the noise-dominated bass band it is competing with");
+        check(low.eq_gain_db[3] < -0.05f,
+              "the 346 Hz mud band is cut (signed EQ), not boosted with the noise");
 
         AdaptController high_controller;
         EarbudCommand high;
         for (int i = 0; i < 12; ++i) {
-            high = high_controller.update(spectral_frame(-55.0f, 17, 24, -32.0f), 150);
+            high = high_controller.update(spectral_frame(-38.0f, 17, 24, -30.0f), 150);
         }
         check(high.noise_spectrum == NoiseSpectrum::high, "high-frequency noise is classified HIGH");
-        check(high.eq_gain_db[20] > high.eq_gain_db[2] * 2.0f,
-              "HIGH noise focuses compensation on high bands");
+        check(high.eq_gain_db[21] > 0.0f,
+              "air band still gets a lift when the content prior asks for it");
+        check(high.eq_gain_db[21] < low.eq_gain_db[21],
+              "but the air band is damped when high-frequency noise owns it");
+        check(std::fabs(high.eq_gain_db[3] - low.eq_gain_db[3]) < 0.02f,
+              "the de-mud cut is not damped by noise ownership (cuts are always useful)");
+
+        // 噪声暴露单调性：越吵动作越大（形状不变）。
+        AdaptController quietish;
+        EarbudCommand quiet_curve;
+        for (int i = 0; i < 12; ++i) {
+            quiet_curve = quietish.update(frame(-52.0f, 0.0f), 150);
+        }
+        check(quiet_curve.eq_gain_db[14] > 0.0f && quiet_curve.eq_gain_db[14] < low.eq_gain_db[14],
+              "louder noise produces a larger presence lift");
     }
 
-    // ---- 预判：第一帧就压，环境声等到确认后才开 ----
+    // ---- 预判：窗内累计 0.5 s 预下压、0.6 s 确认（2026-10-23 窗口累计判据）；
+    //     单帧/断续噪声不动作（D39）----
     // external_self_voice 显式给 false：声纹没有 self 判定时，D16 的预判必须照常发生。
     {
         AdaptController predictor;
         // -50 dBFS：比近场代理的门限（-45）更低，所以 own_voice 证据为 0；但对话 cue 的
         // 门限是 -58 起，仍应触发预判。这条就是"预判不依赖我开口"的最小证明。
-        auto first = predictor.update(frame(-50, 0.8f), 150, /*non_voice_event=*/false,
+        auto first = predictor.update(frame(-50, 0.8f), 100, /*non_voice_event=*/false,
                                       /*external_self_voice=*/false);
-        check(first.conversation == ConversationState::anticipating,
-              "a nearby voice starts anticipating on the first frame");
-        check(first.media_percent < 90, "anticipation ducks the media before I speak");
-        check(first.media_percent >= 69, "anticipation preview stays above its bounded floor");
-        check(!first.ambient_open, "anticipation does not open the environment yet");
+        check(first.conversation == ConversationState::speech_nearby,
+              "a single nearby-voice frame does not claim a conversation yet");
+        check(first.media_percent == 100, "a single cue frame leaves the media alone");
         check(first.own_voice.confidence == 0.0f,
               "the quiet nearby voice produced no own-voice evidence");
-        check(all_bands_flat(first), "anticipation leaves the song EQ flat");
 
-        EarbudCommand engaged = first;
-        for (int i = 0; i < 12; ++i) {
-            engaged = predictor.update(frame(-50, 0.8f), 150, /*non_voice_event=*/false,
+        // 累计 400 ms 证据（首帧 100 + 再 3 帧）→ 预测中，还没到 500 ms 预下压。
+        EarbudCommand preview = first;
+        for (int i = 0; i < 3; ++i) {
+            preview = predictor.update(frame(-50, 0.8f), 100, /*non_voice_event=*/false,
+                                       /*external_self_voice=*/false);
+        }
+        check(preview.conversation == ConversationState::speech_nearby,
+              "400 ms is not yet anticipating at the controller (preview needs 500 ms)");
+        check(!preview.ambient_open, "no ambient intent before confirmation");
+        check(all_bands_flat(preview), "nearby voice leaves the song EQ flat");
+
+        // 再 100 ms（累计 500 ms）→ 预下压。
+        preview = predictor.update(frame(-50, 0.8f), 100, /*non_voice_event=*/false,
+                                   /*external_self_voice=*/false);
+        check(preview.media_percent < 95, "500 ms of evidence ducks the media before I speak");
+        check(preview.media_percent >= 69, "anticipation preview stays above its bounded floor");
+
+        // 再 300 ms（累计 800 ms）→ 确认（2026-10-23：确认保持连续 800 ms，
+        // 事件帧中立；见 conversation_awareness 注释）。
+        EarbudCommand engaged = preview;
+        for (int i = 0; i < 3; ++i) {
+            engaged = predictor.update(frame(-50, 0.8f), 100, /*non_voice_event=*/false,
                                        /*external_self_voice=*/false);
         }
         check(engaged.conversation == ConversationState::likely,
               "sustained nearby voice confirms the conversation");
         check(engaged.ambient_open, "confirmed conversation asks for the environment to open");
+        // 下压有一个 150 ms 时间常数，确认后再走 4 拍（400 ms）应当贴住 60% 地板。
+        for (int i = 0; i < 4; ++i) {
+            engaged = predictor.update(frame(-50, 0.8f), 100, /*non_voice_event=*/false,
+                                       /*external_self_voice=*/false);
+        }
         check(engaged.media_percent <= 61, "confirmed conversation ducks to the floor");
         check(engaged.tuning_mode == TuningMode::flat,
               "a conversation never lifts the song EQ");
         check(all_bands_flat(engaged), "every EQ band stays flat during a conversation");
         check(engaged.external_voice_gain_db == 0,
               "no fake 'real-voice gain' is reported during a conversation");
+    }
+
+    // ---- W1 现场噪声（1179 帧，work/diagnosis/live-timeline.json）不得把媒体压走/
+    //      开环境声（2026-10-23 用户拍板：误触率不比现状差，用数据验证）----
+    {
+        AdaptController fragmented;
+        float lowest_media = 100.0f;
+        bool any_conversation = false;
+        bool any_ambient = false;
+        for (int i = 0; i < kW1TimelineFrames; ++i) {
+            const std::int8_t kind = kW1Timeline[i];
+            const AnalysisFrame input = (kind == 1) ? frame(-45, 0.8f) : frame(-70, 0.0f);
+            const EarbudCommand out = fragmented.update(
+                input, 100, /*non_voice_event=*/kind == -1,
+                /*external_self_voice=*/false);
+            lowest_media = std::min(lowest_media, static_cast<float>(out.media_percent));
+            any_conversation = any_conversation || out.conversation == ConversationState::likely;
+            any_ambient = any_ambient || out.ambient_open;
+        }
+        check(!any_conversation, "W1 noise never confirms a conversation");
+        check(!any_ambient, "W1 noise never asks for the environment");
+        check(lowest_media > 60.0f,
+              "W1 noise never reaches the confirmed duck floor (no 60% lock)");
     }
 
     // ---- 人声消失后：对话保持期不能再把中频抬着 ----
@@ -141,7 +205,7 @@ int main() {
               "the frame still reports no own-voice evidence");
     }
 
-    // ---- 背景/别人说话（还没构成对话）：中频 EQ 要起来 ----
+    // ---- 背景/别人说话（还没构成对话）：内容曲线 + 人声加权 ----
     {
         AdaptController background;
         EarbudCommand out;
@@ -154,13 +218,49 @@ int main() {
         check(!out.ambient_open, "背景人声不开环境声");
         check(out.tuning_mode == TuningMode::external_voice_intent,
               "背景人声选择外部人声意图");
-        bool mid_lifted = false;
-        for (std::size_t band = 8; band <= 16; ++band) {
-            if (out.eq_gain_db[band] > 0.05f) mid_lifted = true;
-        }
-        check(mid_lifted, "背景别人说话：1–3.6 kHz 中频 EQ 被抬起");
-        check(out.eq_gain_db[0] == 0.0f && out.eq_gain_db[23] == 0.0f,
-              "外部人声 EQ 只动中频段，不动两端");
+        check(out.eq_gain_db[14] >= 3.0f,
+              "背景别人说话：语音段被抬到接近单段上限（demo 掩蔽，D41）");
+        check(out.eq_gain_db[1] >= 0.8f,
+              "背景别人说话：全频段也有一层薄抬升（掩蔽，不是只抬人声）");
+        check(out.eq_gain_db[14] > out.eq_gain_db[1] &&
+                  out.eq_gain_db[14] > out.eq_gain_db[21],
+              "外部人声意图把 1.4–4 kHz 放在低频/空气段之上");
+    }
+
+    // ---- 微小噪声在 speech_active 门限附近不得让 EQ 跳变（2026-10-22）----
+    // 旧行为：voice 刚过 0.55 就把 D41 掩蔽整条 +1/+4 dB 拉满，单帧噪声也会顶起一个台阶。
+    // 新行为：掩蔽深度按置信度线性连续缩放（0.55→0，0.75→满幅），不加时间去抖；
+    // 这里同时钉住"不跳"和"不牺牲真实背景人声的满幅/明显度"。
+    {
+        AdaptController tiny;
+        EarbudCommand out;
+        for (int i = 0; i < 40; ++i) out = tiny.update(frame(-54.0f, 0.0f), 100);
+        const float before = out.eq_gain_db[14];
+        out = tiny.update(frame(-54.0f, 0.56f), 100);
+        check(std::fabs(out.eq_gain_db[14] - before) < 0.05f,
+              "a single frame just over the voice threshold does not step the EQ");
+
+        for (int i = 0; i < 30; ++i) out = tiny.update(frame(-54.0f, 0.56f), 100);
+        check(out.eq_gain_db[14] < 0.5f,
+              "sustained marginal voice stays well below the full masking depth");
+        check(out.media_percent == 100 && !out.ambient_open,
+              "marginal voice does not change media ducking or ambient sound");
+
+        // 0.60 是现场房间噪声 voice_likelihood 常漂到的区间；线性映射保留 25% 掩蔽，
+        // 仍应明显小于满幅（0.8 的满幅测试见下），但不需要压到"听不出来"。
+        AdaptController room_noise;
+        EarbudCommand noise_out;
+        for (int i = 0; i < 30; ++i) noise_out = room_noise.update(frame(-54.0f, 0.60f), 100);
+        check(noise_out.eq_gain_db[14] < 1.5f,
+              "room-noise-grade voice 0.60 stays below the full masking depth");
+        check(noise_out.media_percent == 100 && !noise_out.ambient_open,
+              "room-noise-grade voice still does not duck media or open ambient");
+
+        AdaptController strong;
+        EarbudCommand full_mask;
+        for (int i = 0; i < 12; ++i) full_mask = strong.update(frame(-54.0f, 0.8f), 150);
+        check(full_mask.eq_gain_db[14] >= 3.0f,
+              "high-confidence background voice still reaches the full masking depth");
     }
 
     // ---- 对话门槛高于 EQ 门槛：一般噪声不能把对话顶起来 ----
@@ -233,14 +333,33 @@ int main() {
         check(out.media_percent == 100, "非人声事件不得压媒体");
     }
 
-    // ---- 高噪声安全保持 ----
+    // ---- 高噪声安全保持：禁止正增益，但去糊削减保留（D38）----
     {
         AdaptController safety_controller;
         EarbudCommand loud;
-        for (int i = 0; i < 8; ++i) loud = safety_controller.update(frame(-20, 0.0f), 150);
+        for (int i = 0; i < 40; ++i) loud = safety_controller.update(frame(-20, 0.0f), 150);
         check(loud.tuning_mode == TuningMode::safety_hold, "very loud non-speech selects safety hold");
-        check(all_bands_flat(loud), "safety hold forbids positive EQ gain");
+        float max_gain = 0.0f;
+        float min_gain = 0.0f;
+        for (float gain : loud.eq_gain_db) {
+            max_gain = std::max(max_gain, gain);
+            min_gain = std::min(min_gain, gain);
+        }
+        check(max_gain < 0.05f, "safety hold forbids positive EQ gain");
+        check(min_gain < -0.1f, "safety hold still allows de-mud cuts (negative gains)");
         check(loud.media_percent == 100, "safety hold does not duck without a conversation");
+    }
+
+    // ---- 模式路由用平滑电平：单帧瞬态不得把模式顶进 SAFETY_HOLD（D38）----
+    {
+        AdaptController transient;
+        EarbudCommand out;
+        for (int i = 0; i < 10; ++i) out = transient.update(frame(-38.0f, 0.0f), 100);
+        out = transient.update(frame(-22.0f, 0.0f), 100);  // 键盘/拍桌的一帧尖峰
+        check(out.tuning_mode == TuningMode::song_eq,
+              "a single 100 ms loud transient does not flip the mode into safety hold");
+        check(out.environment == EnvironmentKind::steady_noise,
+              "the smoothed level keeps the environment label stable through the transient");
     }
 
     // ---- 麦克风故障：必须复位对话状态、关环境声、把媒体抬回来 ----
@@ -324,6 +443,16 @@ int main() {
         already_low.eq_gain_db[0] = 1.0f;
         apply_wind_eq(already_low);
         check(already_low.eq_gain_db[0] == 0.25f, "wind EQ reduces, never raises, a low band");
+
+        // 有符号曲线（D38）：低频的负增益（去糊）不能被风策略也乘 1/4——
+        // 那等于"风一吹就少削"，与"风噪占满低频、少抬低频"的目标相反。
+        EarbudCommand cut_low;
+        cut_low.tuning_mode = TuningMode::song_eq;
+        cut_low.eq_gain_db[3] = -1.5f;
+        cut_low.eq_gain_db[4] = -1.5f;
+        apply_wind_eq(cut_low);
+        check(cut_low.eq_gain_db[3] == -1.5f && cut_low.eq_gain_db[4] == -1.5f,
+              "wind EQ leaves low-band cuts untouched (only lifts are reduced)");
     }
 
     check(std::string(adapt_state_name(AdaptState::adjusting)) == "ADJUSTING",

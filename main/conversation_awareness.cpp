@@ -29,17 +29,23 @@ Output Awareness::update(const Evidence& evidence, float dt_ms) {
     const bool cue = evidence.conversation_cue >= params_.cue_threshold;
     const bool own = evidence.own_voice >= params_.own_voice_threshold;
     const bool evidence_present = cue || own;
-    evidence_streak_ = evidence_present ? evidence_streak_ + 1 : 0;
+    // 2026-10-23：事件帧（键盘/风/撞击）中立——不打断连续证据、不累计确认/释放
+    // 计时。数据依据见 work/diagnosis/evaluate_gate_params.py（W1 1179 帧回放：
+    // 窗口累计与 vl 平滑都被否决；事件中立是唯一零误触的改善）。
+    if (evidence_present) {
+        evidence_streak_ += 1;
+    } else if (!evidence.event_blocked) {
+        evidence_streak_ = 0;
+    }
 
     switch (state_) {
         case State::idle:
             if (evidence_present) {
                 state_ = State::anticipating;
-                confirm_ms_ = 0.0f;
+                confirm_ms_ = dt;
                 gap_ms_ = 0.0f;
                 silence_ms_ = 0.0f;
                 engaged_ms_ = 0;
-                confirm_ms_ = dt;
                 if (confirm_ms_ >= params_.onset_confirm_ms) {
                     state_ = State::engaged;
                     gap_ms_ = 0.0f;
@@ -57,6 +63,8 @@ Output Awareness::update(const Evidence& evidence, float dt_ms) {
                     state_ = State::engaged;
                     gap_ms_ = 0.0f;
                 }
+            } else if (evidence.event_blocked) {
+                // 键盘/风/撞击：不打断确认累积，也不贡献时长。
             } else {
                 // 短促声不升级，也不累积：一声咳嗽退回 idle，环境声没有动过。
                 state_ = State::idle;
@@ -68,10 +76,12 @@ Output Awareness::update(const Evidence& evidence, float dt_ms) {
 
         case State::engaged:
             engaged_ms_ += static_cast<std::uint32_t>(dt);
-            // 连续两帧才算"还在说"；单帧噪声尖峰不让关闭倒计时无限续命。
-            if (evidence_present && evidence_streak_ >= 2) {
+            // 续命条件：连续 800 ms 证据（2026-10-21 起；事件帧中立不打断）。
+            if (evidence_present && evidence_streak_ >= 8) {
                 gap_ms_ = 0.0f;
                 silence_ms_ = 0.0f;
+            } else if (evidence.event_blocked) {
+                // 键盘不累计释放计时：打字期间的对话保持期不被打断。
             } else {
                 gap_ms_ += dt;
                 silence_ms_ += dt;
@@ -81,10 +91,16 @@ Output Awareness::update(const Evidence& evidence, float dt_ms) {
 
         case State::releasing:
             if (evidence_present) {
-                // 又说起来了：直接回到下压、环境声重新打开。恢复尾巴不属于对话。
-                state_ = State::engaged;
+                // 恢复期里又出现证据：重新走一遍预测→确认，和一次全新对话一致，
+                // 避免断续噪声在 2.5 s hold 周期上反复"放回来→压下去"。
+                state_ = State::anticipating;
+                confirm_ms_ = dt;
                 gap_ms_ = 0.0f;
                 silence_ms_ = 0.0f;
+                if (confirm_ms_ >= params_.onset_confirm_ms) {
+                    state_ = State::engaged;
+                    gap_ms_ = 0.0f;
+                }
             } else {
                 silence_ms_ += dt;
                 if (media_percent_ >= 99.0f) {
@@ -96,22 +112,26 @@ Output Awareness::update(const Evidence& evidence, float dt_ms) {
             break;
     }
 
+    Output out;
+    out.state = state_;
+    out.engaged = state_ == State::engaged;
+    // 预下压也要求证据持续到 preview_confirm_ms。现场噪声的连续段最长 640 ms，
+    // p90 只有 215 ms；如果第一帧就压，媒体会在噪声里持续 100%↔70% 抽动。
+    out.anticipating = state_ == State::anticipating &&
+                       confirm_ms_ >= params_.preview_confirm_ms;
+
     float target = 100.0f;
     float tau = params_.restore_ms;
     if (state_ == State::engaged) {
         target = params_.duck_floor_percent;
         tau = params_.duck_ms;
-    } else if (state_ == State::anticipating) {
+    } else if (out.anticipating) {
         target = std::clamp(params_.preview_floor_percent,
                             params_.duck_floor_percent, 100.0f);
         tau = params_.preview_duck_ms;
     }
     media_percent_ = approach(media_percent_, target, dt, tau);
 
-    Output out;
-    out.state = state_;
-    out.engaged = state_ == State::engaged;
-    out.anticipating = state_ == State::anticipating;
     // 环境声只在对话确认后打开：预测阶段先只压媒体，避免被一声咳嗽切到通透模式。
     out.ambient_open = state_ == State::engaged;
     out.media_percent = media_percent_;

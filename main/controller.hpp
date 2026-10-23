@@ -79,6 +79,14 @@ struct AnalysisFrame {
     /// Center frequency of each band in Hz, same order as band_dbfs.
     std::array<float, kBandCount> band_center_hz{};
     bool mic_valid = false;
+    // ── 双麦遥测（D47 取数阶段，只上报、不参与任何决策）──────────────────────────
+    // 由采集任务在 NoiseAnalyzer::analyze() **之后**填入（analyzer 只算第 1 路），
+    // 统计函数在 main/dual_mic.hpp。近场期望：coherence 低、|diff_db| 大；
+    // 远场/混响期望：coherence 高、diff_db ≈ 0。阈值待真机取数后标定。
+    float mic2_broadband_dbfs = -120.0f;
+    float mic_diff_db = 0.0f;
+    float mic_coherence = 0.0f;
+    bool mic2_valid = false;
 };
 
 /// Measured descriptors of one analysis frame, exposed so the voice decision can be
@@ -131,6 +139,15 @@ struct ContextResult {
     uint8_t class_index = 0;
     /// Softmax confidence of `class_index`, in (0, 1].
     float score = 0.0f;
+    /// D46（混合环境识别）：softmax 分布的第二名。环境音多数时候是混合的
+    /// （近处人声+音乐、街道+持续噪声……），argmax 单标签会把第二名藏起来——
+    /// 上报 top2 之后，"混合"才能被显式建模。`mixed = top2_score >=
+    /// context::kMixedTop2Threshold`（0.20：第二名至少占 1/5）。
+    uint8_t top2_index = 0;
+    float top2_score = 0.0f;
+    /// 这一窗的分布是否"混合"：top1 与 top2 差距小，单标签不可信。仅遥测/显示，
+    /// 不改任何决策（与 Round 2 的"只上报"纪律一致）。
+    bool mixed = false;
     /// One forward pass, microseconds.
     int32_t inference_us = 0;
     /// Points at a string literal from `listening_model.h`: static storage, never freed.
@@ -224,6 +241,12 @@ struct EarbudCommand {
     float spectral_flatness = 0.0f;
     float vocal_peakiness = 0.0f;
     uint8_t excited_vocal_bands = 0;
+    // D47 双麦遥测：第二路麦电平、两路电平差、帧内相关系数。取数阶段只上报，
+    // 用于标定"近场/远场"判据；None 语义由 host 按"没报=旧固件"处理。
+    float mic2_broadband_dbfs = -120.0f;
+    float mic_diff_db = 0.0f;
+    float mic_coherence = 0.0f;
+    bool mic2_valid = false;
     std::array<float, kBandCount> eq_gain_db{};
     std::array<float, kBandCount> ambient_band_dbfs{};
     AdaptState state = AdaptState::observing;
@@ -269,11 +292,17 @@ constexpr std::size_t kLowBandCount = 5;
 }  // namespace wind_eq
 
 /// 把控制器的 EQ 形状按"有风"改一遍。纯函数，方便单测与离线复算。
+///
+/// 2026-10-21（D38）：曲线已经是有符号的，低频 346/452 Hz 可能是**负值（去糊）**。
+/// 风策略只压"抬升"（正增益），负的去糊段原样保留——把削减也乘 1/4 等于风一吹就少削，
+/// 与"风噪占满低频、少抬低频"的目标相反。
 inline void apply_wind_eq(EarbudCommand& command) {
     if (command.tuning_mode != TuningMode::song_eq) return;
     if (command.conversation != ConversationState::none) return;
     for (std::size_t band = 0; band < wind_eq::kLowBandCount; ++band) {
-        command.eq_gain_db[band] *= wind_eq::kLowBandScale;
+        if (command.eq_gain_db[band] > 0.0f) {
+            command.eq_gain_db[band] *= wind_eq::kLowBandScale;
+        }
     }
 }
 
@@ -341,6 +370,9 @@ private:
     /// 实际发给播放器的 24 段曲线。目标值每 100 ms 更新，但输出必须慢慢靠近，
     /// 否则环境谱和 LOW/MIXED 分型的轻微变化会听成音量抽动。
     std::array<float, kBandCount> eq_gain_db_{};
+    /// 平滑后的宽带电平（250 ms，D38）。模式路由与噪声暴露用它，不用原始帧，
+    /// 否则 -30 dBFS 门槛附近的瞬态会让 SONG_EQ 与 SAFETY_HOLD 每 100–200 ms 抖一次。
+    float smoothed_dbfs_ = -120.0f;
     float valid_ms_ = 0.0f;
     float invalid_ms_ = 0.0f;
     /// Apple 式对话感知：自身语音触发 → 下压媒体 → 保持 → 恢复。

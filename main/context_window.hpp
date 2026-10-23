@@ -209,8 +209,33 @@ inline bool ContextWindow::build_vector(float* out) const {
     return true;
 }
 
+/// 数值稳定的 softmax 全分布：probs[c] = exp(logit_c − logit_max) / Σ，和 = 1。
+///
+/// D46（混合环境识别）：环境音多数时候是混合的（近处人声+音乐、街道+持续噪声……），
+/// argmax 单标签把"第二名还占了多少"丢掉，混合场景看起来就像"模型很确定"。上报全分布
+/// 的 top1 + top2 之后，"混合"才能被显式建模与度量，而不是被单标签藏起来。
+inline void softmax_probs(const float* logits, std::size_t count, float* probs) {
+    float best = logits[0];
+    for (std::size_t c = 1; c < count; ++c) {
+        if (logits[c] > best) best = logits[c];
+    }
+    double sum = 0.0;
+    for (std::size_t c = 0; c < count; ++c) {
+        probs[c] = static_cast<float>(
+            std::exp(static_cast<double>(logits[c] - best)));
+        sum += static_cast<double>(probs[c]);
+    }
+    for (std::size_t c = 0; c < count; ++c) {
+        probs[c] = static_cast<float>(static_cast<double>(probs[c]) / sum);
+    }
+}
+
+/// 第二候选概率达到该门槛即判"混合"。9 类均匀分布时 top2 ≈ 0.111，单类占 0.9 时
+/// top2 ≈ 0.05；0.20 表示第二名至少占 1/5——混合成分强到不该被单标签藏起来。
+constexpr float kMixedTop2Threshold = 0.20f;
+
 /// argmax + 该类的 softmax 置信度，与 `ear-context/main/app_main.cpp` 同式：
-/// score = 1 / Σ exp(logit_i − logit_best)。
+/// score = 1 / Σ exp(logit_i − logit_best)。保持原实现（count 通用，不限于 9 类）。
 inline void top_class(const float* logits, std::size_t count, std::size_t* index, float* score) {
     std::size_t best = 0;
     for (std::size_t c = 1; c < count; ++c) {

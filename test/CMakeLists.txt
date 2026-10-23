@@ -74,3 +74,9 @@ add_test(NAME sound_event_test COMMAND sound_event_test)
 add_executable(speech_gate_test speech_gate_test.cpp)
 target_include_directories(speech_gate_test PRIVATE ../main)
 add_test(NAME speech_gate_test COMMAND speech_gate_test)
+
+# 双麦遥测统计（D47）：L/R 交织数据的电平差与帧内 Pearson 相关系数。
+# dual_mic.hpp 头文件无 IDF 依赖，直接在主机上钉住符号与数值。
+add_executable(dual_mic_test dual_mic_test.cpp)
+target_include_directories(dual_mic_test PRIVATE ../main)
+add_test(NAME dual_mic_test COMMAND dual_mic_test)

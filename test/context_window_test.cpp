@@ -172,6 +172,58 @@ int main() {
               "模型版本是 v0.2-s3（融合的是哪一份权重，写在这里）");
     }
 
+    // ---- 7) softmax_probs: full distribution for mixed-environment reporting (D46) ----
+    {
+        // 合成 logits：一个明显峰值 + 一个第二名。概率必须和为 1、argmax 与
+        // top_class 一致、top2 落在第二名上。
+        float logits[listening_model::kClassCount] = {0.0f};
+        logits[3] = 2.0f;   // near_voice
+        logits[6] = 1.2f;   // steady
+        logits[5] = 0.5f;   // quiet
+        float probs[listening_model::kClassCount];
+        context::softmax_probs(logits, listening_model::kClassCount, probs);
+        float sum = 0.0f;
+        for (float p : probs) sum += p;
+        check(std::fabs(sum - 1.0f) < 1.0e-5f, "softmax 概率和 = 1");
+
+        std::size_t top1 = 0, top2 = 0;
+        for (std::size_t c = 1; c < listening_model::kClassCount; ++c) {
+            if (probs[c] > probs[top1]) top1 = c;
+        }
+        for (std::size_t c = 0; c < listening_model::kClassCount; ++c) {
+            if (c != top1 && probs[c] > probs[top2]) top2 = c;
+        }
+        check(top1 == 3, "softmax argmax 落在 logit 最大的类");
+        check(top2 == 6, "softmax 第二名落在 logit 次大的类");
+        check(probs[3] > probs[6] && probs[6] > probs[5], "概率保持 logit 次序");
+
+        // top_class 与 softmax_probs 的 argmax/分数逐位一致（同一公式两个出口）。
+        std::size_t tc_index = 0;
+        float tc_score = 0.0f;
+        context::top_class(logits, listening_model::kClassCount, &tc_index, &tc_score);
+        check(tc_index == top1, "top_class 与 softmax argmax 一致");
+        check(std::fabs(tc_score - probs[top1]) < 1.0e-6f, "top_class 分数 = softmax 峰值");
+
+        // 数值稳定：全部 logits 加一个大常数（-60、+60）不该改变任何概率。
+        float shifted[listening_model::kClassCount];
+        for (std::size_t c = 0; c < listening_model::kClassCount; ++c) {
+            shifted[c] = logits[c] + 60.0f;
+        }
+        float shifted_probs[listening_model::kClassCount];
+        context::softmax_probs(shifted, listening_model::kClassCount, shifted_probs);
+        bool same = true;
+        for (std::size_t c = 0; c < listening_model::kClassCount; ++c) {
+            if (std::fabs(shifted_probs[c] - probs[c]) > 1.0e-5f) same = false;
+        }
+        check(same, "logits 平移 60 后概率不变（数值稳定）");
+
+        // 混合门槛语义：第二名 0.21 ≥ 0.20 → 混合；0.19 < 0.20 → 单标签。
+        check(0.21f >= context::kMixedTop2Threshold, "kMixedTop2Threshold 语义样例（≥0.20 判混合）");
+        check(!(0.19f >= context::kMixedTop2Threshold), "低于门槛不判混合");
+        // 均匀分布的 top2 ≈ 0.111，永远不该被当成混合。
+        check(!(1.0f / 9.0f >= context::kMixedTop2Threshold), "均匀分布不判混合");
+    }
+
     std::cout << "\n" << passed << " 条通过、" << failed << " 条失败\n";
     return failed == 0 ? 0 : 1;
 }

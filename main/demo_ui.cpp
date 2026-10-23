@@ -263,8 +263,15 @@ void demo_ui_update(const AnalysisFrame& frame, const EarbudCommand& command,
     if (command.context.valid) {
         lv_label_set_text(context_value, command.context.class_name);
         // 分数写在标题行：值行已经被最长的类别名（near_voice）占满。
-        std::snprintf(text, sizeof(text), "感知 %.2f",
-                      static_cast<double>(command.context.score));
+        // D46：混合环境报 top1+top2 两个分数（"0.62+0.21"），单标签场景保持原样。
+        if (command.context.mixed) {
+            std::snprintf(text, sizeof(text), "感知 %.2f+%.2f",
+                          static_cast<double>(command.context.score),
+                          static_cast<double>(command.context.top2_score));
+        } else {
+            std::snprintf(text, sizeof(text), "感知 %.2f",
+                          static_cast<double>(command.context.score));
+        }
         lv_label_set_text(context_title, text);
         // 低分不做装饰：界面不应该把 0.31 的猜测显示得和 0.95 一样像结论。
         lv_obj_set_style_text_color(

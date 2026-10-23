@@ -9,6 +9,7 @@
 #include "context_window.hpp"
 #include "controller.hpp"
 #include "demo_ui.hpp"
+#include "dual_mic.hpp"
 #include "esp_codec_dev.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -140,6 +141,10 @@ void emit_command_json(const EarbudCommand& command) {
                 "\"broadband_dbfs\":%.1f,\"voice_likelihood\":%.3f,"
                 "\"vocal_ratio\":%.3f,\"spectral_flatness\":%.4f,"
                 "\"vocal_peakiness\":%.3f,\"excited_vocal_bands\":%u,"
+                // D47 双麦遥测（追加可选键，不涨 schema）：第二路麦电平、两路电平差、
+                // 帧内相关系数。取数阶段只上报；mic2_valid=false 时报 -120/0/0。
+                "\"mic2_broadband_dbfs\":%.1f,\"mic_diff_db\":%.2f,"
+                "\"mic_coherence\":%.3f,\"mic2_valid\":%s,"
                 "\"state\":\"%s\",\"environment\":\"%s\",\"noise_spectrum\":\"%s\",\"mode\":\"%s\","
                 "\"conversation\":\"%s\",\"confidence\":%.2f,"
                 "\"own_voice_confidence\":%.3f,\"own_voice_correlation\":%.3f,"
@@ -165,6 +170,10 @@ void emit_command_json(const EarbudCommand& command) {
                 static_cast<double>(command.spectral_flatness),
                 static_cast<double>(command.vocal_peakiness),
                 static_cast<unsigned>(command.excited_vocal_bands),
+                static_cast<double>(command.mic2_broadband_dbfs),
+                static_cast<double>(command.mic_diff_db),
+                static_cast<double>(command.mic_coherence),
+                command.mic2_valid ? "true" : "false",
                 adapt_state_name(command.state), environment_name(command.environment),
                 noise_spectrum_name(command.noise_spectrum),
                 tuning_mode_name(command.tuning_mode),
@@ -198,11 +207,22 @@ void emit_command_json(const EarbudCommand& command) {
     // 声音事件判断同样只上报：`event_valid=false` 表示 1 s 窗还没攒满（或刚被撞击清空），
     // 上位机必须把这两种情况与"判断成 quiet"分开显示。
     std::printf("],\"context\":\"%s\",\"context_score\":%.3f,\"context_valid\":%s,"
-                "\"context_us\":%ld,\"event\":\"%s\",\"event_valid\":%s,"
+                "\"context_us\":%ld,"
+                // D46 混合环境识别（追加可选键，不涨 schema，先例 voiceprint_*）：
+                // top2 = softmax 第二名；mixed = top2 ≥ 0.20。valid=false 时报占位
+                // unknown/0.0/false，与 context 组同构。
+                "\"context_top2\":\"%s\",\"context_top2_score\":%.3f,"
+                "\"context_mixed\":%s,"
+                "\"event\":\"%s\",\"event_valid\":%s,"
                 "\"speech_gate\":%.3f,\"speech_gate_valid\":%s,\"speech_gate_us\":%ld}\n",
                 command.context.class_name, static_cast<double>(command.context.score),
                 command.context.valid ? "true" : "false",
                 static_cast<long>(command.context.inference_us),
+                command.context.valid
+                    ? listening_model::kClassNames[command.context.top2_index]
+                    : "unknown",
+                static_cast<double>(command.context.top2_score),
+                command.context.mixed ? "true" : "false",
                 command.event.class_name,
                 command.event.valid ? "true" : "false",
                 static_cast<double>(command.speech_gate_score),
@@ -434,10 +454,12 @@ void emit_capture_chunk(const int16_t* samples, std::size_t count, uint32_t sequ
 void processing_task(void*) {
     /// 只被控制任务访问：主机测试与固件跑的是同一份判据，不需要加锁。
     static bone::BoneVoice bone_voice;
+    // D47：双麦取数。I2S 开 STEREO 后 stage 里是 L/R 交织样本；主判据、降采样、中继、
+    // 录音**全部继续用 L 路**（行为与单麦完全一致），R 路只进 dual_mic 累加器做遥测。
     i2s_std_config_t audio_config = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(kSampleRate),
         .slot_cfg = I2S_STD_PHILIP_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
-                                                       I2S_SLOT_MODE_MONO),
+                                                       I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = BSP_I2S_MCLK,
             .bclk = BSP_I2S_SCLK,
@@ -455,7 +477,7 @@ void processing_task(void*) {
     }
     esp_codec_dev_sample_info_t format = {};
     format.sample_rate = kSampleRate;
-    format.channel = 1;
+    format.channel = 2;  // D47：双路（ES7210 MIC1+MIC2 在 L/R 槽）
     format.bits_per_sample = 16;
     ESP_ERROR_CHECK(esp_codec_dev_set_in_gain(microphone, 36.0f));
     ESP_ERROR_CHECK(esp_codec_dev_open(microphone, &format));
@@ -471,9 +493,10 @@ void processing_task(void*) {
     // the top-up loop stopped reading, and the recording ran at 12766 of 16000 samples/s.
     // Eight blocks is 8 KB and takes that to the full rate. Capacity must be a whole number of
     // blocks, or the top-up loop leaves a remainder that never reaches the block threshold.
-    constexpr std::size_t kStageCapacity = 8 * kReadBlockSamples;
-    static_assert(kStageCapacity % kReadBlockSamples == 0,
-                  "staging capacity must be a whole number of blocks");
+    // D47：每块现在是 L/R 交织（kReadBlockSamples 帧 × 2），容量按交织样本数计、翻倍。
+    constexpr std::size_t kStageCapacity = 8 * kReadBlockSamples * 2;
+    static_assert(kStageCapacity % (kReadBlockSamples * 2) == 0,
+                  "staging capacity must be a whole number of interleaved blocks");
     auto* stage = static_cast<int16_t*>(
         heap_caps_malloc(kStageCapacity * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     auto* samples = static_cast<int16_t*>(
@@ -542,6 +565,10 @@ void processing_task(void*) {
     controller.set_evidence_policy(kEvidencePolicy);
     latency::LatencyProfiler profiler;
     latency::ProfilerOverhead overhead;
+    // D47：双麦取数累加器（6 个 double，栈上安全）与降采样用的单路暂存块。
+    // mono_block 用 static：任务独占、无重入；栈只有 16 KB，1 KB 的块不该再往里塞。
+    dual_mic::Accumulator dual_mic_acc;
+    static int16_t mono_block[kReadBlockSamples];
     int64_t next_latency_report_us = esp_timer_get_time() + kLatencyReportPeriodUs;
     uint32_t analysed_frames = 0;
     capture::Decimator decimator;
@@ -595,12 +622,14 @@ void processing_task(void*) {
         // when there is room. Coupling the hardware read to `filled` limited recording to four
         // blocks per analysis period: a 10-second command contained under two seconds of audio.
         const bool capture_needs_audio = g_record_seconds >= 0;
+        // D47：`staged` / `kStageCapacity` 的单位是**交织样本数**（L+R 各一 = 2 个 int16），
+        // `want` 仍是 L/R 帧数，一次最多读一块（512 帧 = 1024 交织样本）。
         if (staged < kStageCapacity &&
             (capture_needs_audio || filled + kReadBlockSamples <= kFrameSamplesMax)) {
-            const std::size_t want = std::min(kReadBlockSamples, kStageCapacity - staged);
+            const std::size_t want = std::min(kReadBlockSamples, (kStageCapacity - staged) / 2);
             const int64_t read_started_us = esp_timer_get_time();
             read_result = esp_codec_dev_read(microphone, stage + staged,
-                                             static_cast<int>(want * sizeof(int16_t)));
+                                             static_cast<int>(want * 2 * sizeof(int16_t)));
             const uint32_t read_us =
                 static_cast<uint32_t>(esp_timer_get_time() - read_started_us);
             if (read_result != ESP_OK) {
@@ -608,7 +637,7 @@ void processing_task(void*) {
                 // invited a uint32 subtraction that underflowed to 4294966 ms.
                 if (g_record_seconds >= 0) capture_no_data_us += read_us;
             } else {
-                staged += want;
+                staged += want * 2;
                 ++capture_reads;
                 if (g_record_seconds >= 0) {
                     ++capture_ok_reads;
@@ -629,16 +658,18 @@ void processing_task(void*) {
         // because the capture cadence has already been relaxed to 250 ms for exactly this reason.
         const bool capturing = g_record_seconds >= 0;
         for (int block = 0; block < 2 && !capturing; ++block) {
-            if (staged < kReadBlockSamples) break;
+            if (staged < kReadBlockSamples * 2) break;
             if (filled + kReadBlockSamples > kFrameSamplesMax) break;
+            // D47：窗口只存 L 路（偶数下标），R 路只进双麦累加器。
             for (std::size_t i = 0; i < kReadBlockSamples; ++i) {
-                samples[filled + i] = stage[i];
+                samples[filled + i] = stage[2 * i];
             }
+            dual_mic_acc.push(stage, kReadBlockSamples);
             filled += kReadBlockSamples;
             got = kReadBlockSamples;
-            const std::size_t remaining = staged - kReadBlockSamples;
+            const std::size_t remaining = staged - kReadBlockSamples * 2;
             for (std::size_t i = 0; i < remaining; ++i) {
-                stage[i] = stage[kReadBlockSamples + i];
+                stage[i] = stage[kReadBlockSamples * 2 + i];
             }
             staged = remaining;
         }
@@ -693,27 +724,34 @@ void processing_task(void*) {
         // 48 kHz) against only 196 blocks reaching the decimator. Decimation needs whole blocks
         // and no window state, so it consumes staging directly and staging keeps its remainder.
         if (capturing) {
-            while (staged >= kReadBlockSamples) {
+            while (staged >= kReadBlockSamples * 2) {
                 // Relay and environment control consume the same microphone stream. Capture
                 // used to starve analysis, so enabling relay silently froze VAD/EQ decisions.
                 if (filled + kReadBlockSamples <= kFrameSamplesMax) {
+                    // D47：窗口只存 L 路；R 路只进双麦累加器。
                     for (std::size_t i = 0; i < kReadBlockSamples; ++i) {
-                        samples[filled + i] = stage[i];
+                        samples[filled + i] = stage[2 * i];
                     }
+                    dual_mic_acc.push(stage, kReadBlockSamples);
                     filled += kReadBlockSamples;
                     if (filled > capture_max_filled) {
                         capture_max_filled = static_cast<uint32_t>(filled);
                     }
                 }
+                // D47：降采样/中继/录音仍走 L 路——先抽出单路块再喂 decimator。
+                for (std::size_t i = 0; i < kReadBlockSamples; ++i) {
+                    mono_block[i] = stage[2 * i];
+                }
                 const std::size_t produced =
-                    decimator.process(stage, kReadBlockSamples, decimated, kDecimatedCapacity);
+                    decimator.process(mono_block, kReadBlockSamples, decimated,
+                                      kDecimatedCapacity);
                 ++capture_blocks_to_decimator;
                 capture_samples_to_decimator += static_cast<uint32_t>(kReadBlockSamples);
                 capture_decimated_samples += static_cast<uint32_t>(produced);
                 capture_last_produced = static_cast<uint32_t>(produced);
-                const std::size_t remaining = staged - kReadBlockSamples;
+                const std::size_t remaining = staged - kReadBlockSamples * 2;
                 for (std::size_t i = 0; i < remaining; ++i) {
-                    stage[i] = stage[kReadBlockSamples + i];
+                    stage[i] = stage[kReadBlockSamples * 2 + i];
                 }
                 staged = remaining;
                 for (std::size_t i = 0; i < produced; ++i) {
@@ -797,6 +835,14 @@ void processing_task(void*) {
         const int64_t analyse_started_us = esp_timer_get_time();
         AnalysisFrame frame = analyzer.analyze(samples, filled,
             static_cast<uint32_t>(now_us / 1000));
+        // D47：帧级双麦遥测（只上报，不改任何决策）。与窗口同步：窗口只收 L 路，
+        // 累加器每块喂交织数据，帧完成后汇总并清零。
+        const dual_mic::Stats dual_stats = dual_mic::finish(dual_mic_acc);
+        dual_mic_acc.reset();
+        frame.mic2_valid = dual_stats.valid;
+        frame.mic2_broadband_dbfs = dual_stats.right_dbfs;
+        frame.mic_diff_db = dual_stats.diff_db;
+        frame.mic_coherence = dual_stats.coherence;
         // 判据历史必须跟着输入一起断：无效帧（削波/非有限值）已经写进了时域闸门的历史，
         // 不丢掉的话，削波段和恢复后的干净段会被当成同一个连续声音。NoiseAnalyzer::reset()
         // 的文档要求调用，这里补上——在此之前主循环从来没调用过它。
@@ -916,14 +962,34 @@ void processing_task(void*) {
             const int64_t inference_started_us = esp_timer_get_time();
             listening_model::classify(window_vector, logits);
             const int64_t inference_us = esp_timer_get_time() - inference_started_us;
-            std::size_t class_index = 0;
-            float class_score = 0.0f;
-            context::top_class(logits, listening_model::kClassCount, &class_index, &class_score);
+            // D46：上报 softmax 分布的 top1 + top2，而不是只有 argmax。混合环境
+            // （人声+音乐、街道+持续噪声）里单标签会藏掉第二名；top2 与 mixed
+            // 让"这一窗是混合的"可显示、可度量、可入账。决策仍不动（Round 2 纪律）。
+            float probs[listening_model::kClassCount];
+            context::softmax_probs(logits, listening_model::kClassCount, probs);
+            std::size_t top1 = 0;
+            std::size_t top2 = 1;
+            if (probs[top2] > probs[top1]) {
+                const std::size_t swap = top1;
+                top1 = top2;
+                top2 = swap;
+            }
+            for (std::size_t c = 2; c < listening_model::kClassCount; ++c) {
+                if (probs[c] > probs[top1]) {
+                    top2 = top1;
+                    top1 = c;
+                } else if (probs[c] > probs[top2]) {
+                    top2 = c;
+                }
+            }
             context_result.valid = true;
-            context_result.class_index = static_cast<uint8_t>(class_index);
-            context_result.score = class_score;
+            context_result.class_index = static_cast<uint8_t>(top1);
+            context_result.score = probs[top1];
+            context_result.top2_index = static_cast<uint8_t>(top2);
+            context_result.top2_score = probs[top2];
+            context_result.mixed = probs[top2] >= context::kMixedTop2Threshold;
             context_result.inference_us = static_cast<int32_t>(inference_us);
-            context_result.class_name = listening_model::kClassNames[class_index];
+            context_result.class_name = listening_model::kClassNames[top1];
             context_timing->record(static_cast<float>(inference_us));
 
             // 说话 vs 非说话二分类学生（只上报）。输入与 9 类模型同一个 92 维窗向量。

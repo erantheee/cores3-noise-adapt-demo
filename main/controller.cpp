@@ -12,7 +12,74 @@ constexpr std::array<float, kBandCount> kBandCenter = {
     10677.1f, 13638.2f,
 };
 
+// ── 噪声自适应歌曲 EQ（2026-10-21，D38）─────────────────────────────────────────
+// 旧公式按"每段噪声能量"抬增益（4 × band_noise × importance × focus），本质是噪声谱的
+// 复读机：2026-10-21 现场 90 s 实测，低频隆隆环境下 24 段建议最大只有 0.34 dB（×2.5 后
+// 仍 ≤0.9 dB），1–4 kHz 恒 0 —— 用户说的"该凸显的没凸显"就是这条公式的直接后果。
+//
+// 新公式把三件事分开，各自有物理含义：
+//   * 内容先验 C[b]：歌曲里"该凸显"的固定形状。低频 70/141 Hz 补开放式耳机的低频泄漏，
+//     1.6–4 kHz 做人声 presence 驼峰，8.5–13.6 kHz 补空气感；346–842 Hz 的"糊区"给负值，
+//     因为两首参考曲目在这里都有 20–27% 的能量，而它正是掩蔽人声的东西。
+//   * 噪声暴露 N：安静不动作（N=0），越吵动作越大（N=1）。只放大整体幅度，不改形状。
+//   * 噪声主导抑制 D[b]：某一段已经被环境噪声占满时，抬它既听不出来又只会更糊，所以按
+//     (1 − k[b]·D[b]) 收掉；削减段（C<0 去糊）不受抑制，因为噪声里削糊总是有利的。
+// 曲线是**有符号**的：负增益 = 去糊。设备建议口径为 [-4, +4] dB/段，Mac 播放器再乘面板
+// 深度（默认 2.5，夹到 [-12, +10]）。形状与参数的来源与数值见
+// work/eq-design/design.md（2026-10-21 现场降噪实验稿）。
+// 2026-10-22 网友共识校准：社区通勤 EQ 共识把 250 Hz 列为"一多就糊"的高危段，
+// 嘈杂环境应切 200–400 Hz（见 work/eq-design/community-eq-consensus.md），
+// 所以 244.9 Hz 段从 +1.0 改为 0——去糊区从 346 Hz 起削、245 Hz 不抬。
+constexpr std::array<float, kBandCount> kSongEqContentDb = {
+    2.5f, 3.0f, 0.0f, -1.8f, -1.8f, -1.4f, -0.6f, -0.5f,
+    0.0f, 0.5f, 1.0f, 1.2f, 1.7f, 2.1f, 2.3f, 2.3f,
+    1.9f, 1.5f, 1.3f, 1.3f, 1.3f, 2.6f, 2.6f, 1.9f,
+};
+/// 正增益的"该段被噪声主导"抑制系数。人声最敢抬（0.45），低频其次（0.65），
+/// 空气最不该把嘶声抬起来（0.85）；负增益段为 0（去糊不抑制）。
+constexpr std::array<float, kBandCount> kSongEqMaskK = {
+    0.65f, 0.65f, 0.65f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.60f, 0.60f, 0.60f, 0.45f, 0.45f, 0.45f, 0.45f, 0.45f,
+    0.45f, 0.45f, 0.60f, 0.60f, 0.60f, 0.85f, 0.85f, 0.85f,
+};
+/// 设备建议的每段绝对值上限（dB）。负值需要协议/面板支持（D38）。
+constexpr float kSongEqDeviceLimitDb = 4.0f;
+/// 噪声暴露 N 的映射：-54 dBFS 以下不动作，-34 以上满幅（与模式路由的安静/高噪门槛对齐）。
+constexpr float kSongEqExposureQuietDbfs = -54.0f;
+constexpr float kSongEqExposureSpanDb = 20.0f;
+/// 每段"被噪声主导程度" D 的映射：-75 dBFS 以下视为干净，-35 以上视为被占满。
+constexpr float kSongEqBandFloorDbfs = -75.0f;
+constexpr float kSongEqBandSpanDb = 40.0f;
+/// 外部人声意图（背景/别人说话）在内容曲线上额外加的人声强调上限（dB）。
+// 2026-10-22 demo 口径：背景人声的诉求不是"让人声靠前"，而是"盖住它"（用户明确：
+// 无关背景说话压根不想听）。做法是把音乐在语音频段抬满（设备单段上限 +4 dB），
+// 再给全频段 +1 dB 的整体抬升；Mac 侧默认 2.5× 处方深度 → 语音段可到 +10 dB。
+// 这是 demo 口径、不是产品口径：产品上要按"用户想不想参与"分三态（见 D41）。
+constexpr float kExternalVoiceEmphasisDb = 4.0f;   // 单段上限，拉爆
+constexpr float kMaskingBroadbandDb = 1.0f;        // 全频段薄薄一层，帮助掩蔽
+constexpr std::size_t kExternalVoiceFirstBand = 8;  // 1.0 kHz
+constexpr std::size_t kExternalVoiceLastBand = 17;  // 4.04 kHz
+/// 掩蔽深度按 voice 置信度连续缩放，而不是"过了 0.55 就整条拉满"：
+/// 0.55（speech_active 门限）→0，0.75→满幅。结构上保证阈值处目标曲线连续，
+/// 微小噪声在 0.55 附近只会让 EQ 动一点点，不会一步 +4 dB。这里**不加时间去抖**，
+/// 所以不会给真实背景人声或环境声增加额外延迟；平滑仍由既有的 650/850 ms EQ slew 负责。
+constexpr float kExternalMaskVoiceFloor = 0.55f;
+constexpr float kExternalMaskVoiceFull = 0.75f;
+
 float clamp01(float value) { return std::clamp(value, 0.0f, 1.0f); }
+
+/// 一条内容曲线：importance × exposure × (1 − 噪声主导抑制)，有符号，夹到设备口径。
+std::array<float, kBandCount> song_clarity_curve(const AnalysisFrame& frame, float exposure) {
+    std::array<float, kBandCount> gains{};
+    for (std::size_t band = 0; band < kBandCount; ++band) {
+        const float dominance =
+            clamp01((frame.band_dbfs[band] - kSongEqBandFloorDbfs) / kSongEqBandSpanDb);
+        const float value =
+            kSongEqContentDb[band] * exposure * (1.0f - kSongEqMaskK[band] * dominance);
+        gains[band] = std::clamp(value, -kSongEqDeviceLimitDb, kSongEqDeviceLimitDb);
+    }
+    return gains;
+}
 
 NoiseSpectrum classify_noise_spectrum(const AnalysisFrame& frame) {
     if (!frame.mic_valid || frame.broadband_dbfs < -56.0f) return NoiseSpectrum::none;
@@ -381,6 +448,11 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms,
     // 判据遥测：训练集与误触发排查都要这些量，决策逻辑一行都不用它们。
     command.broadband_dbfs = frame.broadband_dbfs;
     command.voice_likelihood = frame.voice_likelihood;
+    // D47 双麦遥测：只搬运、不决策（与判据遥测同纪律）。
+    command.mic2_broadband_dbfs = frame.mic2_broadband_dbfs;
+    command.mic_diff_db = frame.mic_diff_db;
+    command.mic_coherence = frame.mic_coherence;
+    command.mic2_valid = frame.mic2_valid;
     {
         const VoiceFeatures telemetry = extract_voice_features(frame);
         command.vocal_ratio = telemetry.vocal_ratio;
@@ -401,6 +473,11 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms,
     } else {
         invalid_ms_ = 0.0f;
         valid_ms_ += dt_ms;
+        // 模式路由与噪声暴露用平滑后的电平，不用原始帧：2026-10-21 现场实测 broadband 在
+        // -30 dBFS 门槛附近被键盘/拍桌的 100 ms 瞬态推着来回穿，环境标签在 NOISY↔LOUD 间
+        // 每 100–200 ms 抖一次，SONG_EQ 与 SAFETY_HOLD 跟着切，EQ 曲线听起来就是抽动。
+        // 250 ms 的对称一阶平滑滤掉瞬态，又比 650/850 ms 的 EQ 平滑快一档。
+        smoothed_dbfs_ = slew(smoothed_dbfs_, frame.broadband_dbfs, dt_ms, 250.0f, 250.0f);
         const float noise = clamp01((frame.broadband_dbfs + 58.0f) / 30.0f);
         const float voice = clamp01(frame.voice_likelihood);
         // 0.55：歌曲 EQ/场景判断用的"有人声"门槛；
@@ -427,6 +504,9 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms,
         evidence.level_dbfs = frame.broadband_dbfs;
         // 键盘/风/撞击（non_voice_event）不参与对话证据；普通噪声也必须在 0.65 以上。
         evidence.conversation_cue = conversation_voice ? cue_level : 0.0f;
+        // 事件帧在状态机的确认窗口里"中立"（不计入证据累计、不打断、不累计释放计时）。
+        // 键盘是现场噪声大头，把它当普通噪声会把真实对话的窗口打碎（2026-10-23 用户拍板）。
+        evidence.event_blocked = non_voice_event;
         // 证据来源按**显式策略**决定，而不是"有就用"。三条路的可信度与失败方式不同，
         // 而且遥测必须如实反映用了哪一条（own_voice_source 与 own_voice_policy）。
         OwnVoiceEvidence effective = own_voice_evidence_;
@@ -486,24 +566,26 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms,
         command.evidence_policy = evidence_policy_;
 
         // 动作是分离的，字段也必须分离：
-        //   * SONG_EQ 写歌曲的 24 段噪声补偿曲线；
-        //   * EXTERNAL_VOICE_INTENT 写背景/别人说话的 1–3.6 kHz 中频抬升（D26 恢复），
-        //     但现实人声增益本身仍只走标量 `external_voice_gain_db`，不是"用歌曲中频
-        //     假装现实人声增强"——D0 的字段分离不变；
-        //   * SAFETY_HOLD 禁止正增益。
+        //   * SONG_EQ 写"内容重要性 × 噪声暴露 × 噪声主导抑制"的有符号 24 段曲线（D38）；
+        //   * EXTERNAL_VOICE_INTENT 用同一条内容曲线，再把 1.4–4 kHz 人声段额外强调一点
+        //     （D26 的"背景/别人说话也要把 EQ 拉起来"仍然成立，只是从"只抬中频"升级成
+        //     "整条内容曲线 + 人声加权"）；
+        //   * SAFETY_HOLD 只允许非正增益：保留去糊削减，绝不抬升（安全口径不变）；
+        //     现实人声增益本身仍只走标量 `external_voice_gain_db`，不是"用歌曲中频
+        //     假装现实人声增强"——D0 的字段分离不变。
         // 已确认的对话（以及 self 判定）走 flat + 下压：这是 D25/D26 的"对话 EQ 全平"，
         // 不在歌曲上叠任何抬升。
         if (conversation_active || external_self_voice) {
             // 自己说话不算对话：环境声不开、外部人声 EQ 不动；模式保持平直。
             command.environment = EnvironmentKind::voice_likely;
             command.tuning_mode = TuningMode::flat;
-        } else if (frame.broadband_dbfs < -56.0f) {
+        } else if (smoothed_dbfs_ < -56.0f) {
             command.environment = EnvironmentKind::quiet;
             command.tuning_mode = TuningMode::flat;
         } else if (speech_active || command.conversation == ConversationState::likely) {
             command.environment = EnvironmentKind::voice_likely;
             command.tuning_mode = TuningMode::external_voice_intent;
-        } else if (frame.broadband_dbfs > -30.0f) {
+        } else if (smoothed_dbfs_ > -30.0f) {
             command.environment = EnvironmentKind::loud;
             command.tuning_mode = TuningMode::safety_hold;
         } else {
@@ -551,29 +633,50 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms,
                                            : (moving ? AdaptState::adjusting : AdaptState::holding);
         command.confidence = clamp01(valid_ms_ / 1200.0f) * (1.0f - clamp01(frame.motion / 4.0f) * 0.35f);
 
-        for (std::size_t band = 0; band < kBandCount; ++band) {
-            const bool speech_band = band >= 8 && band <= 16;
+        // 掩蔽深度：只跟 voice 置信度走，不改变"何时进入 external_voice_intent"
+        //（触发仍由上面的 speech_active 决定），也不影响 ambient_open / media_percent。
+        // 门限 0.55 处深度为 0，所以模式切换本身不会给 EQ 一个台阶；这里不加时间去抖，
+        // 真实背景人声的延迟只来自既有的 650/850 ms EQ slew，没有新增。
+        // 线性 0→满幅，而不是平方衰减：0.60 仍保留 25% 掩蔽（D41 听感不至于消失），
+        // 0.56 这种刚过线的单帧只有 ~1% 深度，不会再把 EQ 顶起来。
+        const float mask_voice =
+            clamp01((voice - kExternalMaskVoiceFloor) /
+                    (kExternalMaskVoiceFull - kExternalMaskVoiceFloor));
+        const float mask_depth =
+            command.tuning_mode == TuningMode::external_voice_intent
+                ? mask_voice
+                : 0.0f;
+
+        // 曲线只在三种"在放歌"的模式下写：稳态噪声、背景人声、安全保持。
+        // 安静与对话/自身语音保持平直（flat 的 eq 目标为 0，由下面的 slew 带回）。
+        if (command.tuning_mode == TuningMode::song_eq ||
+            command.tuning_mode == TuningMode::external_voice_intent ||
+            command.tuning_mode == TuningMode::safety_hold) {
+            const float exposure =
+                clamp01((smoothed_dbfs_ - kSongEqExposureQuietDbfs) / kSongEqExposureSpanDb);
+            std::array<float, kBandCount> curve = song_clarity_curve(frame, exposure);
             if (command.tuning_mode == TuningMode::external_voice_intent) {
-                // 背景/别人说话（还没构成"正在和我对话"）→ 抬 1–3.6 kHz 让中频起来；
-                // 边缘两个频段收一点，形状读起来是个驼峰。对话一旦成立会走 flat + 下压，
-                // 不再抑制这条（用户 2026-10-19 口径：别人的对话也要拉 EQ）。
-                const float edge = (band == 8 || band == 16) ? 0.75f : 1.0f;
-                command.eq_gain_db[band] = speech_band ? speech_gain_db_ * edge : 0.0f;
-            } else if (command.tuning_mode == TuningMode::song_eq) {
-                const float band_noise = clamp01((frame.band_dbfs[band] + 62.0f) / 32.0f);
-                const float importance = speech_band ? 1.0f : (band < 5 ? 0.45f : 0.70f);
-                const bool low_band = band < 6;
-                const bool mid_band = band >= 6 && band < 17;
-                const bool high_band = band >= 17;
-                const bool dominant =
-                    (command.noise_spectrum == NoiseSpectrum::low && low_band) ||
-                    (command.noise_spectrum == NoiseSpectrum::mid && mid_band) ||
-                    (command.noise_spectrum == NoiseSpectrum::high && high_band);
-                const float focus = command.noise_spectrum == NoiseSpectrum::mixed
-                                        ? 0.75f
-                                        : (dominant ? 1.0f : 0.30f);
+                // 掩蔽（demo）：背景有人说话时把音乐盖上去，而不是把人声抬出来。
+                // 全频段 +1 dB，语音段 1–4 kHz 再加到单段上限；Mac 再乘处方深度。
+                //
+                // 2026-10-22 修正：深度由 voice 置信度连续缩放（mask_depth）。
+                // 旧写法在 speech_active 的 0.55 门限处直接整条 +1/+4 dB，单帧噪声一过线
+                // 就是一个大台阶；现在门限处深度为 0，voice≥0.75 才到满幅。
+                for (std::size_t band = 0; band < kBandCount; ++band) {
+                    curve[band] += kMaskingBroadbandDb * mask_depth;
+                }
+                for (std::size_t band = kExternalVoiceFirstBand;
+                     band <= kExternalVoiceLastBand; ++band) {
+                    curve[band] += kExternalVoiceEmphasisDb * mask_depth;
+                }
+            } else if (command.tuning_mode == TuningMode::safety_hold) {
+                // 安全保持：禁止正增益（D25 第 3 条）。保留负的去糊段——削减不会把
+                // 任何东西推得更响，却在噪声里让音乐少糊一点。
+                for (float& gain : curve) gain = std::min(gain, 0.0f);
+            }
+            for (std::size_t band = 0; band < kBandCount; ++band) {
                 command.eq_gain_db[band] =
-                    std::min(4.0f, 4.0f * band_noise * importance * focus);
+                    std::clamp(curve[band], -kSongEqDeviceLimitDb, kSongEqDeviceLimitDb);
             }
         }
 
@@ -604,6 +707,7 @@ void AdaptController::reset() {
     speech_gain_db_ = 0.0f;
     media_percent_ = 100.0f;
     eq_gain_db_.fill(0.0f);
+    smoothed_dbfs_ = -120.0f;
     valid_ms_ = 0.0f;
     invalid_ms_ = 0.0f;
     // 下压地板只有一处定义：kDemoMediaFloorPercent。把它推进状态机的参数里，
