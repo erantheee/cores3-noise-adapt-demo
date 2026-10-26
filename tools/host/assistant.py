@@ -1,4 +1,4 @@
-"""上位机 ASR/LLM 闭环：S3 候选人声 → 语音证据门控 → 本地 ASR → 语义判定 → 环境声授权。
+"""上位机 ASR/LLM 闭环：S3 候选人声 → 语音证据门控 → ASR（本地/千问云端） → 语义判定 → 环境声授权。
 
 2026-10-21 现场反馈后的口径（D32/D33）：
 
@@ -35,6 +35,8 @@ from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
+
+from .qianwen_api import ASR_MODEL, CHAT_BASE, CHAT_MODEL, chat
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -81,7 +83,12 @@ class AssistantService:
     #: 但对话结束后设备意图会立刻关掉环境声，所以 20 s 只用于跨片段续期。
     _DECISION_TTL_S = 20.0
     #: 至少要有这么多秒的语音证据才送 ASR。低于它基本是噪声/呼吸/键盘。
-    _MIN_SPEECH_S = 1.0
+    #: 2026-10-26 从 1.0 放到 0.55：一句短应答（"嗯，对""在吗"）能量证据常只有
+    #: 0.6–0.9 s，1.0 会把真实短句整段跳过（现场 seg0376：0.84 s 被丢）。
+    _MIN_SPEECH_S = 0.55
+    #: 设备明确判为非人声的事件：这些帧覆盖的时段不再送云端 ASR。实测该网关对
+    #: 键盘/风/异响统一回 HTTP 400（原始现场 400 段里 65% 带这些事件）。
+    _BLOCKING_EVENTS = ("keyboard", "wind", "artifact")
     #: ASR 副本最长截取多少秒（正常片段 <= 6 s + 1 s 预缓冲，这里只是防御）。
     _MAX_ASR_SECONDS = 20.0
     #: 单轮转写最多显示多少字符；防止模型跑飞把面板刷屏。
@@ -93,9 +100,20 @@ class AssistantService:
                  training=None,
                  memo_context: Callable[[], str] | None = None,
                  on_decision: Callable[[dict], None] | None = None) -> None:
-        self.base_url = os.environ.get("ANTHROPIC_BASE_URL", "").rstrip("/")
-        self.api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        self.model = os.environ.get("ANTHROPIC_MODEL", "gpt-5.6-sol")
+        self.provider = os.environ.get("CORES3_LLM_PROVIDER", "anthropic")
+        self.asr_provider = os.environ.get("CORES3_ASR_PROVIDER", "local")
+        if self.provider not in ("anthropic", "qianwen"):
+            raise ValueError("CORES3_LLM_PROVIDER 必须为 anthropic 或 qianwen")
+        if self.asr_provider not in ("local", "qianwen"):
+            raise ValueError("CORES3_ASR_PROVIDER 必须为 local 或 qianwen")
+        if self.provider == "qianwen":
+            self.base_url = os.environ.get("QIANWEN_LLM_BASE_URL", CHAT_BASE).rstrip("/")
+            self.api_key = os.environ.get("DASHSCOPE_API_KEY", "")
+            self.model = os.environ.get("QIANWEN_LLM_MODEL", CHAT_MODEL)
+        else:
+            self.base_url = os.environ.get("ANTHROPIC_BASE_URL", "").rstrip("/")
+            self.api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+            self.model = os.environ.get("ANTHROPIC_MODEL", "gpt-5.6-sol")
         # 重入锁：snapshot() 持锁时还会调用 ambient_authorization()。
         self._lock = threading.RLock()
         self._state = "checking" if self.configured else "not_configured"
@@ -123,7 +141,8 @@ class AssistantService:
         self._asr_process: subprocess.Popen[str] | None = None
         self._asr_ready = False
         self._asr_error = ""
-        self._asr_model = "qwen3-asr-1.7b-int8-mlx"
+        self._asr_model = (os.environ.get("QIANWEN_ASR_MODEL", ASR_MODEL)
+                           if self.asr_provider == "qianwen" else "qwen3-asr-1.7b-int8-mlx")
         self._asr_write_lock = threading.Lock()
         self._pending: dict[str, tuple[str, int, str, float]] = {}
         self._pending_events: dict[str, dict[str, object]] = {}
@@ -152,6 +171,11 @@ class AssistantService:
         #: 6 s 分段会把一来一回切到两个请求里，没有它 LLM 每段都是"单方发言"。
         self._llm_context: deque[dict[str, object]] = deque(maxlen=24)
         self._llm_context_verdicts: deque[dict[str, object]] = deque(maxlen=4)
+        # 对话状态机（2026-10-26 用户口径）：LLM 维护"是不是还在对话里"，而不是每 6 s
+        # 孤立判一次。yes 建立"对话进行中"；unclear 不打断进行中的对话；连续两次 no
+        # 才确认"对话结束"（单次 no 常把"本段单向/无问答"误当结束，见 work/replay 复现）。
+        self._dialogue_confirmed = False
+        self._consecutive_no = 0
         #: ASR 吞吐/通过率遥测（2026-10-22）：让"只录到几句话"有数字可查。
         self._asr_stats: dict[str, int] = {
             "segments": 0, "passed": 0, "skipped": 0, "filtered": 0,
@@ -168,8 +192,10 @@ class AssistantService:
             threading.Thread(target=self._probe, name="llm-probe", daemon=True).start()
 
     def _start_asr(self) -> None:
-        python = ROOT / ".asr-venv" / "bin" / "python"
-        worker = ROOT / "tools" / "qwen_asr_worker.py"
+        python = (Path(sys.executable) if self.asr_provider == "qianwen"
+                  else ROOT / ".asr-venv" / "bin" / "python")
+        worker = ROOT / "tools" / ("qianwen_asr_worker.py"
+                                   if self.asr_provider == "qianwen" else "qwen_asr_worker.py")
         if not python.exists() or not worker.exists():
             self._asr_error = "ASR 环境未安装"
             return
@@ -198,7 +224,7 @@ class AssistantService:
                     self._asr_ready = True
                     self._asr_error = ""
                     self._asr_model = str(message.get("model") or self._asr_model)
-            elif kind in ("transcript", "transcript_error"):
+            elif kind in ("transcript", "transcript_error", "transcript_nospeech"):
                 request_id = str(message.get("id") or "")
                 with self._lock:
                     pending = self._pending.pop(request_id, None)
@@ -208,15 +234,28 @@ class AssistantService:
                 asr_latency_ms = max(0.0, (time.monotonic() - sent_at) * 1000.0)
                 with self._lock:
                     self._asr_latency_ms.append(asr_latency_ms)
-                transcript = str(message.get("text") or "").strip()
+                transcript = ("" if kind == "transcript_nospeech"
+                              else str(message.get("text") or "").strip())
                 if kind == "transcript_error":
                     with self._lock:
                         self._asr_error = str(message.get("error") or "转写失败")
                 launch = None
+                launch_asr_errors = []
                 with self._lock:
                     event = self._pending_events.get(event_id)
                     if event is None:
                         continue
+                    if kind == "transcript_error":
+                        event.setdefault("asr_errors", []).append(
+                            str(message.get("error") or "转写失败")[:200]
+                        )
+                    else:
+                        self._asr_error = ""
+                        if kind == "transcript_nospeech":
+                            notes = event.setdefault("asr_notes", [])
+                            assert isinstance(notes, list)
+                            if "服务端未检出人声" not in notes:
+                                notes.append("服务端未检出人声")
                     results = event["results"]
                     assert isinstance(results, dict)
                     raw_results = event.setdefault("raw_results", {})
@@ -242,7 +281,9 @@ class AssistantService:
                         attributed = "\n".join(
                             f"{who}：{text}" for who, text in ordered if text
                         )
+                        launch_asr_errors = list(event.get("asr_errors") or [])
                         notes = [str(item) for item in event.get("asr_notes") or []]
+                        notes.extend("ASR 请求失败：" + error for error in launch_asr_errors)
                         event.setdefault("asr_latency_ms", []).append(round(asr_latency_ms, 1))
                         if any(text for _, text in ordered):
                             self._asr_stats["passed"] += 1
@@ -251,7 +292,8 @@ class AssistantService:
                         if not attributed:
                             # 对用户不要说"噪声/重复/丢弃"（2026-10-22 用户反馈：这是
                             # 内部诊断语言，且比实际判定"不确定"下结论更重）。
-                            attributed = "这段没听出有效内容，未转写（详情见 asr_note）"
+                            attributed = ("本段转写请求失败（详情见 asr_note）" if launch_asr_errors
+                                          else "这段没听出有效内容，未转写（详情见 asr_note）")
                         number = int(event["number"])
                         event_epoch = int(event.get("epoch_id", 0))
                         # 上一轮对话的 ASR 晚归：转写与摘要也不能覆盖当前轮次的状态。
@@ -293,6 +335,28 @@ class AssistantService:
                             event.get("llm_context") or {},
                         )
                         del self._pending_events[event_id]
+                if launch is not None and launch_asr_errors:
+                    # A failed/missing turn is not negative speech evidence. Even
+                    # partial transcripts must not authorize from incomplete turns.
+                    number, epoch = int(launch[0]), int(launch[7])
+                    reason = "ASR 请求失败，无法判断：" + launch_asr_errors[0]
+                    self._publish_decision(number, "unclear", "close", 0.0,
+                                           reason, "local", epoch_id=epoch)
+                    # 只少部分片段失败但拿到了正文时，不要把整轮说成"转写请求失败"：
+                    # 面板上已有转写内容，写清"部分片段失败"即可（2026-10-26 用户反馈）。
+                    has_text = any(text for _, text in launch[6])
+                    headline = ("判定：不确定 · 部分片段转写失败" if has_text
+                                else "判定：不确定 · 转写请求失败")
+                    self._set_summary(number, headline, epoch_id=epoch)
+                    self._finish_training(number, {
+                        "asr": {"errors": launch_asr_errors},
+                        "llm": {"skipped": "ASR 请求失败或轮次不完整"},
+                        "labels": {"teacher": {"dialogue": "unclear", "ambient": "close",
+                                   "confidence": 0.0, "reason": reason, "source": "local"}},
+                    })
+                    with self._lock:
+                        self._task = "等待下一段 S3 候选人声"
+                    continue
                 if launch is not None and any(text for _, text in launch[6]):
                     if self.configured:
                         threading.Thread(
@@ -403,24 +467,24 @@ class AssistantService:
             self._summary_number = number
             self._summary = text
 
-    def _probe(self) -> None:
-        payload = json.dumps({
-            "model": self.model,
-            "max_tokens": 8,
-            "messages": [{"role": "user", "content": "只回复 OK"}],
-        }).encode("utf-8")
+    def _request_llm(self, prompt: str, max_tokens: int = 1024,
+                     timeout: float = 45, structured: bool = True) -> dict:
+        if self.provider == "qianwen":
+            return chat(prompt, key=self.api_key, model=self.model, base_url=self.base_url,
+                        max_tokens=max_tokens, timeout=timeout, structured=structured)
+        payload = json.dumps({"model": self.model, "max_tokens": max_tokens,
+                              "messages": [{"role": "user", "content": prompt}]}).encode("utf-8")
         request = urllib.request.Request(
-            f"{self.base_url}/v1/messages",
-            payload,
-            headers={
-                "x-api-key": self.api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
+            f"{self.base_url}/v1/messages", payload,
+            headers={"x-api-key": self.api_key, "anthropic-version": "2023-06-01",
+                     "content-type": "application/json"},
         )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.load(response)
+
+    def _probe(self) -> None:
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                result = json.load(response)
+            result = self._request_llm("只回复 OK", max_tokens=32, timeout=30, structured=False)
             if result.get("model") != self.model:
                 raise RuntimeError(f"服务返回模型 {result.get('model') or '未知'}")
             new_state, error = "ready", ""
@@ -516,6 +580,8 @@ class AssistantService:
                     self._new_episode_pending = False
                     self._llm_context.clear()
                     self._llm_context_verdicts.clear()
+                    self._dialogue_confirmed = False
+                    self._consecutive_no = 0
                 self._conversation_started_wall = datetime.now().astimezone().strftime("%H:%M:%S")
                 self._last_conversation_at = now
                 self._telemetry = []
@@ -889,7 +955,7 @@ class AssistantService:
                 "asr_notes": [], "epoch_id": epoch_id, "llm_context": llm_context,
             }
             self._task = f"Qwen ASR 正在逐轮转写第 {number} 段候选人声"
-            self._transcript = "正在本地转写并对齐 self / other / unknown…"
+            self._transcript = "正在转写并对齐 self / other / unknown…"
         try:
             for index, (speaker, segment_audio) in enumerate(segments):
                 request_id = f"{event_id}-{index}"
@@ -1167,20 +1233,80 @@ class AssistantService:
         return chunks if len(chunks) >= 2 else [("unknown", audio)]
 
     @classmethod
+    def _event_blocked_regions(cls, telemetry: list[dict[str, object]], rate: int,
+                               start_sample: int, total_samples: int
+                               ) -> list[tuple[int, int]]:
+        """设备明确判为键盘/风/异响的时段。
+
+        2026-10-26 用户口径："S3 判断是键盘的话，就不用转写了"——设备事件必须和
+        ASR 门控耦合。实测这批窗口送云端只会换来 HTTP 400 空体（服务端判无人声），
+        面板上就表现成"一直转写失败"。
+        """
+        if not telemetry or total_samples <= 0 or rate <= 0:
+            return []
+        half = int(rate * 0.15)  # 遥测帧代表"最近约 100 ms"
+        intervals: list[tuple[int, int]] = []
+        for item in telemetry:
+            if str(item.get("event") or "") not in cls._BLOCKING_EVENTS:
+                continue
+            center = int(item.get("sample") or 0) - start_sample
+            begin = max(0, min(total_samples, center - half))
+            end = max(0, min(total_samples, center + half))
+            if end > begin:
+                intervals.append((begin, end))
+        return _merge_intervals(intervals, int(rate * 0.10))
+
+    @staticmethod
+    def _subtract_intervals(regions: list[tuple[int, int]],
+                            blocked: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        """从语音区间里挖掉设备判定的非人声时段（保留其余人声）。"""
+        if not blocked:
+            return list(regions)
+        out: list[tuple[int, int]] = []
+        for begin, end in regions:
+            pieces = [(begin, end)]
+            for b0, b1 in blocked:
+                remaining: list[tuple[int, int]] = []
+                for a0, a1 in pieces:
+                    if b1 <= a0 or b0 >= a1:
+                        remaining.append((a0, a1))
+                        continue
+                    if a0 < b0:
+                        remaining.append((a0, b0))
+                    if b1 < a1:
+                        remaining.append((b1, a1))
+                pieces = remaining
+            out.extend(pieces)
+        return [(b, e) for b, e in out if e > b]
+
+    @classmethod
     def _select_speech_regions(cls, pcm: bytes, rate: int,
                                telemetry: list[dict[str, object]],
                                start_sample: int) -> tuple[list[tuple[int, int]], float, str]:
-        """选择用于转写的语音区间。返回 (区间, 有效秒数, 证据说明)。"""
+        """选择用于转写的语音区间。返回 (区间, 有效秒数, 证据说明)。
+
+        2026-10-26：设备判为键盘/风/异响的时段先从人声证据里挖掉，再判断有没有
+        足够语音——否则这些窗口会原样送去云端，换回 400。
+        """
         total = len(pcm) // 2
-        device = cls._telemetry_speech_regions(telemetry, rate, start_sample, total)
-        audio = cls._audio_speech_regions(pcm, rate)
+        blocked = cls._event_blocked_regions(telemetry, rate, start_sample, total)
+        device = cls._subtract_intervals(
+            cls._telemetry_speech_regions(telemetry, rate, start_sample, total), blocked
+        )
+        audio = cls._subtract_intervals(cls._audio_speech_regions(pcm, rate), blocked)
         device_s = _intervals_seconds(device, rate)
         audio_s = _intervals_seconds(audio, rate)
+        blocked_s = _intervals_seconds(blocked, rate)
+        suffix = f"；已排除键盘/风噪 {blocked_s:.1f}s" if blocked_s > 0 else ""
         if device_s >= cls._MIN_SPEECH_S:
-            return device, device_s, f"设备语音证据 {device_s:.1f}s（能量证据 {audio_s:.1f}s）"
+            return device, device_s, (
+                f"设备语音证据 {device_s:.1f}s（能量证据 {audio_s:.1f}s）{suffix}"
+            )
         if audio_s >= cls._MIN_SPEECH_S:
-            return audio, audio_s, f"能量语音证据 {audio_s:.1f}s（设备遥测不足）"
-        return [], max(device_s, audio_s), f"设备语音证据 {device_s:.1f}s / 能量证据 {audio_s:.1f}s"
+            return audio, audio_s, f"能量语音证据 {audio_s:.1f}s（设备遥测不足）{suffix}"
+        return [], max(device_s, audio_s), (
+            f"设备语音证据 {device_s:.1f}s / 能量证据 {audio_s:.1f}s{suffix}"
+        )
 
     @classmethod
     def _trim_to_speech(cls, pcm: bytes, rate: int,
@@ -1290,6 +1416,13 @@ class AssistantService:
                 "source": str(self._decision["source"]),
                 "reason": str(self._decision["reason"])[:80],
             })
+            # 对话状态机（只认 LLM 判定；本地"无语音证据"不算语义结论）。
+            if source == "llm":
+                if dialogue == "yes":
+                    self._dialogue_confirmed = True
+                    self._consecutive_no = 0
+                elif dialogue == "no":
+                    self._consecutive_no += 1
             self._task = "等待下一段 S3 候选人声"
             decision = dict(self._decision)
         # 记忆写入放在锁外：memo 有自己的锁，也不能因为它失败而影响判定/授权。
@@ -1373,11 +1506,23 @@ class AssistantService:
                 "reason": "本地快路径：本地回退判定不参与语义否决",
             }
         if decision.get("dialogue") == "no":
+            # 对话状态机（2026-10-26 用户口径）：已确认"对话进行中"时，单次 no 常把
+            # "本段单向/无问答"误当结束，不能立即否决；连续两次 no 才确认结束。
+            if self._dialogue_confirmed and self._consecutive_no < 2:
+                return {
+                    **base, "allow": True, "state": "llm_confirmed",
+                    "reason": f"对话进行中，单次 no 暂不否决：{decision.get('reason') or '—'}",
+                }
+            self._dialogue_confirmed = False
+            self._consecutive_no = 0
             return {
                 **base, "allow": False, "state": "llm_veto", "veto": True,
                 "reason": f"LLM 迟到否决：{decision.get('reason') or '—'}",
             }
         if age > self._DECISION_TTL_S:
+            # 判定过期 = 对话大概率已中断：撤销"进行中"状态，后续单次 no 才能即时否决。
+            self._dialogue_confirmed = False
+            self._consecutive_no = 0
             return {
                 **base, "allow": True, "state": "fast_local",
                 "reason": f"LLM 判定已过期 {age:.0f}s，忽略；端侧快路径继续",
@@ -1386,6 +1531,13 @@ class AssistantService:
             return {
                 **base, "allow": True, "state": "llm_confirmed",
                 "reason": f"LLM 确认对话：{decision.get('reason') or '—'}",
+            }
+        # unclear：不打断进行中的对话（保持 llm_confirmed，让门继续开），
+        # 未确认时仍按不确定处理。
+        if self._dialogue_confirmed:
+            return {
+                **base, "allow": True, "state": "llm_confirmed",
+                "reason": f"对话进行中，本段不确定不打断：{decision.get('reason') or '—'}",
             }
         return {
             **base, "allow": True, "state": "llm_unclear",
@@ -1518,45 +1670,33 @@ class AssistantService:
         }
         fallback = self._local_summary(facts)
         prompt = (
-            "你是耳机对话判定器。输入是按声纹窗口切分后的候选人声，不保证是对话。"
+            "你是耳机对话判定器，负责维护一段对话的进行状态（不是孤立地给每 6 秒打分）。"
             "self=已注册佩戴者；other=只能证明非佩戴者，不能证明是同一个人；unknown=身份不确定。"
-            "先判断为 对话/非对话/不确定。只有 self 与 other 出现有语义关联的轮流回应，"
-            "才可判为对话；自言自语、哼唱、媒体人声、只有单方或身份不足都不能判为对话。"
+            "dialogue 三个值：yes=对话进行中；no=对话已结束或不是对话；unclear=开场/身份不足/无法判断。"
             "只输出一个单行 JSON 对象，不要 markdown、代码块、换行、前后缀或解释；"
             "必须且只能含四个键：dialogue（yes|no|unclear）、ambient（open|close）、"
             "confidence（0.0~1.0 的数字）、reason（不超过40个字符的字符串）。"
-            "规则：dialogue=yes 且证据充分才能 ambient=open；其余一律 ambient=close；"
-            "不确定时 dialogue=unclear、ambient=close。"
-            "若 identity_available=false（声纹全是 unknown），但逐字稿里出现至少两个由静音分开、"
-            "语义上像问答或接话的轮次，可以判对话并开放；单向独白、电视/播客播音、"
-            "重复幻觉、只有一句短话都不算。"
-            "facts.interaction 是声纹轮次结构：self_turns>0 且 other_turns>0 且"
-            "（alternating 或 recent_alternating）=true，说明佩戴者与对方在轮流开口；"
-            "此时只要语义像问答/接话（other 的话短或部分 unknown 也算），可以判对话并开放；"
-            "但佩戴者单向独白、对方只是零星噪声/语气词时仍判非对话或不确定。"
-            "使用 context.recent_turns / context.previous_verdicts 保持跨片段一致："
-            "若前文已确认对话，本段单独看不清时不要轻易改判 no（除非明确是媒体/独白/换人）；"
-            "若前文已判非对话，保持 no 除非出现明确的一来一回。"
-            "s3_ambient_open_intent_frames 只是 S3 意图，不等于对话证据，也不等于实际执行。"
+            "规则：只有 dialogue=yes 才 ambient=open；no/unclear 一律 ambient=close。"
+            "判 yes（对话进行中）的情形："
+            "1) self 与 other 出现有语义关联的轮流回应（facts.interaction 的"
+            "   alternating / recent_alternating 为 true，身份少量 unknown 也算）；"
+            "2) 前文 context.previous_verdicts 已判 yes，且本段是同一场对话的延续——"
+            "   哪怕是某一方连续陈述、另一方只是偶尔短回应或在听（面试/讲解/汇报都算），"
+            "   也判 yes 保持打开；"
+            "3) identity_available=false 但逐字稿里出现至少两个由静音分开、语义像问答/接话的轮次。"
+            "判 no（已结束/不是对话）的情形：明确对话结束（长静音后话题完全改变/换了一群人）、"
+            "或从头就是媒体/播客/电视播音、单人对着空气的连续独白且前文从未确认过对话。"
+            "判 unclear：开场、身份不足、或无法确定是否同一场对话的延续。"
+            "重要：前文已判 yes 时，本段单独看不清不要轻易改判 no——只有明确证据表明对话结束才 no；"
+            "本段是单向陈述本身不构成结束，除非前文从未确认过对话。"
+            "facts.interaction 是声纹轮次结构；s3_ambient_open_intent_frames 只是 S3 意图，"
+            "不等于对话证据，也不等于实际执行。"
             "facts.memo 是历史记忆（可能有偏/过期），只作弱先验；与本段逐字稿/遥测冲突时"
             "以本段为准，不能凭记忆判对话或开放环境声。数据："
             + json.dumps(facts, ensure_ascii=False)
         )
-        payload = json.dumps({
-            "model": self.model,
-            # 结构化判定只输出一行 JSON。现场中转实测：512 tokens 能完成多数场景，
-            # 但个别场景 thinking 会吃掉 496 tokens，1024 留余量；与 2048 相比延迟相同。
-            "max_tokens": 1024,
-            "messages": [{"role": "user", "content": prompt}],
-        }).encode("utf-8")
-        request = urllib.request.Request(
-            f"{self.base_url}/v1/messages", payload,
-            headers={"x-api-key": self.api_key, "anthropic-version": "2023-06-01",
-                     "content-type": "application/json"},
-        )
         try:
-            with urllib.request.urlopen(request, timeout=45) as response:
-                result = json.load(response)
+            result = self._request_llm(prompt)
             raw = "".join(
                 item.get("text", "") for item in result.get("content", [])
                 if item.get("type") == "text"
@@ -1697,6 +1837,8 @@ class AssistantService:
             "transcript": self._transcript,
             "summary_state": self._summary,
             "today_sessions": self._today_sessions,
+            "provider": self.provider,
+            "asr_provider": self.asr_provider,
             "model": self.model,
             "error": error,
             "asr_ready": self._asr_ready,

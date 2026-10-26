@@ -121,11 +121,12 @@ def fresh_self_veto(snapshot: dict, max_age_s: float = 3.0) -> bool:
 def relay_reports_audio(*, relay_audio: bool, relay_ambient: object | None) -> bool:
     """中继是否真的在送音频（决定横幅/面板/路由告警怎么说）。
 
-    坑（2026-10-23 真机审计）：只开 `--voiceprint` 时 main() 也会建一个 Relay 对象——
-    它只是借"有 relay"来触发设备持续采集（`start_live_capture`），**不喂音频**
-    （base_feed=None）。如果拿 `relay is not None` 当"中继已开"，面板会显示一个永远
-    0 字节的 24 ms 延迟，并在耳机没连时误报"中继正在播放到扬声器"。上报口径只看
-    真正会送音频的两个来源：`--relay-audio` 或 `--ambient-executor relay|observe`。
+    坑（2026-10-23 真机审计）：旧版只开 `--voiceprint` 时 main() 也会建一个 Relay 对象，
+    它只是借"有 relay"来触发设备持续采集，**不喂音频**（base_feed=None）。如果拿
+    `relay is not None` 当"中继已开"，面板会显示一个永远 0 字节的 24 ms 延迟，并在耳机
+    没连时误报"中继正在播放到扬声器"。2026-10-26 起 voiceprint 不再建 relay（采集触发
+    改由 capture_needed 决定），但上报口径仍只看真正会送音频的两个来源：`--relay-audio`
+    或 `--ambient-executor relay|observe`。
     """
     return bool(relay_audio or relay_ambient is not None)
 
@@ -135,18 +136,23 @@ def ambient_gate_allows(*, device_intent: bool, llm_ok: bool, self_ok: bool,
                         dual_turn: bool = False, llm_veto: bool = False) -> bool:
     """环境声执行门放行判定（D42；2026-10-23 加入 dual_turn 触发源）。
 
-    触发器有两个：
+    触发器有三个（任一成立即"对话在进行"）：
       * device_intent：S3 端侧预判意图（快路径，但设备 vl 判据在真实对话下
         几乎不可达——voice_likelihood 帧间 0↔1 抖动，见 12:02 录音复盘）；
       * dual_turn：声纹双向交替（最近 10 s 内 self 与 other 都出现且交替）——
         用户拍板的 B 方案，约 2–3 s 延迟，不依赖设备 vl。自言自语（只有 self）
-        不触发，所以不会重蹈"自己说话把环境声拉开"的覆辙。
+        不触发，所以不会重蹈"自己说话把环境声拉开"的覆辙；
+      * llm_ok：ASR/LLM 语义确认"这是对话"（D32 的授权语义）。2026-10-26 真实
+        对话回放实测：S3 意图全程 0、dual_turn 断续，但 LLM 对 13/29 段判 yes——
+        若 LLM 确认只能当"证据"不能当"触发器"，环境声就会在 LLM 明明说"是对话"
+        时仍被关掉（见 work/replay 复现）。LLM 确认作为触发器只是把"慢但确定"
+        的语义判定从"事后批准"升为"独立放行"，不影响 veto 优先级。
     门证据：本拍/8 s 内 self 接话、LLM 确认、或 dual_turn 本身。LLM 明确否决
     （llm_veto）优先级最高，任何证据都不能覆盖（D34 迟到否决）。
     """
     if llm_veto:
         return False
-    trigger = bool(device_intent or dual_turn)
+    trigger = bool(device_intent or dual_turn or llm_ok)
     evidence = bool(llm_ok or self_ok or dual_turn or intent_recent or evidence_recent)
     return bool(trigger and evidence)
 
@@ -570,10 +576,11 @@ def main(argv: list[str] | None = None) -> int:
         print("注意：--ambient-gate voice 需要 --voiceprint；本次退化为 llm 门", file=sys.stderr)
     source = build_source(args)
     # relay 执行端需要中继基础设施；--relay-audio 只表示"开机就常开中继"。
+    # 2026-10-26：voiceprint 不再借 relay 触发采集（采集触发改由 capture_needed 决定），
+    # 避免 voiceprint-only 也拉起一个空转的 16 kHz relaysink 去开音频输出。
     relay_needed = (
         args.relay_audio
         or args.ambient_executor in ("relay", "observe")
-        or args.voiceprint
     )
     relay = (
         AudioRelay(
@@ -597,7 +604,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.ambient_executor in ("relay", "observe") and relay
         else None
     )
-    # 上报口径 ≠ 建对象口径：voiceprint 借 relay 触发采集，但它不喂音频。
+    # 上报口径 ≠ 建对象口径：voiceprint-only 现在**不再**建 relay（见 relay_needed），
+    # 采集触发由 capture_needed 单独决定。
     relay_reports = relay_reports_audio(
         relay_audio=args.relay_audio, relay_ambient=relay_ambient
     )
@@ -634,6 +642,12 @@ def main(argv: list[str] | None = None) -> int:
             )
         except (OSError, ValueError) as exc:
             print(f"连续音频目录不可用，本次不采集：{exc}", file=sys.stderr)
+
+    # 采集触发条件（2026-10-26）：relay（中继/执行端）、连续音频、声纹，任一需要设备
+    # 持续推流就 rec start。voiceprint-only 也在这里，不再借 relay（那会拉起空转的
+    # 16 kHz relaysink 去开音频输出）。与 continuous_audio.py 的"不开 relay 也 rec start"
+    # 同口径。
+    capture_needed = relay is not None or continuous is not None or voiceprint is not None
 
     def on_mic_chunk(chunk):
         if base_feed is not None:
@@ -706,10 +720,12 @@ def main(argv: list[str] | None = None) -> int:
         state.attach_memo(memo)
     assistant.start()
     assistant_configured = assistant.configured
-    # 中继使用的是无结束时间的 S3 音频流；设备若在上一次主机退出后仍处于录音态，
-    # 重连时不一定再发 started。主机既然明确启用了 relay，就直接把它登记为持续流，
-    # 会话边界随后由 conversation 状态切分。
-    if relay is not None:
+    # 中继/连续音频/声纹用的是无结束时间的 S3 音频流；设备若在上一次主机退出后仍处于
+    # 录音态，重连时不一定再发 started。主机既然明确要采集（capture_needed），就直接把
+    # 它登记为持续流，会话边界随后由 conversation 状态切分。
+    # 2026-10-26：voiceprint-only 也登记——否则 observe_frame 会因 _recording=False 提前
+    # return，ASR/LLM 侧拿不到候选段，voice 门退化的 llm 判定就永远不工作。
+    if capture_needed:
         assistant.recording_started(16_000, 0)
     if relay_reports:
         # 中继的数字要进快照：这条通路上原来最缺的就是"现在到底晚了多少"。
@@ -922,7 +938,7 @@ def main(argv: list[str] | None = None) -> int:
                 + "，D42）"
             )
         if assistant_configured:
-            print(f"  对话判定  {assistant.model} · Qwen3-ASR 本地转写 · "
+            print(f"  对话判定  {assistant.model} · {assistant._asr_model} 转写 · "
                   f"快路径端侧先开，LLM 迟到否决（D34）")
         else:
             print("  对话判定  未配置 LLM（ANTHROPIC_*）：环境声回退到设备意图/声纹门控")
@@ -1002,24 +1018,26 @@ def main(argv: list[str] | None = None) -> int:
 
     def start_live_capture() -> None:
         """Start indefinite device capture after the serial console has finished booting."""
-        if relay is None and continuous is None:
+        if not capture_needed:
             return
+        capture_reason = (
+            "音频中继" if relay is not None
+            else ("声纹采集" if voiceprint is not None else "连续音频")
+        )
         deadline = time.monotonic() + 10.0
         while not stop.is_set() and time.monotonic() < deadline:
             if writer.available:
                 time.sleep(0.8)
                 try:
                     writer(b"rec start\r\n")
-                    state.note_control_sent(
-                        "rec start（音频中继）" if relay is not None else "rec start（连续音频）"
-                    )
+                    state.note_control_sent(f"rec start（{capture_reason}）")
                     return
                 except (OSError, RuntimeError):
                     pass
             time.sleep(0.1)
         state.note("音频中继未能启动：10 秒内没有可写的设备连接")
 
-    if can_control and (relay is not None or continuous is not None):
+    if can_control and capture_needed:
         threading.Thread(target=start_live_capture, name="relay-start", daemon=True).start()
 
     serving = threading.Thread(target=httpd.serve_forever, name="http", daemon=True)

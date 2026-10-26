@@ -2498,6 +2498,13 @@ def test_ambient_gate_allows() -> None:
     check(ambient_gate_allows(device_intent=True, llm_ok=True, self_ok=False,
                               intent_recent=False, evidence_recent=False),
           "S3 意图 + LLM 确认时放行")
+    check(ambient_gate_allows(device_intent=False, llm_ok=True, self_ok=False,
+                              intent_recent=False, evidence_recent=False),
+          "LLM 语义确认本身可触发环境声（S3 意图真实对话下几乎不可达，2026-10-26 回放）")
+    check(not ambient_gate_allows(device_intent=False, llm_ok=True, self_ok=False,
+                                  intent_recent=False, evidence_recent=False,
+                                  llm_veto=True),
+          "llm_ok 与 llm_veto 互斥；明确否决仍优先")
     check(ambient_gate_allows(device_intent=True, llm_ok=False, self_ok=False,
                               intent_recent=False, evidence_recent=True),
           "S3 意图 + 8 秒内门证据时放行（避免一句一关）")
@@ -2997,6 +3004,58 @@ def test_assistant_gates_asr_on_speech_evidence() -> None:
           "连续 speech 帧必须能通过语音证据门（对照组）")
 
 
+def test_device_keyboard_events_block_asr() -> None:
+    """2026-10-26 用户口径：S3 判键盘/风/异响的窗口不送 ASR。
+
+    实测该云端网关对这些窗口统一回 HTTP 400（"转写失败"刷屏），设备事件必须
+    和 ASR 门控耦合：被事件覆盖的时段从语音证据里挖掉。
+    """
+    rate = 16000
+    tone = [8000 if index % 2 else -8000 for index in range(rate)]
+    samples = [0] * int(0.3 * rate) + tone + [0] * int(0.3 * rate)
+    pcm = struct.pack(f"<{len(samples)}h", *samples)
+    keyboard = [
+        {"voice_likelihood": 0.0, "event": "keyboard",
+         "sample": int(rate * (0.3 + 0.1 * index))}
+        for index in range(10)  # 覆盖 0.3–1.3 s 的全部能量
+    ]
+    regions, seconds, note = AssistantService._select_speech_regions(pcm, rate, keyboard, 0)
+    eq(regions, [], "设备判为键盘的时段不得作为 ASR 输入")
+    check(seconds < AssistantService._MIN_SPEECH_S, "排掉键盘后不得再达到 ASR 门槛")
+    check("已排除键盘/风噪" in note, f"证据说明要写清排除了键盘，实际：{note}")
+
+    # 键盘只覆盖前半段：后半段人声必须保留，不能整段丢。
+    samples2 = [0] * int(0.3 * rate) + tone + tone + [0] * int(0.3 * rate)
+    pcm2 = struct.pack(f"<{len(samples2)}h", *samples2)
+    regions2, seconds2, note2 = AssistantService._select_speech_regions(pcm2, rate, keyboard, 0)
+    check(seconds2 >= AssistantService._MIN_SPEECH_S, "未被键盘覆盖的人声段必须保留")
+    check("已排除键盘/风噪" in note2, "有排除时证据说明要写明")
+
+
+def test_provider_no_speech_is_not_request_failure() -> None:
+    """服务端 400（无人声）按"这段没听出内容"处理，不能整轮显示"请求失败"。"""
+    service = AssistantService()
+    service._pending["1-2-0"] = ("1-2", 0, "unknown", 1.2, time.monotonic())
+    service._pending_events["1-2"] = {
+        "number": 2, "seconds": 6.0, "chunks": 40, "chunks_lost": 0,
+        "telemetry": [], "remaining": 1, "results": {}, "raw_results": {},
+        "asr_notes": [], "epoch_id": 0, "llm_context": {},
+    }
+    service._transcript_number = 0
+
+    class FakeProcess:
+        stdout = iter([
+            json.dumps({"type": "transcript_nospeech", "id": "1-2-0", "seconds": 1.2}) + "\n",
+        ])
+
+    service._asr_process = FakeProcess()  # type: ignore[assignment]
+    service._read_asr()
+    transcript = service.snapshot()["transcript"]
+    check("请求失败" not in transcript, f"400/无人声不能显示成请求失败：{transcript}")
+    check("没听出有效内容" in transcript, f"应显示这段没听出内容，实际：{transcript}")
+    eq(service._asr_stats["filtered"], 1, "无人声片段计入 filtered，不计入请求失败")
+
+
 def test_assistant_fast_path_authorization_and_late_veto() -> None:
     """D34：端侧快路径默认放行；LLM 只有迟到的语义否决权。"""
     service = AssistantService()
@@ -3039,6 +3098,36 @@ def test_assistant_fast_path_authorization_and_late_veto() -> None:
     local_veto = service.ambient_authorization()
     check((not local_veto["allow"]) and local_veto["state"] == "local_veto",
           "本地无有效语音必须能关闭快路径已经打开的环境声")
+
+
+def test_assistant_conversation_state_holds_through_one_sided_no() -> None:
+    """2026-10-26 用户口径：对话一旦确认，逐段单向/短应答的 no 不能把环境声关掉；
+    LLM 维护"是否还在对话里"，连续两次 no 才确认结束。"""
+    service = AssistantService()
+    service.base_url = "http://127.0.0.1:9"
+    service.api_key = "test"
+    service.model = "test-model"
+
+    service._publish_decision(1, "yes", "open", 0.9, "双方轮流接话", "llm")
+    check(service.ambient_authorization()["state"] == "llm_confirmed", "yes 建立对话进行中")
+
+    # 进行中：单方连续陈述被判 no，不应立即否决（保持 llm_confirmed）。
+    service._publish_decision(2, "no", "close", 0.8, "本段单向独白", "llm")
+    one_no = service.ambient_authorization()
+    check(one_no["allow"] and one_no["state"] == "llm_confirmed" and not one_no["veto"],
+          "对话进行中单次 no 不否决（可能是把单向延续误当结束）")
+
+    # 进行中：unclear 也不打断，保持 llm_confirmed。
+    service._publish_decision(3, "unclear", "close", 0.4, "身份不足", "llm")
+    unclear = service.ambient_authorization()
+    check(unclear["allow"] and unclear["state"] == "llm_confirmed",
+          "对话进行中 unclear 不打断")
+
+    # 连续第二次 no：确认结束，否决。
+    service._publish_decision(4, "no", "close", 0.8, "对话已结束", "llm")
+    two_no = service.ambient_authorization()
+    check((not two_no["allow"]) and two_no["state"] == "llm_veto" and two_no["veto"],
+          "连续两次 no 才确认对话结束并否决")
 
     # 旧轮次判定晚归：不能写入新轮次，快路径继续。
     delayed = AssistantService()
@@ -3758,6 +3847,8 @@ def main() -> int:
         test_assistant_filters_asr_noise_hallucinations,
         test_assistant_interaction_features,
         test_assistant_gates_asr_on_speech_evidence,
+        test_device_keyboard_events_block_asr,
+        test_provider_no_speech_is_not_request_failure,
         test_assistant_fast_path_authorization_and_late_veto,
         test_assistant_splits_unknown_speakers_into_pause_turns,
         test_assistant_aggregates_speaker_labels_per_turn,
