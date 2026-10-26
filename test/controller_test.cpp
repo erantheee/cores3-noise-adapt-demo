@@ -333,6 +333,82 @@ int main() {
         check(out.media_percent == 100, "非人声事件不得压媒体");
     }
 
+    // ---- 键盘特殊掩蔽 + 普通噪声掩蔽（2026-10-26，D48）----
+    // 真机定位：键盘来时模式停在 SONG_EQ、掩蔽推量 ≈ 0、EQ 只动 ±0.8 dB。这里钉住：
+    // ①键盘事件在足迹段（1.0–3.4 kHz）给出清晰但克制的掩蔽抬升；②普通噪声掩蔽按
+    // 电平连续缩放；③安静/安全保持不叠掩蔽；④±4 dB 上限不破；⑤键盘停止后掩蔽慢释放
+    // 不瞬间抽掉（2026-10-26 现场第一版拉满 +4 dB：人声全变、毛刺感极强）。
+    {
+        AdaptController typing;
+        EarbudCommand typed;
+        for (int i = 0; i < 24; ++i) {
+            typed = typing.update(frame(-42.0f, 0.0f), 150, /*non_voice_event=*/true,
+                                  /*external_self_voice=*/false, /*keyboard_event=*/true);
+        }
+        check(typed.tuning_mode == TuningMode::song_eq,
+              "keyboard stays in song EQ mode (non-voice noise)");
+        check(typed.eq_gain_db[10] >= 1.2f,
+              "keyboard footprint band gets a clear masking lift");
+        check(typed.eq_gain_db[0] > 0.3f && typed.eq_gain_db[0] < typed.eq_gain_db[10],
+              "keyboard adds a broadband layer below the footprint emphasis");
+        bool capped = true;
+        for (float gain : typed.eq_gain_db) {
+            if (gain > 4.01f) capped = false;
+        }
+        check(capped, "keyboard masking respects the ±4 dB per-band device cap");
+
+        AdaptController plain;
+        EarbudCommand plain_out;
+        for (int i = 0; i < 24; ++i) {
+            plain_out = plain.update(frame(-42.0f, 0.0f), 150, /*non_voice_event=*/true);
+        }
+        check(plain_out.tuning_mode == TuningMode::song_eq,
+              "plain noise without the keyboard event stays in song EQ");
+        check(typed.eq_gain_db[10] > plain_out.eq_gain_db[10] + 0.8f,
+              "the keyboard event adds a distinct emphasis on top of noise masking");
+
+        // 键盘停止后：掩蔽慢释放（1200 ms），不会一拍就抽回噪声掩蔽水平。
+        EarbudCommand after_typing;
+        for (int i = 0; i < 2; ++i) {
+            after_typing = typing.update(frame(-42.0f, 0.0f), 150,
+                                         /*non_voice_event=*/true);
+        }
+        check(after_typing.eq_gain_db[10] > plain_out.eq_gain_db[10] + 0.3f,
+              "keyboard mask releases gradually when typing stops");
+
+        AdaptController quiet_noise;
+        EarbudCommand q;
+        for (int i = 0; i < 24; ++i) q = quiet_noise.update(frame(-54.0f, 0.0f), 150);
+        check(q.eq_gain_db[14] < 0.15f,
+              "at -54 dBFS the noise mask is off (no masking in a quiet room)");
+        check(plain_out.eq_gain_db[14] > q.eq_gain_db[14] + 1.0f,
+              "louder steady noise produces a larger presence mask");
+
+        AdaptController typing_quiet;
+        EarbudCommand quiet_typed;
+        for (int i = 0; i < 12; ++i) {
+            quiet_typed = typing_quiet.update(frame(-65.0f, 0.0f), 150,
+                                              /*non_voice_event=*/true,
+                                              /*external_self_voice=*/false,
+                                              /*keyboard_event=*/true);
+        }
+        check(all_bands_flat(quiet_typed),
+              "keyboard masking does not fire in a quiet room (mode stays flat)");
+
+        AdaptController typing_loud;
+        EarbudCommand loud_typed;
+        for (int i = 0; i < 40; ++i) {
+            loud_typed = typing_loud.update(frame(-20.0f, 0.0f), 150,
+                                            /*non_voice_event=*/true,
+                                            /*external_self_voice=*/false,
+                                            /*keyboard_event=*/true);
+        }
+        float loud_max = 0.0f;
+        for (float gain : loud_typed.eq_gain_db) loud_max = std::max(loud_max, gain);
+        check(loud_max < 0.05f,
+              "keyboard masking respects safety hold (no positive gain when very loud)");
+    }
+
     // ---- 高噪声安全保持：禁止正增益，但去糊削减保留（D38）----
     {
         AdaptController safety_controller;

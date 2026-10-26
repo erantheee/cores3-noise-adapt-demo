@@ -66,6 +66,37 @@ constexpr std::size_t kExternalVoiceLastBand = 17;  // 4.04 kHz
 constexpr float kExternalMaskVoiceFloor = 0.55f;
 constexpr float kExternalMaskVoiceFull = 0.75f;
 
+// ── 噪声掩蔽 + 键盘特殊掩蔽（2026-10-26，D48）───────────────────────────────────
+// 背景：用户反馈"基础档遮蔽一般，尤其键盘噪声"。真机定位（8787 host 快照）：键盘来时
+// event=keyboard、broadband ≈ -42 dBFS，模式停在 SONG_EQ、掩蔽推量 ≈ 0、内容曲线只动
+// ±0.8 dB——键盘当前没有任何"盖住它"的动作。D41 的掩蔽只认背景人声
+// （external_voice_intent）；这里把掩蔽补到噪声上，两条形状分开：
+//   * 普通噪声（SONG_EQ）：全频段 +0.3、presence 段（1.6–4 kHz）+1.0；
+//     深度 -54→0 / -34→1，与 D39 噪声暴露同映射（安静不动作）。
+//   * 键盘（事件为 keyboard 且 SONG_EQ）：全频段 +0.5、键盘足迹段（1.0–3.4 kHz；
+//     D17 实测质心 932 Hz、中频 +7.1 dB）+1.5；深度 -52→0 / -34→1。
+// 2026-10-26 现场第一版把足迹段直接拉满 +4 dB 且从 696.5 Hz 起：反馈"人声完全变了、
+// 毛刺感极强"——幅度砍到 1/3、足迹上移到 1 kHz 起（避开歌曲人声基频区），并给掩蔽
+// 深度加了独立时间平滑（起音 400 ms / 释放 1200 ms），不跟咔哒尖峰与
+// SONG_EQ↔SAFETY_HOLD 模式边界抽动。
+// 对话/自身语音 = flat、安全保持 = 只削不抬，都不叠掩蔽（D25 不变）。掩蔽 ≠ 降噪 ≠
+// 隔音：只是把音乐盖上去。
+constexpr float kNoiseMaskBroadbandDb = 0.3f;
+constexpr float kNoiseMaskEmphasisDb = 1.0f;
+constexpr std::size_t kNoiseMaskFirstBand = 11;   // 1595.0 Hz
+constexpr std::size_t kNoiseMaskLastBand = 17;    // 4036.1 Hz
+constexpr float kNoiseMaskFloorDbfs = -54.0f;
+constexpr float kNoiseMaskSpanDb = 20.0f;
+constexpr float kKeyboardMaskBroadbandDb = 0.5f;
+constexpr float kKeyboardMaskEmphasisDb = 1.5f;
+constexpr std::size_t kKeyboardFirstBand = 8;     // 996.8 Hz
+constexpr std::size_t kKeyboardLastBand = 16;     // 3414.7 Hz
+constexpr float kKeyboardMaskFloorDbfs = -52.0f;
+constexpr float kKeyboardMaskSpanDb = 18.0f;
+/// 掩蔽深度的独立时间平滑：起音 400 ms、释放 1200 ms。
+constexpr float kMaskDepthAttackMs = 400.0f;
+constexpr float kMaskDepthReleaseMs = 1200.0f;
+
 float clamp01(float value) { return std::clamp(value, 0.0f, 1.0f); }
 
 /// 一条内容曲线：importance × exposure × (1 − 噪声主导抑制)，有符号，夹到设备口径。
@@ -438,7 +469,8 @@ float voice_likelihood_from_features(const VoiceFeatures& features) {
 
 EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms,
                                     bool non_voice_event,
-                                    bool external_self_voice) {
+                                    bool external_self_voice,
+                                    bool keyboard_event) {
     EarbudCommand command;
     command.sequence = ++sequence_;
     command.timestamp_ms = frame.timestamp_ms;
@@ -647,6 +679,22 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms,
                 ? mask_voice
                 : 0.0f;
 
+        // 噪声/键盘掩蔽深度（D48）：目标深度每拍算一次，但用独立的慢时间平滑
+        // （起音 400 ms / 释放 1200 ms）。第一版直接用 250 ms 平滑电平当深度，
+        // 现场反馈"毛刺感极强"——掩蔽跟着敲击节奏与 SONG_EQ↔SAFETY_HOLD 边界抽动。
+        // 这里每拍都更新（包括 flat / safety_hold 模式），让深度在对话或极响期间
+        // 也能自然衰减，回 SONG_EQ 时不会带着陈旧的高深度。
+        const float noise_mask_target =
+            clamp01((smoothed_dbfs_ - kNoiseMaskFloorDbfs) / kNoiseMaskSpanDb);
+        const float keyboard_mask_target =
+            keyboard_event
+                ? clamp01((smoothed_dbfs_ - kKeyboardMaskFloorDbfs) / kKeyboardMaskSpanDb)
+                : 0.0f;
+        noise_mask_depth_ = slew(noise_mask_depth_, noise_mask_target, dt_ms,
+                                 kMaskDepthAttackMs, kMaskDepthReleaseMs);
+        keyboard_mask_depth_ = slew(keyboard_mask_depth_, keyboard_mask_target, dt_ms,
+                                    kMaskDepthAttackMs, kMaskDepthReleaseMs);
+
         // 曲线只在三种"在放歌"的模式下写：稳态噪声、背景人声、安全保持。
         // 安静与对话/自身语音保持平直（flat 的 eq 目标为 0，由下面的 slew 带回）。
         if (command.tuning_mode == TuningMode::song_eq ||
@@ -673,6 +721,31 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms,
                 // 安全保持：禁止正增益（D25 第 3 条）。保留负的去糊段——削减不会把
                 // 任何东西推得更响，却在噪声里让音乐少糊一点。
                 for (float& gain : curve) gain = std::min(gain, 0.0f);
+            } else {
+                // 稳态噪声（SONG_EQ）：普通噪声掩蔽 + 键盘特殊掩蔽（2026-10-26，D48）。
+                // 键盘事件帧必然是非人声（non_voice_event），只会落进这里，不会与
+                // D41 的人声掩蔽叠加；两条掩蔽都吃同一个 ±4 dB 设备上限。深度用上面
+                // 平滑过的状态，不在这里重算（否则白做时间平滑）。
+                const float noise_mask = noise_mask_depth_;
+                if (noise_mask > 0.0f) {
+                    for (std::size_t band = 0; band < kBandCount; ++band) {
+                        curve[band] += kNoiseMaskBroadbandDb * noise_mask;
+                    }
+                    for (std::size_t band = kNoiseMaskFirstBand;
+                         band <= kNoiseMaskLastBand; ++band) {
+                        curve[band] += kNoiseMaskEmphasisDb * noise_mask;
+                    }
+                }
+                const float keyboard_mask = keyboard_mask_depth_;
+                if (keyboard_mask > 0.0f) {
+                    for (std::size_t band = 0; band < kBandCount; ++band) {
+                        curve[band] += kKeyboardMaskBroadbandDb * keyboard_mask;
+                    }
+                    for (std::size_t band = kKeyboardFirstBand;
+                         band <= kKeyboardLastBand; ++band) {
+                        curve[band] += kKeyboardMaskEmphasisDb * keyboard_mask;
+                    }
+                }
             }
             for (std::size_t band = 0; band < kBandCount; ++band) {
                 command.eq_gain_db[band] =

@@ -345,7 +345,8 @@ class AdaptController {
 public:
     EarbudCommand update(const AnalysisFrame& frame, float dt_ms,
                          bool non_voice_event = false,
-                         bool external_self_voice = false);
+                         bool external_self_voice = false,
+                         bool keyboard_event = false);
     void reset();
 
     /// 最近一次对话感知输出。工具与测试用它读 own_voice / 状态 / 已下压时长，
@@ -373,6 +374,10 @@ private:
     /// 平滑后的宽带电平（250 ms，D38）。模式路由与噪声暴露用它，不用原始帧，
     /// 否则 -30 dBFS 门槛附近的瞬态会让 SONG_EQ 与 SAFETY_HOLD 每 100–200 ms 抖一次。
     float smoothed_dbfs_ = -120.0f;
+    /// 噪声/键盘掩蔽深度的时间平滑状态（D48，起音 400 ms / 释放 1200 ms）。
+    /// 不跟原始帧的咔哒尖峰、也不跟 SONG_EQ↔SAFETY_HOLD 的模式边界抽动。
+    float noise_mask_depth_ = 0.0f;
+    float keyboard_mask_depth_ = 0.0f;
     float valid_ms_ = 0.0f;
     float invalid_ms_ = 0.0f;
     /// Apple 式对话感知：自身语音触发 → 下压媒体 → 保持 → 恢复。
