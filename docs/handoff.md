@@ -1,35 +1,48 @@
-# Session handoff — 2026-10-26
+# Session handoff — 2026-10-26（傍晚）
 
 > 每轮收尾更新本文件（≤2.5KB）。新会话顺序：`AGENTS.md` → 本文件 → `docs/INDEX.md` → 按需读。
-> 旧版交接（2026-10-22 明细）已归档到 `docs/handoff-archive-20261023.md`，不复读。
+> 旧版交接已归档 `docs/handoff-archive-20261023.md`。
 
 ## 仓库状态
-- 分支 `feature/apple-conversation-awareness`；工作树干净（HEAD 见 `git log`）；远端未 push（origin 仍停在 `66cdbd9`）。
-- 测试口径（2026-10-26 实测）：`ctest` 12/12；host 自测 90 组 / 7928 条；渲染约 80/0；`sh tools/build.sh` exit 0。
+- 分支 `feature/apple-conversation-awareness`；工作树不干净：上一轮 host 修复 5 文件**仍未提交**
+  （tools/host/{__main__.py,assistant.py,tests/test_host.py}、tools/voiceprint_worker.py）；
+  本轮 D48 已按 firmware/docs 两个提交入库。远端未 push（origin 仍停在 66cdbd9）。
+- 测试口径（2026-10-26 实测）：host 自测 90 组 / 7917 条（exit 0）；ctest 12/12、controller 113/113。
 
-## 本轮内容（D41–D47 + 演示控制）
-- D41 掩蔽；D42 执行门；D43 ASR 可读性；D44 unknown 修复；D45 说话人聚合；D46 混合情境；D47 双麦取数（只遥测，已刷机，`mic2_*` 有效）。
-- 端侧确认判据：连续 800 ms + 事件帧中立（W1 1179 帧零误触）。
-- 上位机：voiceprint 在线学习、systemeq、memo、连续音频、训练数据。
-- 2026-10-26 演示控制：`启动演示.command` / `停止演示.command` + 面板「演示控制」（暂停只停执行端，采集与 AI 继续；`/api/execution`）。S3 触摸按钮下一步（需刷机+补字库）。
+## 本轮内容（2026-10-26 下午 · D48 键盘/普通噪声特殊掩蔽）
+- 用户反馈"EQ 基础状态遮蔽一般，尤其键盘噪声"→"没让你物理隔音，要你做特殊掩蔽"。
+  定位（8787 快照）：键盘来时 event=keyboard、-42 dBFS、SONG_EQ、掩蔽推量≈0、内容曲线
+  ±0.8 dB——D41 掩蔽只认人声，键盘没有任何掩蔽路径。
+- 实现：`AdaptController::update()` 加 `keyboard_event` 参数；SONG_EQ 内两条掩蔽：
+  ①普通噪声 宽带 +0.3、presence(1.6–4k) +1.0，深度 -54→-34；②键盘 宽带 +0.5、
+  足迹段(1.0–3.4k，D17 质心 932 Hz) +1.5，深度 -52→-34。**深度独立慢平滑 400ms/1.2s**
+  （每拍更新，flat/safety_hold 也衰减）。对话/自身语音=flat、安全保持只削不抬，豁免（D25）。
+- **现场迭代**：第一版"拉爆"（足迹段 +4、696.5 Hz 起）→ 用户："人声完全变了、毛刺感极强"；
+  第二版幅度砍约 1/3 + 足迹下沿上移 1 kHz + 深度慢平滑，已刷机（两次）。
+- 8787 host 已按默认三件套重启（QQ音乐 systemeq basic / ambient-gate voice / voiceprint）。
 
 ## 未完成 / 下一步
-- **A0**：D40 真人对话验收（首响 0.5 s / 确认 0.8 s、误关漏关、噪声误触发）——需设备+真人。
-- **A1**：LLM 迟到否决回写 S3（`dialog no|yes`）——代码未接。
-- **#38**：真实房间本底误判未修；设备麦数据显示四判据退化成 `vocal_ratio` 单判据（见 `work/diagnosis/room-floor-findings.md`）。
-- **D47**：近场/远场/安静三态数据未采完，判据阈值未定。
-- 待拍板：6.5 dB vs 8.0 dB；D41 掩蔽无 limiter。
-- 声纹 self-veto 默认关、实验性（D31）。
+- **⚠️ 待用户现场听感验收第二版**（敲键盘 + 稳态噪声）；不满意改 controller.cpp 的
+  `kNoiseMask*` / `kKeyboardMask*` 常量，改后 ctest → free_port → flash → host_up。
+- 键盘掩蔽在 SAFETY_HOLD 豁免：猛敲把 250 ms 平滑电平顶过 -30 dBFS 仍会有模式边界抽动
+  （D38 既有）；第二版幅度小应大减，若仍刺耳可给 keyboard_event 加模式滞回。
+- LLM API 403（10-26 14:2x 复现）：assistant error=HTTP 403，对话判定退化 local/unclear；
+  代码层修不了，需充值/查代理。
+- 上一轮 host 修复（环境声触发）仍未提交，建议下轮按惯例补提交。
+- 遗留（不变）：A0 真人验收、A1 LLM 否决回写 S3、#38 房间本底、D47 三态阈值、
+  6.5 vs 8.0 dB、声纹 self-veto 默认关、other 快锁。
 
-## 当前环境（2026-10-26 10:46）
-- host 在跑（默认三件套 + 训练数据）；S3 `/dev/cu.usbmodem101`（D47 固件）。
-- 输出设备 Xiaomi 耳夹；LLM `gpt-5.6-sol`；ASR qwen3；声纹在线学习已启用；训练数据 1.7GB（gitignore）。
+## 当前环境（2026-10-26 15:2x）
+- 8787 host 在跑（serial 真机）；S3 `/dev/cu.usbmodem101`；面板 http://127.0.0.1:8787/；
+  systemeq basic depth 1.3（面板可调）；输出 Xiaomi 耳夹；LLM gpt-5.6-sol（403）、ASR qwen3。
 
 ## 验证入口
 ```bash
 cmake -S test -B build-host-tests && cmake --build build-host-tests --parallel
 ctest --test-dir build-host-tests --output-on-failure
 python3 tools/host/tests/test_host.py
-node tools/host/tests/render_check.js <快照.json>
-sh tools/build.sh            # 固件
+# 重刷（先停 host）：
+CORES3_PORT=/dev/cu.usbmodem101 sh tools/free_port.sh --kill
+sh tools/build.sh flash
+sh tools/host_up.sh --detach
 ```
