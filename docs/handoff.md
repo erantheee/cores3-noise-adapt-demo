@@ -14,9 +14,10 @@
 
 ## 仓库状态
 - 分支 `feature/apple-conversation-awareness`；工作树不干净：上一轮 host 修复 5 文件**仍未提交**
-  （tools/host/{__main__.py,assistant.py,tests/test_host.py}、tools/voiceprint_worker.py）；
-  本轮 D48 已按 firmware/docs 两个提交入库。远端未 push（origin 仍停在 66cdbd9）。
-- 测试口径（2026-10-26 实测）：host 自测 90 组 / 7917 条（exit 0）；ctest 12/12、controller 113/113。
+  （tools/host/{__main__.py,assistant.py,tests/test_host.py}、tools/voiceprint_worker.py，
+  千问轮未提交文件另见上方"最新补充"）；本轮 D48/D49 已按 firmware/docs 提交入库。
+  远端未 push（origin 仍停在 66cdbd9）。
+- 测试口径（2026-10-26 实测）：host 自测 92 组 / 7925 条（exit 0）；ctest 12/12、controller 117/117。
 
 ## 本轮内容（2026-10-26 下午 · D48 键盘/普通噪声特殊掩蔽）
 - 用户反馈"EQ 基础状态遮蔽一般，尤其键盘噪声"→"没让你物理隔音，要你做特殊掩蔽"。
@@ -30,20 +31,30 @@
   第二版幅度砍约 1/3 + 足迹下沿上移 1 kHz + 深度慢平滑，已刷机（两次）。
 - 8787 host 已按默认三件套重启（QQ音乐 systemeq basic / ambient-gate voice / voiceprint）。
 
+## 本轮内容（2026-10-26 17:0x–17:3x · D49 对话证据过事件层 speech）
+- 用户发现"S3 贴键盘掩蔽正常、贴耳朵不准确"。双位置采集（`记录/位置对照/20261026-kbd-ab.csv`）：
+  电平只差 3 dB，主因是**耳边 OWS 漏音** → quiet 窗口 vl 0.82 → 状态机锁 engaged →
+  FLAT 占 47%（键盘边 16%）、最长 1.9 s → 掩蔽被压平。
+- 修法：对话证据(0.65)与背景人声判定(0.55)必须过**事件层 speech**（`update()` 加
+  `speech_event`；app_main 从 sound_event_out 算）。背书：真人面试回放证据帧 1464/1464
+  本就是 speech、连续段统计零变化；漏音打字 speech 0 帧。代价：对话首响 +~1 s。
+- 离线工具 conversation_replay / voice_decision_offline 串入同一事件检测器（口径一致）。
+- 感知点口径（写进 product-alignment）：S3=耳机仓=人身边；贴耳不是产品几何但 D49
+  让掩蔽在贴耳下也能连续工作。
+- 已刷机（D49），8787 host 已重启；**待用户贴耳打字听感验收**。
+
 ## 未完成 / 下一步
-- **⚠️ 待用户现场听感验收第二版**（敲键盘 + 稳态噪声）；不满意改 controller.cpp 的
-  `kNoiseMask*` / `kKeyboardMask*` 常量，改后 ctest → free_port → flash → host_up。
+- **⚠️ 待用户贴耳打字听感验收 D49**（掩蔽应连续、不再被 FLAT 打断）；掩蔽幅度仍不满意
+  改 controller.cpp 的 `kNoiseMask*` / `kKeyboardMask*` 常量，改后 ctest → free_port → flash → host_up。
 - 键盘掩蔽在 SAFETY_HOLD 豁免：猛敲把 250 ms 平滑电平顶过 -30 dBFS 仍会有模式边界抽动
-  （D38 既有）；第二版幅度小应大减，若仍刺耳可给 keyboard_event 加模式滞回。
-- LLM API 403（10-26 14:2x 复现）：assistant error=HTTP 403，对话判定退化 local/unclear；
-  代码层修不了，需充值/查代理。
+  （D38 既有）；若仍刺耳可给 keyboard_event 加模式滞回。
 - 上一轮 host 修复（环境声触发）仍未提交，建议下轮按惯例补提交。
 - 遗留（不变）：A0 真人验收、A1 LLM 否决回写 S3、#38 房间本底、D47 三态阈值、
   6.5 vs 8.0 dB、声纹 self-veto 默认关、other 快锁。
 
-## 当前环境（2026-10-26 15:2x）
-- 8787 host 在跑（serial 真机）；S3 `/dev/cu.usbmodem101`；面板 http://127.0.0.1:8787/；
-  systemeq basic depth 1.3（面板可调）；输出 Xiaomi 耳夹；LLM gpt-5.6-sol（403）、ASR qwen3。
+## 当前环境（2026-10-26 17:3x）
+- 8787 host 在跑（serial 真机，D49 固件）；S3 `/dev/cu.usbmodem101`；面板 http://127.0.0.1:8787/；
+  systemeq basic depth 1.3（面板可调）；输出 Xiaomi 耳夹；LLM 千问（见上方"最新补充"）。
 
 ## 千问 ASR 400 根因（2026-10-26 16:4x，只读诊断，未改代码）
 - 结论：模型没坏。实测干净 TTS / -52 dBFS 弱语音 / SNR 0 dB 混噪 / 400 ms 短句均 200；HTTP 400 `{}` 只出现在窗口内无可识别人声（静音、键盘、房间噪声）。seg0001 最响 1.5 s（键盘）400、最安静 2.5 s 200（"你是写出来了。"）；本地 qwen3-asr 判断一致（噪声→"嗯。"）。
