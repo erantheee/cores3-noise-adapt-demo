@@ -911,6 +911,10 @@ void processing_task(void*) {
         // 风/撞击仍只做否决与风 EQ，不叠键盘掩蔽。
         const bool keyboard_event =
             sound_event_out.valid && sound_event_out.cls == sound_event::Class::keyboard;
+        // speech 单独进控制器（D49）：对话证据与背景人声判定必须过事件层 speech，
+        // 否则贴耳时 OWS 耳机漏音会把对话状态机锁进 engaged、掩蔽被打断。
+        const bool speech_event =
+            sound_event_out.valid && sound_event_out.cls == sound_event::Class::speech;
 
         // 声纹门控（D28 step3）：self → 不压媒体、不抬歌曲 EQ、不开环境声；
         // other 或没有判定 → 按 D16 的预判逻辑走。判定超过 3 s 没有新行即过期，
@@ -921,7 +925,7 @@ void processing_task(void*) {
         const bool external_self_voice = voiceprint.self_voice;
         EarbudCommand command =
             controller.update(frame, elapsed_ms, non_voice_event, external_self_voice,
-                              keyboard_event);
+                              keyboard_event, speech_event);
         command.event.valid = sound_event_out.valid;
         command.event.class_name = sound_event::class_name(sound_event_out.cls);
         const int64_t decide_done_us = esp_timer_get_time();

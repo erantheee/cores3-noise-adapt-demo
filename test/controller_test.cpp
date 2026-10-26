@@ -112,7 +112,8 @@ int main() {
         // -50 dBFS：比近场代理的门限（-45）更低，所以 own_voice 证据为 0；但对话 cue 的
         // 门限是 -58 起，仍应触发预判。这条就是"预判不依赖我开口"的最小证明。
         auto first = predictor.update(frame(-50, 0.8f), 100, /*non_voice_event=*/false,
-                                      /*external_self_voice=*/false);
+                                      /*external_self_voice=*/false,
+                                      /*keyboard_event=*/false, /*speech_event=*/true);
         check(first.conversation == ConversationState::speech_nearby,
               "a single nearby-voice frame does not claim a conversation yet");
         check(first.media_percent == 100, "a single cue frame leaves the media alone");
@@ -123,7 +124,8 @@ int main() {
         EarbudCommand preview = first;
         for (int i = 0; i < 3; ++i) {
             preview = predictor.update(frame(-50, 0.8f), 100, /*non_voice_event=*/false,
-                                       /*external_self_voice=*/false);
+                                       /*external_self_voice=*/false,
+                                       /*keyboard_event=*/false, /*speech_event=*/true);
         }
         check(preview.conversation == ConversationState::speech_nearby,
               "400 ms is not yet anticipating at the controller (preview needs 500 ms)");
@@ -132,7 +134,8 @@ int main() {
 
         // 再 100 ms（累计 500 ms）→ 预下压。
         preview = predictor.update(frame(-50, 0.8f), 100, /*non_voice_event=*/false,
-                                   /*external_self_voice=*/false);
+                                   /*external_self_voice=*/false,
+                                   /*keyboard_event=*/false, /*speech_event=*/true);
         check(preview.media_percent < 95, "500 ms of evidence ducks the media before I speak");
         check(preview.media_percent >= 69, "anticipation preview stays above its bounded floor");
 
@@ -141,7 +144,8 @@ int main() {
         EarbudCommand engaged = preview;
         for (int i = 0; i < 3; ++i) {
             engaged = predictor.update(frame(-50, 0.8f), 100, /*non_voice_event=*/false,
-                                       /*external_self_voice=*/false);
+                                       /*external_self_voice=*/false,
+                                       /*keyboard_event=*/false, /*speech_event=*/true);
         }
         check(engaged.conversation == ConversationState::likely,
               "sustained nearby voice confirms the conversation");
@@ -149,7 +153,8 @@ int main() {
         // 下压有一个 150 ms 时间常数，确认后再走 4 拍（400 ms）应当贴住 60% 地板。
         for (int i = 0; i < 4; ++i) {
             engaged = predictor.update(frame(-50, 0.8f), 100, /*non_voice_event=*/false,
-                                       /*external_self_voice=*/false);
+                                       /*external_self_voice=*/false,
+                                       /*keyboard_event=*/false, /*speech_event=*/true);
         }
         check(engaged.media_percent <= 61, "confirmed conversation ducks to the floor");
         check(engaged.tuning_mode == TuningMode::flat,
@@ -185,7 +190,8 @@ int main() {
     // ---- 人声消失后：对话保持期不能再把中频抬着 ----
     {
         AdaptController holder;
-        for (int i = 0; i < 12; ++i) holder.update(frame(-50, 0.8f), 150);
+        for (int i = 0; i < 12; ++i) holder.update(frame(-50, 0.8f), 150,
+                                                   false, false, false, /*speech_event=*/true);
         EarbudCommand silent = holder.update(frame(-70, 0.0f), 150);
         check(silent.conversation != ConversationState::none,
               "人声刚消失时对话仍在保持期");
@@ -196,7 +202,9 @@ int main() {
     {
         AdaptController bone_only;  // 默认策略，且没有塞任何 own-voice 证据
         EarbudCommand out;
-        for (int i = 0; i < 20; ++i) out = bone_only.update(frame(-45, 0.8f), 150);
+        for (int i = 0; i < 20; ++i) out = bone_only.update(frame(-45, 0.8f), 150,
+                                                             false, false, false,
+                                                             /*speech_event=*/true);
         check(out.media_percent <= 61,
               "conversation prediction ducks without own-voice evidence (fail-closed no longer blocks prediction)");
         check(out.conversation == ConversationState::likely,
@@ -211,7 +219,9 @@ int main() {
         EarbudCommand out;
         // -54 dBFS、voice 0.8：speech_active 成立，但对话 cue（-58 起按 16 dB 归一）
         // 只有 0.25，低于 0.5 门限 -> 不进入 anticipating，走 external_voice_intent。
-        for (int i = 0; i < 12; ++i) out = background.update(frame(-54, 0.8f), 150);
+        for (int i = 0; i < 12; ++i) out = background.update(frame(-54, 0.8f), 150,
+                                                              false, false, false,
+                                                              /*speech_event=*/true);
         check(out.conversation == ConversationState::speech_nearby,
               "背景人声只报 nearby，不升级为对话（cue 未过门限）");
         check(out.media_percent == 100, "背景人声不压媒体");
@@ -236,11 +246,15 @@ int main() {
         EarbudCommand out;
         for (int i = 0; i < 40; ++i) out = tiny.update(frame(-54.0f, 0.0f), 100);
         const float before = out.eq_gain_db[14];
-        out = tiny.update(frame(-54.0f, 0.56f), 100);
+        out = tiny.update(frame(-54.0f, 0.56f), 100, false, false, false,
+                           /*speech_event=*/true);
         check(std::fabs(out.eq_gain_db[14] - before) < 0.05f,
               "a single frame just over the voice threshold does not step the EQ");
 
-        for (int i = 0; i < 30; ++i) out = tiny.update(frame(-54.0f, 0.56f), 100);
+        for (int i = 0; i < 30; ++i) {
+            out = tiny.update(frame(-54.0f, 0.56f), 100, false, false, false,
+                              /*speech_event=*/true);
+        }
         check(out.eq_gain_db[14] < 0.5f,
               "sustained marginal voice stays well below the full masking depth");
         check(out.media_percent == 100 && !out.ambient_open,
@@ -250,7 +264,10 @@ int main() {
         // 仍应明显小于满幅（0.8 的满幅测试见下），但不需要压到"听不出来"。
         AdaptController room_noise;
         EarbudCommand noise_out;
-        for (int i = 0; i < 30; ++i) noise_out = room_noise.update(frame(-54.0f, 0.60f), 100);
+        for (int i = 0; i < 30; ++i) {
+            noise_out = room_noise.update(frame(-54.0f, 0.60f), 100, false, false, false,
+                                          /*speech_event=*/true);
+        }
         check(noise_out.eq_gain_db[14] < 1.5f,
               "room-noise-grade voice 0.60 stays below the full masking depth");
         check(noise_out.media_percent == 100 && !noise_out.ambient_open,
@@ -258,7 +275,10 @@ int main() {
 
         AdaptController strong;
         EarbudCommand full_mask;
-        for (int i = 0; i < 12; ++i) full_mask = strong.update(frame(-54.0f, 0.8f), 150);
+        for (int i = 0; i < 12; ++i) {
+            full_mask = strong.update(frame(-54.0f, 0.8f), 150, false, false, false,
+                                      /*speech_event=*/true);
+        }
         check(full_mask.eq_gain_db[14] >= 3.0f,
               "high-confidence background voice still reaches the full masking depth");
     }
@@ -268,7 +288,10 @@ int main() {
         AdaptController noisy;
         EarbudCommand out;
         // voice 0.6、-45 dBFS：够"有人声"（EQ/场景）但不够对话（0.65）。
-        for (int i = 0; i < 12; ++i) out = noisy.update(frame(-45, 0.6f), 150);
+        for (int i = 0; i < 12; ++i) {
+            out = noisy.update(frame(-45, 0.6f), 150, false, false, false,
+                               /*speech_event=*/true);
+        }
         check(out.conversation == ConversationState::speech_nearby,
               "voice 0.6 只报 nearby，不进入对话（对话门槛 0.65）");
         check(out.media_percent == 100 && !out.ambient_open,
@@ -409,6 +432,28 @@ int main() {
               "keyboard masking respects safety hold (no positive gain when very loud)");
     }
 
+    // ---- 漏音/非人声不得进入对话或背景人声判定（2026-10-26，D49）----
+    // 耳边实测：OWS 耳机漏音把 voice_likelihood 顶到 0.82（event=quiet），旧路径把
+    // 对话状态机锁进 engaged、EQ 压平 47%。现在 speech_event=false 时必须既不进对话、
+    // 也不进背景人声掩蔽，掩蔽在 SONG_EQ 下继续工作。
+    {
+        AdaptController leaked;
+        EarbudCommand out;
+        for (int i = 0; i < 24; ++i) {
+            out = leaked.update(frame(-45.0f, 0.9f), 150, /*non_voice_event=*/false,
+                                /*external_self_voice=*/false, /*keyboard_event=*/false,
+                                /*speech_event=*/false);
+        }
+        check(out.conversation == ConversationState::none,
+              "leakage-like voice without a speech event never starts a conversation");
+        check(out.tuning_mode == TuningMode::song_eq,
+              "leakage-like voice without a speech event stays in song EQ (no voice mask)");
+        check(out.eq_gain_db[14] < 2.5f,
+              "no D41 voice-band emphasis for leakage (only the level-driven noise mask)");
+        check(out.media_percent == 100 && !out.ambient_open,
+              "leakage-like voice never ducks media or opens ambient");
+    }
+
     // ---- 高噪声安全保持：禁止正增益，但去糊削减保留（D38）----
     {
         AdaptController safety_controller;
@@ -441,7 +486,9 @@ int main() {
     // ---- 麦克风故障：必须复位对话状态、关环境声、把媒体抬回来 ----
     {
         AdaptController failing;
-        for (int i = 0; i < 20; ++i) failing.update(frame(-45, 0.8f), 150);
+        for (int i = 0; i < 20; ++i) failing.update(frame(-45, 0.8f), 150,
+                                                    false, false, false,
+                                                    /*speech_event=*/true);
         EarbudCommand failed_frame;
         for (int i = 0; i < 3; ++i) failed_frame = failing.update(frame(-20, 0, false), 100);
         check(failed_frame.state == AdaptState::mic_fault, "persistent invalid mic enters fault");
@@ -462,7 +509,9 @@ int main() {
         AdaptController demo;
         demo.set_evidence_policy(EvidencePolicy::near_field_demo);
         EarbudCommand with_demo;
-        for (int i = 0; i < 20; ++i) with_demo = demo.update(frame(-28, 0.8f), 150);
+        for (int i = 0; i < 20; ++i) with_demo = demo.update(frame(-28, 0.8f), 150,
+                                                              false, false, false,
+                                                              /*speech_event=*/true);
         check(with_demo.media_percent <= 61, "near_field_demo also ducks");
         check(with_demo.own_voice.proxy && !with_demo.own_voice.bone,
               "near_field_demo never claims bone evidence");
@@ -472,7 +521,9 @@ int main() {
         AdaptController off;
         off.set_evidence_policy(EvidencePolicy::disabled);
         EarbudCommand with_disabled;
-        for (int i = 0; i < 20; ++i) with_disabled = off.update(frame(-28, 0.8f), 150);
+        for (int i = 0; i < 20; ++i) with_disabled = off.update(frame(-28, 0.8f), 150,
+                                                                 false, false, false,
+                                                                 /*speech_event=*/true);
         check(with_disabled.media_percent <= 61,
               "disabled own-voice evidence does not disable conversation prediction");
         check(with_disabled.own_voice.bone == false && with_disabled.own_voice.proxy == false,
@@ -486,7 +537,9 @@ int main() {
         evidence.confidence = 0.9f;
         bone.set_own_voice_evidence(evidence);
         EarbudCommand with_bone;
-        for (int i = 0; i < 20; ++i) with_bone = bone.update(frame(-28, 0.8f), 150);
+        for (int i = 0; i < 20; ++i) with_bone = bone.update(frame(-28, 0.8f), 150,
+                                                              false, false, false,
+                                                              /*speech_event=*/true);
         check(with_bone.media_percent <= 61, "bone_only ducks when bone evidence is present");
     }
 

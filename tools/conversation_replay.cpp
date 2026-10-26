@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "controller.hpp"
+#include "sound_event.hpp"
 
 namespace {
 
@@ -131,6 +132,9 @@ int main(int argc, char** argv) {
 
     NoiseAnalyzer analyzer;
     AdaptController controller;
+    // 事件层（1 s 窗规则）与固件同口径：D49 起对话证据/背景人声判定必须过 event=speech，
+    // 这里把同一检测器串进来，否则回放会低估触发（漏掉 speech 门控）。
+    sound_event::Detector event_detector;
     // 回放工具要检验的正是**近场代理**在真实素材上的行为（它是判断"证据该不该换"的依据），
     // 所以这里显式选 near_field_demo 策略；产品默认是 bone_only（fail-closed，不动作）。
     controller.set_evidence_policy(EvidencePolicy::near_field_demo);
@@ -150,7 +154,19 @@ int main(int argc, char** argv) {
         ++tick;
         const std::uint32_t ts = static_cast<std::uint32_t>(tick * kTickMs);
         AnalysisFrame frame = analyzer.analyze(audio.data() + offset, kFrameSamples, ts);
-        const EarbudCommand command = controller.update(frame, kTickMs);
+        const sound_event::Output event_out = event_detector.push(
+            frame.band_dbfs, frame.broadband_dbfs, frame.mic_valid,
+            static_cast<float>(ts) / 1000.0f);
+        const bool non_voice = event_out.valid &&
+            (event_out.cls == sound_event::Class::keyboard ||
+             event_out.cls == sound_event::Class::wind ||
+             event_out.cls == sound_event::Class::artifact);
+        const bool keyboard_event =
+            event_out.valid && event_out.cls == sound_event::Class::keyboard;
+        const bool speech_event =
+            event_out.valid && event_out.cls == sound_event::Class::speech;
+        const EarbudCommand command = controller.update(frame, kTickMs, non_voice, false,
+                                                        keyboard_event, speech_event);
         const conversation::Output& aware = controller.awareness();
 
         if (frame.voice_likelihood > 0.55f) { saw_speech = true; ++speech_ticks; }

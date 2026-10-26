@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 #include "controller.hpp"
+#include "sound_event.hpp"
 
 namespace {
 constexpr float kTargetRate = 48000.0f;
@@ -108,6 +109,8 @@ int main(int argc, char** argv) {
 
     NoiseAnalyzer analyzer;
     AdaptController controller;
+    // 与固件同口径：D49 起背景人声判定必须过事件层 speech，这里串同一检测器。
+    sound_event::Detector event_detector;
     std::vector<float> score(frames);
     std::vector<int> mode(frames);
     int crossings = 0, triggers = 0, first_trigger = -1;
@@ -120,7 +123,19 @@ int main(int argc, char** argv) {
         score[k] = frame.voice_likelihood;
         if (frame.voice_likelihood >= kVoiceCut) ++crossings;
         if (frame.voice_likelihood > worst) { worst = frame.voice_likelihood; worst_at = k; }
-        const auto cmd = controller.update(frame, 1000.0f / float(frames_per_sec));
+        const sound_event::Output event_out = event_detector.push(
+            frame.band_dbfs, frame.broadband_dbfs, frame.mic_valid,
+            static_cast<float>(k * 1000 / frames_per_sec) / 1000.0f);
+        const bool non_voice = event_out.valid &&
+            (event_out.cls == sound_event::Class::keyboard ||
+             event_out.cls == sound_event::Class::wind ||
+             event_out.cls == sound_event::Class::artifact);
+        const bool keyboard_event =
+            event_out.valid && event_out.cls == sound_event::Class::keyboard;
+        const bool speech_event =
+            event_out.valid && event_out.cls == sound_event::Class::speech;
+        const auto cmd = controller.update(frame, 1000.0f / float(frames_per_sec),
+                                           non_voice, false, keyboard_event, speech_event);
         mode[k] = int(cmd.tuning_mode);
         if (cmd.tuning_mode == TuningMode::external_voice_intent) {
             ++triggers;

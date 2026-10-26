@@ -470,7 +470,8 @@ float voice_likelihood_from_features(const VoiceFeatures& features) {
 EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms,
                                     bool non_voice_event,
                                     bool external_self_voice,
-                                    bool keyboard_event) {
+                                    bool keyboard_event,
+                                    bool speech_event) {
     EarbudCommand command;
     command.sequence = ++sequence_;
     command.timestamp_ms = frame.timestamp_ms;
@@ -519,11 +520,18 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms,
         constexpr float kConversationVoiceThreshold = 0.65f;
         // self 判定（声纹，3 s 内新鲜）视为哼唱/自言自语：不触发人声 EQ 或对话。
         // other / 没有判定都走 D16 的预判逻辑（D28 step3）。
+        //
+        // 2026-10-26（D49）：人声判定必须过事件层的 speech 类。旧写法只看 4 判据
+        // voice + 电平，贴耳时 OWS 耳机漏音把 voice 顶到 0.8+，对话状态机被持续
+        // 证据锁进 engaged → EQ 压平、掩蔽中断（真机实测耳边打字 FLAT 占 47%）。
+        // 事件层 speech 在漏音/键盘场景 0 帧触发，在真人回放证据帧 1464/1464 全部
+        // 触发——门控对真实对话零损伤（回放连续段统计前后一致），代价是首响 +~1 s
+        // （事件窗要先攒 1 s 语音）。
         const bool speech_active =
-            !non_voice_event && !external_self_voice &&
+            speech_event && !external_self_voice &&
             voice > 0.55f && frame.broadband_dbfs > -58.0f;
         const bool conversation_voice =
-            !non_voice_event && !external_self_voice &&
+            speech_event && !external_self_voice &&
             voice > kConversationVoiceThreshold && frame.broadband_dbfs > -58.0f;
 
         // **预判输入**：附近有人开口 = 对话正在开始。这是提前量的唯一来源——"我开口"只能
