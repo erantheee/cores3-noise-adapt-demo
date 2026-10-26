@@ -11,7 +11,7 @@ stdout 回 JSON 行（ready / verdict / error）。使用仓库 `.venv`（需要
                  {"type":"verdict","verdict":"self"|"other"|"unknown","score":0.93,...}
                  {"type":"error","error":"..."}
 
-判定：1.5 s 窗、0.75 s 步进；embedding 与佩戴者注册原型（设备录音的均值）
+判定：3 s 窗、0.75 s 步进；embedding 与佩戴者注册原型（设备录音的均值）
 做 cosine。当前窗口达到 self 阈值即否决为本人；只有有声且明显低于阈值才判 other，
 静音、边界区和不可靠窗口为 unknown。结果回传 S3，用双方轮次判断对话。
 """
@@ -123,7 +123,10 @@ def main() -> int:
     parser.add_argument("--enroll-dir", type=Path,
                         default=ROOT / "记录" / "声纹" / "self-device")
     parser.add_argument("--threshold", type=float, default=0.80)
-    parser.add_argument("--window-s", type=float, default=1.5)
+    # 判决窗 3 s（2026-10-26 现场实测）：1.5 s 窗在远场/键盘噪声下把本人也压到
+    # 0.65–0.75（噪声窗同样能到 0.65，几乎不可分）；3 s 窗下本人 0.86–0.90、
+    # 键盘/房间噪声 0.65–0.71，阈值 0.8 才重新有区分度。步进仍是 0.75 s。
+    parser.add_argument("--window-s", type=float, default=3.0)
     parser.add_argument("--hop-s", type=float, default=0.75)
     parser.add_argument("--smooth", type=float, default=0.6)
     parser.add_argument("--speech-floor-dbfs", type=float, default=-45.0)
@@ -133,7 +136,13 @@ def main() -> int:
     # 活动（防纯噪声窗），但不再系统性排除耳语。身份判定仍由 score ≥ threshold 决定。
     parser.add_argument("--min-speech-ratio", type=float, default=0.15,
                         help="窗口内语音活动占比门槛（低于则 unknown，默认 0.15）")
-    parser.add_argument("--unknown-margin", type=float, default=0.15)
+    parser.add_argument("--unknown-margin", type=float, default=0.30,
+                        help="低于 threshold-该边距才判 other，其余中间区算 unknown（默认 0.30）")
+    # 说话人状态滞后（2026-10-26）：单人连续语音的短窗打分会在阈值附近抖动，
+    # 逐窗判决会把同一个人切成 self/other。self 快进（1 窗），other 需连续多窗
+    # 确认，中间区保持上一个说话人，静音复位 unknown。
+    parser.add_argument("--other-confirm-windows", type=int, default=2,
+                        help="判 other 需连续几个窗都低于阈值（滞后防抖，默认 2）")
     # 持续积累（2026-10-23 用户要求）：高置信 self 窗口在线更新声纹原型。
     # 只学"干净的高分样本"，混合说话（两人同时）分数在中间区，不会污染原型。
     parser.add_argument("--no-learn", action="store_true",
@@ -174,6 +183,10 @@ def main() -> int:
     last_emit = 0.0
     last_save = 0.0
     learn_threshold = max(args.learn_min_score, args.threshold)
+    # 说话人状态滞后：confirmed_speaker 记住上一段连续语音里确认的身份；
+    # low_streak 统计连续低于阈值窗的个数（用于判 other）。
+    confirmed_speaker: str | None = None
+    low_streak = 0
 
     for line in sys.stdin:
         line = line.strip()
@@ -226,17 +239,32 @@ def main() -> int:
             while len(peak_scores) > 4:
                 peak_scores.pop(0)
             peak = max(peak_scores)
+            # 说话人状态滞后（2026-10-26）：单人连续语音的短窗打分会在阈值附近抖动，
+            # 逐窗 peak 判决会把同一个人切成 self/other，进而污染 dual_turn 与 LLM 的
+            # 轮次结构。self 快进（1 窗，这是"你接话"信号）；other 需连续多窗确认；
+            # 中间区保持上一个说话人；静音/低语音活动复位 unknown。
             if speech_ratio < args.min_speech_ratio or dbfs < args.speech_floor_dbfs:
                 verdict = "unknown"
+                confirmed_speaker = None
+                low_streak = 0
             elif peak >= args.threshold:
                 verdict = "self"
+                confirmed_speaker = "self"
+                low_streak = 0
             elif peak <= args.threshold - args.unknown_margin:
-                verdict = "other"
+                low_streak += 1
+                if low_streak >= args.other_confirm_windows:
+                    verdict = "other"
+                    confirmed_speaker = "other"
+                else:
+                    verdict = confirmed_speaker or "unknown"
             else:
-                verdict = "unknown"
-            # 在线积累：判定用的还是旧原型（score 在上方算好），只把干净的高分
-            # self 样本并进原型；混合/中间区样本不学，避免把对方声纹吃进来。
+                # 中间区（不确定）：保持上一个说话人，避免一句一判抖动。
+                verdict = confirmed_speaker or "unknown"
+            # 在线积累：只学"稳定 self"的干净高分窗（verdict=self 且 score 达标），
+            # 混合/中间区/边界窗不学，避免原型漂向对方或抖动窗。
             if (not args.no_learn
+                    and verdict == "self"
                     and score >= learn_threshold
                     and speech_ratio >= args.learn_min_speech_ratio
                     and dbfs >= args.learn_min_dbfs):
