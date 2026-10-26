@@ -37,7 +37,8 @@ sh tools/build.sh flash       # 编译后刷写（复用 tools/flash.sh）
 # 备用：CI 构建（push 触发，gh run download 产物后 sh tools/flash.sh <产物目录>）
 ```
 - 刷写前 `sh tools/free_port.sh --kill` 释放串口；`tools/flash.sh` 逐区写+校验（"Hash of data verified" ≠ 刷写成功）。
-- 上位机：`sh tools/host_up.sh --detach`（面板 http://127.0.0.1:8787/）；无设备加 `--mock`。
+- 上位机：Finder 双击 `启动演示.command`（自动 free_port + 默认三件套）或在终端 `sh tools/host_up.sh --detach`（面板 http://127.0.0.1:8787/）；无设备加 `--mock`。
+- 运行中控制：面板顶部「演示控制」= 暂停/继续/关闭（暂停只停执行端，采集与 AI 继续）；关闭也可双击 `停止演示.command`。S3 触摸按钮尚未做（需刷机+补字库）。
 - 断言/测试条数以**实际运行输出**为准（文档里的数字会漂移）。
 
 ## 硬规则 / 已知坑

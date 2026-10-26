@@ -126,6 +126,22 @@
 <main>
   <div id="alerts" class="grid"></div>
 
+  <!--
+    演示控制（2026-10-26）。为什么「启动」不在这里：上位机没跑时没有进程能响应网页请求，
+    所以启动只能放在 Mac 上（双击「启动演示.command」）。这里管运行中的暂停/继续/关闭。
+    暂停 = 停执行端（EQ/媒体/环境声复位），采集与 AI 继续；关闭 = 释放串口并退出。
+  -->
+  <div class="card" id="exec-card">
+    <h2>演示控制</h2>
+    <div class="row">
+      <span class="value small" id="exec-status">—</span>
+      <button id="btn-pause">暂停执行</button>
+      <button id="btn-resume">继续执行</button>
+      <button id="btn-close-host">关闭上位机</button>
+    </div>
+    <div class="sub" id="exec-note">暂停 = 停执行端（EQ/媒体/环境声复位），采集与 AI 继续；启动请双击 Mac 上的「启动演示.command」</div>
+  </div>
+
   <div class="grid cards">
     <div class="card">
       <h2>环境</h2>
@@ -604,6 +620,16 @@ function render(s) {
   const dot = $("conn-dot");
   dot.className = "dot " + (!s.connected ? "bad" : s.stale ? "warn" : "ok");
   $("conn-text").textContent = !s.connected ? "上位机未连接设备" : s.stale ? "已连接（无数据）" : "已连接";
+
+  // 演示控制：暂停状态只认快照，按钮 disabled 与状态必须一致（快照缺字段时按运行中处理）。
+  const paused = s.execution_paused === true;
+  $("exec-status").textContent = paused ? "已暂停" : "运行中";
+  $("exec-status").className = "value small" + (paused ? " warn" : "");
+  $("btn-pause").disabled = paused;
+  $("btn-resume").disabled = !paused;
+  $("exec-note").textContent = paused
+    ? "执行端已复位（EQ 平直 / 媒体 100% / 环境声关闭）；采集与 AI 继续。继续请点「继续执行」。"
+    : "暂停 = 停执行端（EQ/媒体/环境声复位），采集与 AI 继续；启动请双击 Mac 上的「启动演示.command」";
 
   const f = s.frame;
   if (!f) {
@@ -1331,6 +1357,44 @@ $("btn-release").addEventListener("click", async () => {
     toast.textContent = payload.released_port
       ? "串口已释放，上位机即将退出。现在可以跑录音工具或刷机了。"
       : "已请求退出（当前数据源没有串口需要释放）";
+    toast.style.color = "#3ddc84";
+  } catch (error) {
+    toast.textContent = "上位机已退出（连接中断属正常）";
+  }
+});
+
+// 演示控制：暂停/继续只改 host 的执行端开关；关闭复用 /api/stop（释放串口后退出）。
+async function setExecutionPaused(paused) {
+  const toast = $("toast");
+  toast.textContent = paused ? "正在暂停执行…" : "正在继续执行…";
+  try {
+    const response = await fetch("/api/execution", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paused }),
+    });
+    const payload = await response.json();
+    if (!payload.ok) throw new Error(payload.error || "请求失败");
+    toast.textContent = paused
+      ? "已暂停：执行端已复位，采集与 AI 继续"
+      : "已继续：执行端恢复跟随 S3 决策";
+    toast.style.color = "#3ddc84";
+  } catch (error) {
+    toast.textContent = `操作失败：${error.message}`;
+    toast.style.color = "#ff5c6c";
+  }
+}
+$("btn-pause").addEventListener("click", () => setExecutionPaused(true));
+$("btn-resume").addEventListener("click", () => setExecutionPaused(false));
+$("btn-close-host").addEventListener("click", async () => {
+  if (!confirm("关闭上位机并释放串口？面板会断开；重新启动请双击 Mac 上的「启动演示.command」。")) {
+    return;
+  }
+  const toast = $("toast");
+  toast.textContent = "正在关闭上位机…";
+  try {
+    await fetch("/api/stop");
+    toast.textContent = "上位机正在退出（连接中断属正常）";
     toast.style.color = "#3ddc84";
   } catch (error) {
     toast.textContent = "上位机已退出（连接中断属正常）";

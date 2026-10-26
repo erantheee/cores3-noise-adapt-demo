@@ -14,6 +14,17 @@
 
 ---
 
+## 一键启动 / 暂停 / 关闭（2026-10-26 新增）
+
+| 动作 | 怎么点 | 行为 |
+|---|---|---|
+| 启动 | Finder 双击 [`启动演示.command`](启动演示.command) | 自动释放串口、按默认三件套启动上位机、打开面板 |
+| 暂停 / 继续 | 面板顶部「演示控制」 | **只停执行端**（EQ/媒体/环境声复位），采集、ASR/LLM、训练数据继续 |
+| 关闭 | 面板「关闭上位机」或双击 [`停止演示.command`](停止演示.command) | 释放串口、进程退出；S3 不受影响（USB 供电） |
+
+S3 屏上的触摸按钮（暂停/继续/关闭）是下一步：需要改固件 + 补字库（现有字库缺「关/闭/启」）
+再刷机。当前 S3 只负责感知/决策与显示，启动和停止在 Mac 端。
+
 ## 当前闭环
 
 ```text
@@ -462,8 +473,8 @@ CI 里这一步跑在固件构建**之前**（[`.github/workflows/build.yml`](.g
 上位机（`tools/host/`）另有一套自己的自测，同样是纯 Python、秒级、不需要设备：
 
 ```bash
-python3 tools/host/tests/test_host.py            # 88 组、7914 条断言（2026-10-23 实测，连跑稳定）
-node tools/host/tests/render_check.js <快照.json> # 可选：用 DOM 桩真跑一遍界面渲染（80 条通过、0 条失败，条数随快照内容略变）
+python3 tools/host/tests/test_host.py            # 90 组、7928 条断言（2026-10-26 实测，含暂停控制）
+node tools/host/tests/render_check.js <快照.json> # 可选：用 DOM 桩真跑一遍界面渲染（约 80 条通过、0 条失败，条数随快照内容略变）
 ```
 
 `render_check.js` 存在的原因很具体：这台机器上无头浏览器拿不到显示器，系统也不允许截屏，
@@ -733,8 +744,8 @@ Mac 的 `applied` / `idle` / `silent` / `bypass` / `unavailable`（有证据：
 ### 上位机自测
 
 ```bash
-python3 tools/host/tests/test_host.py      # 88 组、7914 条断言，不需要设备、不需要串口
-node tools/host/tests/render_check.js <快照.json>   # 用 DOM 桩真跑一遍 render()：80 条通过、0 条失败（条数随快照内容略变）
+python3 tools/host/tests/test_host.py      # 90 组、7928 条断言，不需要设备、不需要串口
+node tools/host/tests/render_check.js <快照.json>   # 用 DOM 桩真跑一遍 render()：约 80 条通过、0 条失败（条数随快照内容略变）
 ```
 
 它自带一份真机日志 `tools/host/tests/fixtures/device_real.log`（**2026-10-15 从当前固件重抓**：

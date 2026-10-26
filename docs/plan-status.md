@@ -153,10 +153,10 @@
 | 80 | **调音重做 + 对话确认改为持续证据（D39/D40，2026-10-21 深夜现场反馈）** | ✅ **已实现、单测、已烧机真机复验；真人对话首响待验收** | 用户现场："环境很嘈杂，调音一般般；该凸显的没凸显"。量化：旧 SONG_EQ 在实测低频谱下最大建议 0.34 dB（×2.5 复合 ≤0.7 dB、1–4 kHz 恒 0）；同时 87–95% 时间卡在 FLAT+media60%（断续噪声连续段 p50 110 ms、最长 640 ms 被 200 ms 确认+2 帧续命积分成常驻对话）。修复：① 歌曲 EQ 改为有符号内容曲线 `clamp(C·N·(1−k·D), −4,+4)`（低频/人声 presence/空气为正、346–842 Hz 去糊为负；风只压正增益；safety_hold 只保留削减）；② 协议/面板/播放器支持负值（0 dB 零线；applied=clamp(suggest×2.5, −12,+10)）；③ 模式路由改用 250 ms 平滑电平；④ 对话确认：0.5 s 连续证据预下压、0.8 s 确认、engaged 续命≥0.8 s、releasing 内重新确认。真机复验（同一嘈杂现场）：media=100%、SONG_EQ≈84%、EXTERNAL_VOICE_INTENT≈5%、ambient=false；SONG_EQ 设备建议低频+1.4/去糊−1.2/presence+1.6/空气+1.8 dB，Mac applied ×2.5 后低频+3.7/+3.9、去糊−3.2、presence+2.7…4.0、空气+4.7 dB。代价：真人对话首响 0.2–0.3 s → 0.5 s 预览/0.8 s 确认。见 D39/D40。 |
 
 
-**断言计数（2026-10-23 实测）**：主机 C++ 单测 **12 套件**（`ctest` 12/12 全部通过；
+**断言计数（2026-10-26 实测）**：主机 C++ 单测 **12 套件**（`ctest` 12/12 全部通过；
 新增 D47 的 `dual_mic_test`；条数以 ctest 输出为准，不在此手工维护）。上位机自测
-`python3 tools/host/tests/test_host.py` 输出 **88 组、7914 条断言**；
-`node tools/host/tests/render_check.js <快照.json>` 用真实快照运行 **80 条通过、0 条失败**
+`python3 tools/host/tests/test_host.py` 输出 **90 组、7928 条断言**；
+`node tools/host/tests/render_check.js <快照.json>` 用真实快照运行 **约 80 条通过、0 条失败**
 （条数随快照内容略变）；检查器 `--selftest` **8/8 场景符合预期**。
 这些数字会随代码变化，改完代码要重新跑一遍再同步到 README。
 

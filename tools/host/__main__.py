@@ -76,6 +76,20 @@ def masking_depth(mode: str | None, broadband_dbfs: float | None,
     return base + (peak - base) * t
 
 
+def apply_neutral_execution(player_service, systemeq_service) -> bool:
+    """暂停时把执行端复位到"什么都不做"：EQ 全平直、媒体 100%。
+
+    只复位一次（主循环负责在暂停沿调用）。环境声由主循环同时关掉。
+    返回值表示是否真的下发成功——没有执行端时返回 False，不伪报成功。
+    """
+    flat = [0.0] * 24
+    if systemeq_service is not None:
+        return bool(systemeq_service.apply_decision(flat, 100.0, base_gain=0.0))
+    if player_service is not None:
+        return bool(player_service.apply_decision(flat, 100.0))
+    return False
+
+
 def voiceprint_allows_ambient(snapshot: dict, max_age_s: float = 3.0) -> bool:
     """只有 worker 就绪且判定为新鲜 other 时允许环境声执行。"""
     age = snapshot.get("age_s")
@@ -1046,9 +1060,29 @@ def main(argv: list[str] | None = None) -> int:
     # 主线程只做一件事：按节拍发布快照，并把最新一帧的决策下发给 Mac 执行端。
     # 没有新帧时也发快照，界面才能区分"设备停了"与"浏览器和主机之间的连接断了"——
     # 这两种情况的处置完全不同。
+    execution_paused_last = False
     while not stop.is_set():
         broadcaster.publish()
         latest = state.latest
+        # 面板「暂停执行」（2026-10-26）：只停执行端，采集与 AI 继续跑。
+        # 进入暂停时要**主动复位一次**执行端，否则上一帧的 EQ/下压会留在音频上，
+        # 看起来像"暂停键没生效"。
+        execution_paused = bool(getattr(state, "execution_paused", False))
+        if execution_paused and not execution_paused_last:
+            neutral_ok = apply_neutral_execution(player_service, systemeq_service)
+            if ambient is not None:
+                ambient.set_open(False)
+                last_ambient_open = False
+            state.note(
+                "演示已暂停：执行端已复位（EQ 平直 / 媒体 100%）"
+                + ("、环境声已关闭" if ambient is not None else "")
+                + "；采集与 AI 继续"
+                + ("" if neutral_ok or (player_service is None and systemeq_service is None)
+                   else "（执行端复位未确认，请检查面板 Mac 实际应用一栏）")
+            )
+        elif not execution_paused and execution_paused_last:
+            state.note("演示已继续：执行端恢复跟随 S3 决策")
+        execution_paused_last = execution_paused
         if memo is not None and latest is not None:
             # 每 10 秒采一次环境统计（memo 内部节流）；只进长期 profile，不参与决策。
             memo.sample_frame(
@@ -1126,7 +1160,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 + "\n"
             )
-        if latest is not None and (player_service is not None or systemeq_service is not None):
+        if not execution_paused and latest is not None and (player_service is not None or systemeq_service is not None):
             # 决策的形状永远来自 S3，这里只是把它搬到音频上；apply_decision 内部有节流。
             # 旧固件不发 eq_gain_db（tuning 为 None）时下发全平直：**没有建议就该什么都不做**，
             # 而不是把上一次的形状留在曲子上。
@@ -1153,7 +1187,7 @@ def main(argv: list[str] | None = None) -> int:
                                                 base_gain=base_gain)
             else:
                 player_service.apply_decision(bands, media_target)
-        if ambient is not None:
+        if ambient is not None and not execution_paused:
             # S3 的 ambient_open 意图 → 执行端（relay 门控 / AirPods 聆听模式）。安全规则：
             #   * 旧固件（v4 之前）不报 ambient_open → 当成"不开放"，不猜；
             #   * 设备静默/掉线 → 必须关回去，不能把人留在环境声里；

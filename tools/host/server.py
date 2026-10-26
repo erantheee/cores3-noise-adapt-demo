@@ -295,6 +295,30 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return payload
 
+    def _handle_execution(self) -> None:
+        """演示暂停/继续（2026-10-26）。
+
+        与播放回控同一条原则：**只改一个明确的状态位**，由主循环决定执行端怎么复位。
+        暂停不碰采集/AI/设备；只停止把 S3 的决策下发到音频。
+        """
+        payload = self._read_json_body()
+        if payload is None:
+            return
+        paused = payload.get("paused")
+        if not isinstance(paused, bool):
+            self._send_json(
+                {"ok": False, "error": "缺少 paused 布尔字段"}, HTTPStatus.BAD_REQUEST
+            )
+            return
+        setter = getattr(self.state, "set_execution_paused", None)
+        if setter is None:  # pragma: no cover - 旧 HostState 兼容
+            self._send_json(
+                {"ok": False, "error": "当前状态对象不支持暂停"}, HTTPStatus.CONFLICT
+            )
+            return
+        setter(paused)
+        self._send_json({"ok": True, "paused": paused})
+
     def _handle_player(self) -> None:
         """Mac 播放与执行端（player / systemeq）的回控。与设备回控同一条原则：
         **白名单，不是通用终端**。
@@ -402,6 +426,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0]
+        if path == "/api/execution":
+            self._handle_execution()
+            return
         if path == "/api/player":
             self._handle_player()
             return

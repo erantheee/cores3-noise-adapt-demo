@@ -3593,6 +3593,94 @@ def test_main_wires_continuous_audio_from_replay() -> None:
             thread.join(timeout=3)
 
 
+def test_execution_pause_endpoint_and_snapshot() -> None:
+    """POST /api/execution 必须真的改变快照里的状态（不是只回 ok）。
+
+    这是 2026-10-26 新增的面板暂停/继续入口：面板按钮读 snapshot.execution_paused，
+    端点只负责置位；执行端的复位由主循环在暂停沿完成（见下一组测试）。
+    """
+    import threading
+    import urllib.request
+
+    from host.server import make_server, pick_port
+
+    state = HostState(source="mock")
+    broadcaster = Broadcaster(state, min_interval=0.0)
+    port = pick_port(18960)
+    httpd = make_server(state, broadcaster, port)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{port}"
+
+    def post_paused(value: bool) -> dict:
+        request = urllib.request.Request(
+            f"{base}/api/execution",
+            data=json.dumps({"paused": value}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return json.loads(response.read())
+
+    try:
+        check(state.snapshot()["execution_paused"] is False, "默认不是暂停状态")
+        payload = post_paused(True)
+        check(payload.get("ok") is True and payload.get("paused") is True,
+              "暂停请求返回 ok + paused")
+        check(state.snapshot()["execution_paused"] is True, "暂停后快照反映已暂停")
+        payload = post_paused(False)
+        check(payload.get("ok") is True and payload.get("paused") is False,
+              "继续请求返回 ok + paused")
+        check(state.snapshot()["execution_paused"] is False, "继续后快照回到运行中")
+        bad = urllib.request.Request(
+            f"{base}/api/execution",
+            data=b'{"paused": "yes"}',
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(bad, timeout=5)
+            check(False, "非布尔 paused 必须被拒绝")
+        except urllib.error.HTTPError as exc:
+            check(exc.code == 400, "非布尔 paused 返回 400")
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_pause_resets_execution_side() -> None:
+    """暂停必须把执行端复位（平直 / 媒体 100%），不能把上一帧的 EQ 留在音频上。"""
+    from host.__main__ import apply_neutral_execution
+
+    class FakePlayer:
+        def __init__(self) -> None:
+            self.calls: list[tuple[list[float], float]] = []
+
+        def apply_decision(self, bands, media_percent):
+            self.calls.append((list(bands), media_percent))
+            return True
+
+    class FakeSystemEq(FakePlayer):
+        def apply_decision(self, bands, media_percent, depth_override=None, base_gain=1.0):
+            self.calls.append((list(bands), media_percent, depth_override, base_gain))
+            return True
+
+    player = FakePlayer()
+    check(apply_neutral_execution(player, None) is True, "播放器执行端复位成功")
+    eq(len(player.calls), 1, "复位只下发一次")
+    bands, media = player.calls[0]
+    check(len(bands) == 24 and all(v == 0.0 for v in bands), "复位曲线全 0（平直）")
+    eq(media, 100.0, "复位媒体 100%")
+
+    systemeq = FakeSystemEq()
+    check(apply_neutral_execution(None, systemeq) is True, "systemeq 执行端复位成功")
+    bands, media, _depth, base_gain = systemeq.calls[0]
+    check(all(v == 0.0 for v in bands) and media == 100.0,
+          "systemeq 复位 = 平直 + 媒体 100%")
+    eq(base_gain, 0.0, "systemeq 基线归零，不留 demo 音染")
+    check(apply_neutral_execution(None, None) is False, "没有执行端时返回 False，不伪报成功")
+
+
 def main() -> int:
     tests = [
         test_d2_matches_c_printf,
@@ -3638,6 +3726,8 @@ def main() -> int:
         test_broadcaster_publishes_snapshots,
         test_web_assets_contract,
         test_server_endpoints,
+        test_execution_pause_endpoint_and_snapshot,
+        test_pause_resets_execution_side,
         test_interval_stats_and_percentile,
         test_player_decision_path_is_not_silently_dropped,
         test_eq_mode_and_bypass_control,

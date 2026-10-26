@@ -196,6 +196,17 @@ if (frame) {
   }
 }
 
+// 演示控制（2026-10-26）：暂停状态必须从快照读，按钮状态不能和状态打架。
+{
+  const paused = snapshot.execution_paused === true;
+  check(["运行中", "已暂停"].includes(text("exec-status")), "演示控制显示运行/暂停状态");
+  check(text("exec-note").includes("采集与 AI 继续"), "暂停说明里写明采集与 AI 继续");
+  check(elements.get("btn-pause").disabled === paused, "暂停按钮的可用状态与快照一致");
+  check(elements.get("btn-resume").disabled === !paused, "继续按钮的可用状态与快照一致");
+  // 关闭按钮只在点击时被引用，render() 不碰它；这里直接对 HTML 的 id 集合断言。
+  check(REAL_IDS.has("btn-close-host"), "关闭上位机按钮存在");
+}
+
 // 中继延迟：这条通路上原来最缺的一块，也是"改了参数延迟只动一点点"的答案。
 // 三种情形必须显示成三件不同的事：有实测数字 / 播放端不报告 / 没开中继。
 if (snapshot.relay === null || snapshot.relay === undefined) {
@@ -397,6 +408,18 @@ if (snapshot.frame) {
       applied_cut_bands: 3,
       min_applied_gain_db: -12,
       max_applied_gain_db: 10,
+    });
+  }
+  // 2026-10-26：默认执行端已是 systemeq；有符号曲线必须同样覆盖它，否则 paused 快照
+  // （applied 全 0）会让后面的"削减数字"断言变成对旧执行端的假验证。
+  if (snapshot.systemeq) {
+    signed.systemeq = Object.assign({}, snapshot.systemeq, {
+      applied_bands: signedApplied,
+      source_bands: signedGains,
+      applied_peak_abs_db: 7.5,
+      applied_max_cut_db: -7.5,
+      applied_lifted_bands: 9,
+      applied_cut_bands: 3,
     });
   }
   const eqCanvas = elements.get("eq");

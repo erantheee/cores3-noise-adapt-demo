@@ -292,6 +292,9 @@ class HostState:
         self.capture_event_seq: int = 0
         self.audio_samples: int = 0
         self.recording = False
+        #: 演示暂停：只停执行端（EQ/媒体/环境声），采集、ASR/LLM、训练数据继续。
+        #: 由面板 POST /api/execution 置位；主循环读它决定是否把 S3 决策下发到音频。
+        self.execution_paused = False
 
         # 回控应答追踪。设备侧只实现了 rec start / rec stop 两条命令，而"写成功了"与
         # "设备照做了"是两件事：实测这台 CoreS3 上 write() 返回成功、设备却没有任何反应
@@ -322,6 +325,18 @@ class HostState:
         self._last_context: str | None = None
         self._last_event: str | None = None
         self._last_mic_valid: bool | None = None
+
+    # ------------------------------------------------------------------ 演示控制
+
+    def set_execution_paused(self, paused: bool) -> bool:
+        """暂停/继续演示执行端。
+
+        只影响"要不要把 S3 的决策下发到音频"；采集、ASR/LLM、训练数据都不停。
+        面板的暂停按钮与主循环的唯一同步点就是这一个布尔量。
+        """
+        with self.lock:
+            self.execution_paused = bool(paused)
+        return self.execution_paused
 
     # ------------------------------------------------------------------ 连接
 
@@ -717,6 +732,8 @@ class HostState:
             "silent": self.is_silent(now),
             "silence_threshold_ms": SILENCE_THRESHOLD_MS,
             "recording": self.recording,
+            #: 演示控制（2026-10-26）：暂停时执行端已复位，采集与 AI 仍在跑。
+            "execution_paused": bool(self.execution_paused),
             #: Mac 播放与执行端的自报状态。为 None = 本次运行没启用播放器。
             "player": self.player.snapshot() if self.player is not None else None,
             #: 第三方播放器 system EQ 执行端。为 None = 本次运行没启用。
