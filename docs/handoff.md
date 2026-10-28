@@ -57,9 +57,18 @@
     applied 峰值 2.0–5.0 dB。剩余削波集中在"响歌 + SONG_EQ/quiet"与
     "音乐漏音被标成 speech → EXTERNAL_VOICE_INTENT"（12% 帧）——见下一步。
 - 当前在线：D50+D51 固件 + 新 systemeq/host；host 日志 `/tmp/cores3host/host.log`。
-- **下一步（待用户听感）**：① 人声毛刺是否减轻；② 敲击掩蔽是否更弱（headroom 收缩的
-  代价）；③ 若毛刺仍在，优先做"音乐漏音不当作背景人声"（EXTERNAL_VOICE_INTENT 抑制，
-  需要固件+刷机）；键盘掩蔽的帧内瞬态检测（D51 后续）排在后面。
+- **用户听感反馈（2026-10-28 14:33）**：D51+D52 后"好多了，真的好多了"；但"贴键盘掩蔽
+  超级准，放肩膀上（近耳）就不准"，具体是**"敲击时掩蔽太弱 + 节奏对不上"**。
+- **双位置数据（2026-10-28 14:33–14:39，`记录/位置对照/20261028-position-ab.jsonl`）**：
+  贴键盘 keyboard 命中 52%、掩蔽抬 2.6–3.4 dB；肩上命中 15–21%、掩蔽抬 1.2–2.2 dB；
+  肩上情境模型 25–33% 帧判 music（自放漏音），偶发 speech→EXTERNAL_VOICE_INTENT。
+- **D53 已实现并刷机（2026-10-28 14:50）**：帧内 8 子块 HF-crest 检测（≥9 dB = click），
+  1 s 内 ≥2 次 → `typing_active`（保持 300 ms），并入 keyboard_event / non_voice_event；
+  遥测 `typing_active`。离线：noise_analyzer 51/51、controller 128/128、host 94/7950。
+  **待现场验证**：肩上打字时 typing_active 占比、键盘掩蔽抬升、听感（稳/够不够）。
+- **下一步**：① 肩上位听感验证（当前录制）；② 若仍偏弱 → 调 D48 键盘掩蔽幅度/攻击时间；
+  ③ "音乐漏音不当作背景人声"（EXTERNAL_VOICE_INTENT 抑制）——建议加 host→S3 `music on|off`
+  控制行（S3 不知道音乐是自己放的）；④ A0 真人对话验收仍未做。
  
 ## 最新补充：千问接口切换（2026-10-26）
 - 分支 `feature/apple-conversation-awareness`；千问轮改动已于 10-26 提交，HEAD 见 `git log`。

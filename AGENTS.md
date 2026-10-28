@@ -9,9 +9,9 @@ CoreS3 = AI OWS 耳机仓（端侧感知/决策）；Mac = 播放器与原型执
 **不做**：降噪、音频回传注入（D2/D3）；不宣称目标人声增强、双耳原始麦流、声学 DOA/波束（D36）。
 
 ## 当前状态（2026-10-28；详情以 `docs/handoff.md` 为准）
-- 分支 `feature/apple-conversation-awareness`；工作树按"固件 / 上位机 / 文档"分层提交（HEAD 见 `git log`）；远端尚未 push（origin 仍停在 `66cdbd9`）。设备已连、已刷 D50+D51。
-- 最新：D47 双麦取数（只遥测）；D48 键盘/普通噪声特殊掩蔽；D49 对话/背景人声证据必须过事件层 speech（已刷机，听感验收待做）；D50 LLM 迟到否决回写 S3 快路径（`dialog no|yes`，已刷机；**只回写 llm_veto**，local_veto 会误锁快路径）；D51 未确认预判不压平 EQ；D52 歌曲清晰度预算（systemeq 输出削波计量 + 自适应 headroom）。
-- 待办：TODOS **A0**（D40 真人对话验收，需设备+人）、**A1**（已实现 D50 并已刷机，待真机语义验收）；第 38 项"真实房间本底被判成语音"未修；D47 三态数据未采完、阈值未定；D49/D51 贴耳打字听感复测（D51 已刷机）；D52 人声毛刺听感验收；键盘掩蔽的帧内瞬态检测未做；声纹 self-veto 默认关、实验性（D31）。
+- 分支 `feature/apple-conversation-awareness`；工作树按"固件 / 上位机 / 文档"分层提交（HEAD 见 `git log`）；远端尚未 push（origin 仍停在 `66cdbd9`）。设备已连、已刷 D50+D51+D53。
+- 最新：D47 双麦取数（只遥测）；D48 键盘/普通噪声特殊掩蔽；D49 对话/背景人声证据必须过事件层 speech（已刷机，听感验收待做）；D50 LLM 迟到否决回写 S3 快路径（`dialog no|yes`，已刷机；**只回写 llm_veto**，local_veto 会误锁快路径）；D51 未确认预判不压平 EQ；D52 歌曲清晰度预算（systemeq 输出削波计量 + 自适应 headroom）；D53 肩上位置的键盘掩蔽改由帧内瞬态（`typing_active`）触发。
+- 待办：TODOS **A0**（D40 真人对话验收，需设备+人）、**A1**（已实现 D50 并已刷机，待真机语义验收）；第 38 项"真实房间本底被判成语音"未修；D47 三态数据未采完、阈值未定；D49/D51 贴耳打字听感复测（D51 已刷机）；D52 人声毛刺听感验收（已明显好转）；D53 肩上打字掩蔽听感验收；声纹 self-veto 默认关、实验性（D31）。
 
 ## 关键文件（按需读，不要整篇扫）
 - `main/conversation_awareness.{hpp,cpp}` — 预判对话状态机（D16/D40）
@@ -21,7 +21,7 @@ CoreS3 = AI OWS 耳机仓（端侧感知/决策）；Mac = 播放器与原型执
 - `tools/host/` — 上位机（`__main__.py` 入口，`assistant.py` ASR/LLM，`state.py` 快照，`memo.py` 账本，`web/` 面板）；`tools/player/` — Swift 实时 24 段 EQ
 - `test/*_test.cpp`（ctest）、`tools/host/tests/test_host.py`、`tools/host/tests/render_check.js`
 - `tools/{build.sh,flash.sh,monitor.sh,host_up.sh,free_port.sh,record_from_device.py}`
-- 索引：`docs/INDEX.md`（先看，含归档级标记与已知矛盾）；口径：`docs/product-alignment.md`；状态：`docs/plan-status.md`（只看状态表/下一步）；决策：`docs/decisions.md` 按 D 编号 grep（最新 D52）
+- 索引：`docs/INDEX.md`（先看，含归档级标记与已知矛盾）；口径：`docs/product-alignment.md`；状态：`docs/plan-status.md`（只看状态表/下一步）；决策：`docs/decisions.md` 按 D 编号 grep（最新 D53）
 
 ## 构建 / 测试（改完先跑）
 ```bash

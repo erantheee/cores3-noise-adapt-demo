@@ -1635,3 +1635,46 @@ FLAT 只占 4%（D49 前耳边 47%）、conversation 从不 LIKELY、媒体全�
 
 **文件**：`tools/systemeq/systemeq.swift`、`tools/host/systemeq.py`、构建产物
 `tools/systemeq/systemeq`；数据 `记录/位置对照/20261028-d49-ear-typing.jsonl`。
+
+
+---
+
+## D53 · 2026-10-28 肩上/近耳位置：帧内键盘瞬态驱动"正在打字"掩蔽
+
+**背景**：用户听感"贴键盘掩蔽超级准；放肩膀上/近耳就不准"，并明确是
+**"敲击时掩蔽不够/太弱 + 节奏对不上"**。双位置现场数据
+（`记录/位置对照/20261028-position-ab.jsonl`，300 s，10 Hz）：
+
+| | 贴键盘（S3 离键 1–3 cm，过度测量） | 肩上/近耳（10–30 cm，真实听音点） |
+|---|---|---|
+| 电平 | -40.5 dBFS | -44.2 dBFS（低 4 dB） |
+| `event=keyboard` 命中 | 52% | **15–21%** |
+| 键盘掩蔽 1–3.4 kHz 抬升 | 2.6–3.4 dB | **1.2–2.2 dB** |
+| 情境模型 `music` | ~0% | **25–33%**（自放漏音） |
+
+根因：D48 键盘掩蔽只认 1 s 事件窗的 `keyboard` 类。贴着噪声源时命中率高显得"准"；
+回到听音点，键盘低 4 dB、命中率掉到 15–21%，掩蔽又弱又断续（"节奏对不上"）。
+
+**离线标定（设备录音，16 kHz）**：帧内 8 子块（5.3 ms）的一阶差分（HF 加权）能量，
+"最响子块 / 中位子块" 的 dB 差（hf_crest）能分开打字与停手：
+肩上打字 p90≈6 dB、点击帧 9–15 dB；停手/纯音乐 p90≈4 dB。
+
+**决定**：
+
+1. `NoiseAnalyzer::analyze()` 新增帧内瞬态检测：`hf_crest_db`（只上报）与
+   `click_transient = hf_crest >= 9 dB`。2048 样本分 8 子块，一阶差分能量取最响/中位。
+2. app_main：1 s 窗口（10 拍）≥2 次点击 → `typing_active`，再保持 300 ms 跨击键间隙；
+   `typing_active` 并入 `keyboard_event`（驱动 D48 键盘掩蔽）与 `non_voice_event`
+   （敲击瞬态不累计对话证据），与 1 s 事件分类器互为补充。
+3. 遥测追加 `typing_active`（不涨 schema；旧固件缺键 = None）。
+
+**不做**：不改 D48 的掩蔽幅度与 400/1200 ms 平滑（先验证"触发可靠性"）；不改事件
+分类器；不加宽滤波带宽（D52 教训）。
+
+**验证（离线）**：C++ 12/12（noise_analyzer 51/51：稳态/静音不触发、帧内 2 ms HF
+瞬态触发、瞬态不误判 mic 失效；controller 128/128）；host 94 组 / 7950 断言。
+**已刷机（2026-10-28 14:50）**，待现场验证：肩上打字时 `typing_active` 占比、键盘掩蔽
+抬升、听感（掩蔽是否变稳/够强）。
+
+**文件**：`main/{controller.hpp,controller.cpp,app_main.cpp}`、
+`test/noise_analyzer_test.cpp`、`tools/host/{protocol.py,state.py,tests/test_host.py}`。
