@@ -3585,6 +3585,109 @@ def test_assistant_uses_absolute_sample_offset_for_speakers() -> None:
        "ASR 轮次必须按绝对样本号切分（start_sample + trim_start）")
 
 
+def test_qianwen_cloud_asr_keeps_full_context_and_single_request() -> None:
+    """云端 ASR 不得把一个候选段按 VAD/声纹切成多个短请求。
+
+    2026-10-28 现场：原始 6–7 s WAV 本地可完整识别，但云端前被裁成
+    0.3–1.7 s、再按 self/other 边界拆分后连续 HTTP 400。云端路径必须保留
+    原候选段上下文且只发一次；混合身份降为 unknown，不能伪造归属。
+    """
+    rate = 16000
+    audio = struct.pack("<64000h", *([1200, -1200] * 32000))  # 4 s
+
+    class FakeStdin:
+        def __init__(self) -> None:
+            self.lines: list[str] = []
+
+        def write(self, data: str) -> None:
+            self.lines.append(data)
+
+        def flush(self) -> None:
+            pass
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.stdin = FakeStdin()
+
+    process = FakeProcess()
+    service = AssistantService()
+    service.asr_provider = "qianwen"
+    service._asr_ready = True
+    service._asr_process = process  # type: ignore[assignment]
+    service._select_speech_regions = (  # type: ignore[method-assign]
+        lambda *args: ([(rate, rate * 2)], 1.0, "test")
+    )
+    service._speaker_segments = (  # type: ignore[method-assign]
+        lambda pcm, _rate, _start: [
+            ("self", pcm[:len(pcm) // 2]),
+            ("other", pcm[len(pcm) // 2:]),
+        ]
+    )
+
+    service._dispatch_event(8, 4.0, 1, 0, [], audio, rate, 200_000)
+    eq(len(process.stdin.lines), 1, "一个云端候选段必须只产生一次 ASR 请求")
+    payload = json.loads(process.stdin.lines[0])
+    sent = base64.b64decode(payload["pcm_base64"])
+    # 送 ASR 前会先做一次音量归一（约 -20 dBFS，最多 +18 dB）。断言必须按归一化后
+    # 的 PCM 比较：拿原始 PCM 比会永远失败，反而把"整段上下文"这条真回归掩盖掉。
+    expected, _gain_db = AssistantService._prepare_asr_audio(audio)
+    eq(len(sent), len(audio),
+       "云端 ASR 必须保留完整候选段长度，不能只发送能量 VAD 的窄切片")
+    eq(sent, expected,
+       "云端 ASR 必须发送整段候选（除 ASR 前音量归一外不得裁剪/拆分）")
+    eq(payload.get("speech_seconds"), 1.0,
+       "路由必须把能量 VAD 的有效语音秒数传给 worker（<3 s 才走本机）")
+    request_id = str(payload["id"])
+    eq(service._pending[request_id][2], "unknown",
+       "同段出现 self/other 混合身份时必须降为 unknown")
+    event_id = service._pending[request_id][0]
+    eq(service._pending_events[event_id]["remaining"], 1,
+       "单次云端请求的完成计数必须为 1")
+
+
+def test_local_asr_still_preserves_speaker_segments() -> None:
+    """本地 ASR 没有云端 400 问题，继续逐轮转写以保留说话人结构。"""
+    rate = 16000
+    audio = struct.pack("<32000h", *([1200, -1200] * 16000))  # 2 s
+
+    class FakeStdin:
+        def __init__(self) -> None:
+            self.lines: list[str] = []
+
+        def write(self, data: str) -> None:
+            self.lines.append(data)
+
+        def flush(self) -> None:
+            pass
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.stdin = FakeStdin()
+
+    process = FakeProcess()
+    service = AssistantService()
+    service.asr_provider = "local"
+    service._asr_ready = True
+    service._asr_process = process  # type: ignore[assignment]
+    service._select_speech_regions = (  # type: ignore[method-assign]
+        lambda *args: ([(0, rate * 2)], 2.0, "test")
+    )
+    service._speaker_segments = (  # type: ignore[method-assign]
+        lambda pcm, _rate, _start: [
+            ("self", pcm[:len(pcm) // 2]),
+            ("other", pcm[len(pcm) // 2:]),
+        ]
+    )
+
+    service._dispatch_event(9, 2.0, 1, 0, [], audio, rate, 0)
+    eq(len(process.stdin.lines), 2, "本地 ASR 必须继续按 self/other 轮次转写")
+    labels = {
+        service._pending[str(json.loads(line)["id"])][2]
+        for line in process.stdin.lines
+    }
+    eq(labels, {"self", "other"}, "本地 ASR 请求必须保留说话人标签")
+
+
 def test_llm_ambient_authority_helpers() -> None:
     class NoLlm:
         configured = False
@@ -4035,6 +4138,8 @@ def main() -> int:
         test_assistant_aggregates_speaker_labels_per_turn,
         test_training_writer_records_segment_and_llm_context,
         test_assistant_uses_absolute_sample_offset_for_speakers,
+        test_qianwen_cloud_asr_keeps_full_context_and_single_request,
+        test_local_asr_still_preserves_speaker_segments,
         test_authorization_epoch_advances_after_rolling_cap_then_silence,
         test_assistant_asr_death_falls_back_to_fast_path,
         test_llm_ambient_authority_helpers,

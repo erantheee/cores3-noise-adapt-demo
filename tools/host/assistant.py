@@ -243,6 +243,8 @@ class AssistantService:
                     self._asr_latency_ms.append(asr_latency_ms)
                 transcript = ("" if kind == "transcript_nospeech"
                               else str(message.get("text") or "").strip())
+                backend = str(message.get("backend") or "")
+                fallback_reason = str(message.get("fallback_reason") or "")
                 if kind == "transcript_error":
                     with self._lock:
                         self._asr_error = str(message.get("error") or "转写失败")
@@ -258,6 +260,14 @@ class AssistantService:
                         )
                     else:
                         self._asr_error = ""
+                        if backend == "local":
+                            notes = event.setdefault("asr_notes", [])
+                            assert isinstance(notes, list)
+                            note = ("短/稀疏语音由本机 ASR 优先识别"
+                                    if fallback_reason == "short_sparse"
+                                    else "千问未检出人声，已由本机 ASR 兜底")
+                            if note not in notes:
+                                notes.append(note)
                         if kind == "transcript_nospeech":
                             notes = event.setdefault("asr_notes", [])
                             assert isinstance(notes, list)
@@ -899,7 +909,16 @@ class AssistantService:
             })
             return
 
-        trimmed, trim_start = self._trim_to_speech(audio, rate, regions)
+        # 千问云端 ASR 需要完整的短句上下文。旧路径先按能量 VAD 裁首尾、再按声纹
+        # 边界拆成多次请求；2026-10-28 现场中，原始 6–7 s 片段本地可完整转写，
+        # 裁剪/拆分后的 0.3–1.7 s 请求却连续 HTTP 400。云端路径因此保留整段候选
+        # （正常候选本来就 <=7 s），只在异常超长时才回退到防御性裁剪。
+        max_asr_bytes = int(self._MAX_ASR_SECONDS * rate) * 2
+        cloud_single_pass = self.asr_provider == "qianwen"
+        if cloud_single_pass and len(audio) <= max_asr_bytes:
+            trimmed, trim_start = audio, 0
+        else:
+            trimmed, trim_start = self._trim_to_speech(audio, rate, regions)
         if not trimmed:
             with self._lock:
                 if number >= self._transcript_number:
@@ -952,10 +971,20 @@ class AssistantService:
 
         # trim_start 是相对本段音频的偏移；声纹窗口用的是绝对流样本号。
         # 连续中继里 start_sample 几乎总 >0，漏加它会让所有轮次都归 unknown。
-        segments = self._speaker_segments(trimmed, rate, start_sample + trim_start)
-        labels = sorted({speaker for speaker, _ in segments})
+        speaker_segments = self._speaker_segments(
+            trimmed, rate, start_sample + trim_start
+        )
+        labels = sorted({speaker for speaker, _ in speaker_segments})
+        if cloud_single_pass:
+            # qwen-audio 的一次请求覆盖整个候选段，避免声纹边界制造短/稀疏请求。
+            # 只有整段身份完全一致时才保留身份；混合或 unknown 一律降为 unknown，
+            # 防止为了提高成功率而伪造 self/other 归属。
+            cloud_speaker = self._single_pass_speaker(speaker_segments)
+            segments = [(cloud_speaker, trimmed)]
+        else:
+            segments = speaker_segments
         # 声纹全部 unknown 时 LLM 看不到轮次结构；用停顿切成多轮再送 ASR/LLM。
-        if not labels or labels == ["unknown"]:
+        if not cloud_single_pass and (not labels or labels == ["unknown"]):
             pause_turns = self._split_unknown_turns(
                 trimmed, rate, regions, trim_start
             )
@@ -996,6 +1025,9 @@ class AssistantService:
                     "id": request_id, "rate": rate,
                     "pcm_base64": base64.b64encode(segment_audio).decode("ascii"),
                     "max_new_tokens": max_tokens,
+                    # 云端 worker 用它把短/稀疏片段优先送本机 ASR，避免先制造一次
+                    # qwen-audio HTTP 400；完整语音仍走千问。
+                    "speech_seconds": round(float(speech_s), 3),
                 }
                 with self._asr_write_lock:
                     process.stdin.write(json.dumps(payload) + "\n")
@@ -1134,6 +1166,21 @@ class AssistantService:
             else:
                 merged.append((speaker, pcm))
         return merged or [("unknown", audio)]
+
+    @staticmethod
+    def _single_pass_speaker(segments: list[tuple[str, bytes]]) -> str:
+        """Return a safe coarse identity for one cloud-ASR request.
+
+        A single transcript has no timestamps, so it cannot be truthfully distributed across
+        several voiceprint turns. Preserve identity only when every non-empty slice agrees;
+        otherwise fail closed to ``unknown``.
+        """
+        labels = [speaker for speaker, pcm in segments if pcm]
+        if labels and labels[0] in ("self", "other") and all(
+            speaker == labels[0] for speaker in labels
+        ):
+            return labels[0]
+        return "unknown"
 
     # ------------------------------------------------------------------ 语音证据
 

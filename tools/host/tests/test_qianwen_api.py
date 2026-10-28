@@ -13,9 +13,61 @@ import wave
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from host import qianwen_api as api
 from host.assistant import AssistantService
+import qianwen_asr_worker as asr_worker
 
 
 class QianwenTests(unittest.TestCase):
+    def test_short_sparse_audio_uses_local_before_cloud(self):
+        request = {
+            "id": "short", "rate": 16000,
+            "pcm_base64": base64.b64encode(b"\x01\x00" * 16000).decode(),
+            "speech_seconds": 1.2,
+        }
+        fallback = unittest.mock.Mock()
+        fallback.transcribe.return_value = "这是我的声音"
+        with patch.object(asr_worker, "transcribe") as cloud:
+            result = asr_worker.process_request(
+                request, key="test", model="model", base="https://example.com",
+                fallback=fallback,
+            )
+        self.assertEqual(result["text"], "这是我的声音")
+        self.assertEqual(result["backend"], "local")
+        self.assertEqual(result["fallback_reason"], "short_sparse")
+        cloud.assert_not_called()
+
+    def test_cloud_nospeech_uses_local_fallback(self):
+        request = {
+            "id": "dense", "rate": 16000,
+            "pcm_base64": base64.b64encode(b"\x01\x00" * 64000).decode(),
+            "speech_seconds": 4.0,
+        }
+        fallback = unittest.mock.Mock()
+        fallback.transcribe.return_value = "我也是"
+        with patch.object(asr_worker, "transcribe", side_effect=api.AsrNoSpeech("no speech")):
+            result = asr_worker.process_request(
+                request, key="test", model="model", base="https://example.com",
+                fallback=fallback,
+            )
+        self.assertEqual(result["text"], "我也是")
+        self.assertEqual(result["backend"], "local")
+        self.assertEqual(result["fallback_reason"], "cloud_nospeech")
+
+    def test_local_fallback_failure_preserves_cloud_nospeech(self):
+        request = {
+            "id": "none", "rate": 16000,
+            "pcm_base64": base64.b64encode(b"\x00\x00" * 16000).decode(),
+            "speech_seconds": 1.2,
+        }
+        fallback = unittest.mock.Mock()
+        fallback.transcribe.return_value = None
+        with patch.object(asr_worker, "transcribe", side_effect=api.AsrNoSpeech("no speech")):
+            result = asr_worker.process_request(
+                request, key="test", model="model", base="https://example.com",
+                fallback=fallback,
+            )
+        self.assertEqual(result["type"], "transcript_nospeech")
+        self.assertEqual(result["backend"], "qianwen")
+
     def test_chat_wire_contract(self):
         response = io.BytesIO(json.dumps({"model": api.CHAT_MODEL, "choices": [
             {"finish_reason": "stop", "message": {"content": '{"dialogue":"no"}'}}
