@@ -78,6 +78,7 @@ from host.assistant import AssistantService, _intervals_seconds  # noqa: E402
 from host.training import TrainingWriter  # noqa: E402
 from host.continuous_audio import ContinuousAudioWriter  # noqa: E402
 from host.__main__ import (  # noqa: E402
+    DialogOverrideLink,
     DialogueTurnGate,
     ambient_gate_allows,
     fresh_self_veto,
@@ -2496,6 +2497,60 @@ def test_ambient_gate_llm_only_trigger() -> None:
           "没有任何证据时必须关闭")
 
 
+def test_dialog_override_link() -> None:
+    """A1/D50：LLM/本地迟到否决 → S3 快路径回写（`dialog no|yes [ttl_ms]`）。
+
+    为什么需要：D34 的迟到否决过去只能关 Mac 执行端的环境声，没有通道让 S3 放开快路径。
+    连续电视/播客会把端侧对话态一直顶在 engaged（EQ 压平、D41/D48 掩蔽停摆），
+    LLM 判 no 也纠正不回来。回写纪律：
+      * 只回写**新鲜**否决（age_s <= ttl_s）：过期交给 S3 自己的 TTL 解除（fail-open）；
+      * 同一否决每 5 s 续期一次，不是每拍都刷串口；
+      * 撤销只发一条 yes。
+    """
+    link = DialogOverrideLink()
+    fresh = {"veto": True, "state": "llm_veto", "age_s": 0.2, "ttl_s": 20}
+    eq(link.update(fresh, 0.0), b"dialog no 20000\r\n",
+       "新鲜否决 → dialog no，TTL 与 assistant 判定新鲜期一致")
+    eq(link.update(fresh, 1.0), None, "续期窗口内不重复发（每拍都发会刷串口）")
+    eq(link.update(fresh, 5.5), b"dialog no 20000\r\n",
+       "每 5 s 续期一次，S3 的 TTL 不会在判定仍新鲜时过期")
+
+    # 判定过期：不再续期，并立即撤销——否则 S3 会多压 20 s 的 EQ。
+    stale = {"veto": True, "state": "llm_veto", "age_s": 25.0, "ttl_s": 20}
+    eq(link.update(stale, 6.0), b"dialog yes\r\n", "过期否决要撤销，不能把 EQ 压死")
+    eq(link.update(stale, 7.0), None, "撤销只发一次")
+
+    not_veto = {"veto": False, "state": "llm_confirmed", "age_s": 0.5, "ttl_s": 20}
+    eq(link.update(not_veto, 8.0), None, "从未发过否决时不需要 yes")
+    eq(link.update(fresh, 9.0), b"dialog no 20000\r\n", "重新出现否决 → 再发 no")
+    eq(link.update(not_veto, 10.0), b"dialog yes\r\n", "否决撤销 → yes 提前解除 S3 TTL")
+
+    # 本地否决（无有效语音）也回写；LLM 未配置的授权没有 age/ttl，仍要撤销旧否决。
+    local = {"veto": True, "state": "local_veto", "age_s": 1.0, "ttl_s": 20}
+    eq(DialogOverrideLink().update(local, 0.0), b"dialog no 20000\r\n",
+       "本地否决也回写 S3 快路径")
+    link2 = DialogOverrideLink()
+    eq(link2.update(local, 0.0), b"dialog no 20000\r\n", "前置：先建立一条否决")
+    eq(link2.update({"veto": False, "state": "not_configured"}, 1.0), b"dialog yes\r\n",
+       "未配置 LLM 的授权没有 age/ttl，但仍要撤销上一条否决")
+
+    # 协议：`dialog_veto` 是追加可选键；缺字段 = 旧固件（None），不能默认成 False。
+    base = {
+        "type": "earbud_command", "schema": 4, "sequence": 1, "timestamp_ms": 100,
+        "speech_gain_db": 0.0, "external_voice_gain_db": 0.0, "media_percent": 100,
+        "state": "OBSERVING", "environment": "quiet", "confidence": 0.5,
+        "link": "simulated",
+    }
+    frame = parse_line(json.dumps(dict(base, dialog_veto=True))).value
+    check(frame is not None and frame.dialog_veto is True, "dialog_veto=true 要解析进帧")
+    old = parse_line(json.dumps(base)).value
+    check(old is not None and old.dialog_veto is None,
+          "旧固件没有 dialog_veto：必须是 None，不能猜成 False")
+    state = HostState(source="mock")
+    state.feed_line(json.dumps(dict(base, dialog_veto=True)))
+    eq(state.snapshot()["frame"]["dialog_veto"], True, "快照要带 dialog_veto")
+
+
 def test_relay_ambient_gate() -> None:
     """环境声走 S3 中继（当前 demo 路径）：门控必须真的拦住/放行，且状态可读。
 
@@ -3933,6 +3988,7 @@ def main() -> int:
         test_voiceprint_energy_activity_fallback,
         test_ambient_executor_and_intent_parsing,
         test_ambient_gate_llm_only_trigger,
+        test_dialog_override_link,
         test_relay_ambient_gate,
         test_audio_relay_budget_caps_backlog,
         test_relay_measures_real_queue_depth_not_our_writes,

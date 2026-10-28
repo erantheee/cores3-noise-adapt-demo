@@ -245,6 +245,10 @@ class CommandFrame:
     voiceprint_valid: bool | None = None
     voiceprint_self: bool | None = None
     voiceprint_age_ms: int | None = None
+    #: A1/D50：本拍是否处于 host `dialog no` 的 TTL 内（设备侧回写确认）。None = 这一帧
+    #: 没报（D49 及更早的固件没有这个键）。它是"迟到否决有没有到设备"的现场证据，
+    #: 也是判断设备固件是否已带 A1 的唯一协议依据。
+    dialog_veto: bool | None = None
     schema_version: int = SCHEMA_VERSION
     #: 越界或无法解释的字段说明。空表示这一帧通过了全部校验。
     problems: tuple[str, ...] = ()
@@ -446,6 +450,9 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
     raw_voiceprint_self = payload.get("voiceprint_self")
     voiceprint_self = raw_voiceprint_self if isinstance(raw_voiceprint_self, bool) else None
     voiceprint_age_ms = _as_int(payload, "voiceprint_age_ms")
+    # A1/D50：设备是否正处于 host `dialog no` 的 TTL 内。缺字段 = 旧固件（没报）。
+    raw_dialog_veto = payload.get("dialog_veto")
+    dialog_veto = raw_dialog_veto if isinstance(raw_dialog_veto, bool) else None
 
     missing = [
         name
@@ -683,6 +690,7 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
             voiceprint_valid=voiceprint_valid,
             voiceprint_self=voiceprint_self,
             voiceprint_age_ms=voiceprint_age_ms,
+            dialog_veto=dialog_veto,
             schema_version=schema,
         ),
         json_line=True,

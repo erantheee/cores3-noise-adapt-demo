@@ -174,6 +174,60 @@ def llm_ambient_authorization(assistant) -> dict:
     return dict(authorize())
 
 
+#: A1/D50：host→S3 迟到否决回写的 TTL 与续期间隔。
+#: TTL 对齐 assistant 的判定新鲜期（`_DECISION_TTL_S` = 20 s）；续期取 1/4，host 每拍
+#: 看到新鲜否决就重发，判定过期/撤销后下发 `dialog yes` 提前解除。
+DIALOG_VETO_TTL_MS = 20000
+DIALOG_VETO_REFRESH_S = 5.0
+
+
+class DialogOverrideLink:
+    """把 LLM/本地的迟到否决回写到 S3 快路径（A1/D50，控制行 `dialog no|yes`）。
+
+    为什么需要它：D34 把 LLM 定位成"迟到否决"，但过去只能关 Mac 执行端的
+    `ambient_open`，没有通道让 S3 自己放开快路径。连续电视/播客会让端侧对话态一直
+    engaged（EQ 压平、D41/D48 掩蔽停摆），即使 LLM 判 `dialogue=no` 也纠正不回来。
+
+    只回写**新鲜**的否决（`age_s <= ttl_s`）：过期后停止续期，交给 S3 的 TTL 自己
+    解除（fail-open 回 D16 预判）——host 崩了或串口断了也不会把 EQ 永久压平。
+    """
+
+    def __init__(self, ttl_ms: int = DIALOG_VETO_TTL_MS,
+                 refresh_s: float = DIALOG_VETO_REFRESH_S) -> None:
+        self.ttl_ms = int(ttl_ms)
+        self.refresh_s = float(refresh_s)
+        self._sent = False
+        self._sent_at = 0.0
+
+    def update(self, authorization: dict, now: float) -> bytes | None:
+        """返回这一拍该发给 S3 的控制行（bytes）；没有变化时返回 None。"""
+        age = authorization.get("age_s")
+        ttl_s = authorization.get("ttl_s")
+        fresh = (
+            isinstance(age, (int, float))
+            and isinstance(ttl_s, (int, float))
+            and 0.0 <= float(age) <= float(ttl_s)
+        )
+        veto = bool(authorization.get("veto")) and fresh
+        if veto:
+            if not self._sent or now - self._sent_at >= self.refresh_s:
+                self._sent = True
+                self._sent_at = now
+                return f"dialog no {self.ttl_ms}\r\n".encode("ascii")
+            return None
+        if self._sent:
+            self._sent = False
+            return b"dialog yes\r\n"
+        return None
+
+    def release(self) -> bytes | None:
+        """退出/串口断开时撤销尚未过期的否决（没有发过则返回 None）。"""
+        if not self._sent:
+            return None
+        self._sent = False
+        return b"dialog yes\r\n"
+
+
 class DialogueTurnGate:
     """要求 self/other 轮次证据，避免单个环境人声把通透模式顶开。
 
@@ -311,6 +365,10 @@ class DeviceWriter:
     def send_voiceprint(self, verdict: str, score: float) -> None:
         """把 WavLM 的 self/other 判定回传给 S3（纯文本控制行）。"""
         self(f"voiceprint {verdict} {float(score):.2f}\n".encode("ascii"))
+
+    def send_dialog(self, line: bytes) -> None:
+        """把迟到否决回写发给 S3（A1/D50 的 `dialog no|yes [ttl_ms]` 控制行）。"""
+        self(line)
 
 
 def parse_earphone(raw: str) -> Earphone:
@@ -740,6 +798,9 @@ def main(argv: list[str] | None = None) -> int:
         state.attach_voiceprint(voiceprint)
     broadcaster = Broadcaster(state)
     writer = DeviceWriter()
+    #: A1/D50：LLM/本地迟到否决 → S3 快路径的回写通道（`dialog no|yes`）。定义在
+    #: writer 旁边，下面的 on_close/cleanup 才能安全地撤销否决。
+    dialog_link = DialogOverrideLink()
 
     def send_voiceprint_off() -> None:
         """尽力告诉设备「声纹判定已失效」，避免它沿用上一轮判定。
@@ -792,7 +853,14 @@ def main(argv: list[str] | None = None) -> int:
 
         def _detach_writer() -> None:
             # 串口断开/退出前尽力告诉设备判定已失效，再把回控句柄摘掉（顺序不能反）。
+            # A1/D50：尚未过期的 S3 快路径否决也要撤销，否则退出后 EQ 会被压平到 TTL 结束。
             send_voiceprint_off()
+            try:
+                line = dialog_link.release()
+                if line is not None:
+                    writer(line)
+            except (RuntimeError, OSError):
+                pass
             writer.detach()
 
         source.on_open = _attach_writer
@@ -1200,6 +1268,29 @@ def main(argv: list[str] | None = None) -> int:
                                                 base_gain=base_gain)
             else:
                 player_service.apply_decision(bands, media_target)
+        # A1/D50：把 LLM/本地的迟到否决回写 S3 快路径。**与执行端配置无关**——
+        # 默认 `--ambient-executor off` 的演示最需要它：环境声本来就关着，但 S3 的
+        # 对话态会把歌曲 EQ 压平、把 D41/D48 的掩蔽停掉，LLM 的 no 必须能纠正快路径。
+        if (
+            not execution_paused
+            and can_control
+            and assistant_configured
+            and writer.available
+        ):
+            try:
+                line = dialog_link.update(
+                    llm_ambient_authorization(assistant), time.monotonic()
+                )
+                if line is not None:
+                    writer(line)
+                    state.note_control_sent(
+                        "dialog no（LLM 迟到否决 → S3 快路径释放）"
+                        if line.startswith(b"dialog no")
+                        else "dialog yes（撤销 S3 快路径否决）"
+                    )
+            except (RuntimeError, OSError):
+                # 串口刚断开：回写不是关键路径，下一拍重试，不阻断主循环。
+                pass
         if ambient is not None and not execution_paused:
             # S3 的 ambient_open 意图 → 执行端（relay 门控 / AirPods 聆听模式）。安全规则：
             #   * 旧固件（v4 之前）不报 ambient_open → 当成"不开放"，不猜；
