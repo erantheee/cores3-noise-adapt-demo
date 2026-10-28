@@ -1271,6 +1271,18 @@ S3 快路径**，而 S3 的预判只看"附近像人声"（视频/旁人说话�
 误判直接决定开门时机，先按"多等 1–2 s 也不误开"取舍。`llm` 门更稳但更慢。这不是最终产品
 形态——最终要靠 `ignore / exchange / conversation` 三态与 addressee 证据（D41 提到的方向）。
 
+**2026-10-26 晚更新（用户现场口径）：环境声只由 LLM 语义确认放行。**
+现场复现 `device_intent` 与 `dual_turn` 都会在**单人独白 / 背景人声**时把环境声误开：
+① 固件 event/vl 在"近场语音 + 音乐"下把语音错判成 keyboard/wind，S3 意图短暂误发；
+② 声纹把一个人连续说话切成 self+other 假交替（dual_turn 误触）。LLM 的 `dialogue=yes`
+（要求 self+other 有语义轮次）是唯一能区分"对话"与"独白/背景"的信号，所以
+`ambient_gate_allows()` 改为**只认新鲜的 `llm_confirmed`**；`llm_veto` 仍最高优先。
+快触发（S3 意图 / self / dual_turn）**仍驱动媒体下压的门栓**（`engagement_latch`、
+`dual_turn_open` 分支不变），只是不再开环境声——`--ambient-gate voice` 与 `llm` 的差别
+现在只剩"媒体下压能否由 self/声纹交替快速放行"。代价：环境声开门延迟 = LLM 往返
+约 5–10 s（准确优先于速度，本轮用户口径）。验证：host 93 组 / 7932 断言锁定门语义；
+真机"背景人声不再误开环境声"待设备在场复测。
+
 **文件**：`tools/host/__main__.py`（执行门/门栓/self 不回传）、`README.md`、
 `docs/plan-status.md`。
 

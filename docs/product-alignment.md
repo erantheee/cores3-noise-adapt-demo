@@ -61,9 +61,12 @@ Mac（播放器与原型执行器）
 - `--ambient-executor` 可选 `off` / `relay` / `airpods`；**真机默认 `off`**（D30）。
 - `airpods` 只对 TWS 有效（AX 切聆听模式）；OWS 耳夹物理开放、没有聆听模式，`ambient_open`
   在 OWS 上退为意图/遥测 + 中继门控（D35）。
-- **执行门（D42，demo）**：`--ambient-gate voice` 下，只有 voiceprint 判 `self`（佩戴者接话）
-  或 LLM 确认对话才真正执行 `ambient_open`；背景人声只显示意图、不执行（门栓 2.5 s）。
-  门只拦执行，不拦 S3 的媒体下压与 EQ。
+- **执行门（D42；2026-10-26 晚触发源收窄）**：`--ambient-gate voice|llm` 下，只有**新鲜的
+  LLM 语义确认**（`dialogue=yes`）才真正执行 `ambient_open`；S3 意图、voiceprint `self`、
+  声纹双向交替都**不再开环境声**（现场实测会误开：固件 event/vl 把近场语音错判成
+  keyboard/wind、单人连续说话被声纹切成 self+other 假交替）。`self`/交替证据仍驱动**媒体
+  下压门栓**（`voice` 门比 `llm` 门更快让位）；背景人声只显示意图、不执行。代价：环境声
+  开门延迟 = LLM 往返约 5–10 s（准确优先于速度）。门只拦执行，不拦 S3 的媒体下压与 EQ。
 - 没有 Mac 执行回执前，协议固定报 `execution: decision_only`。
 
 ## 延迟口径（已实测）

@@ -84,6 +84,13 @@ CoreS3 承担耳机仓侧的感知、判断与决策；Mac 承担本次 Demo 的
 - 真机验证：背景人声帧为 `EXTERNAL_VOICE_INTENT`、`ambient_open=false`、`opens=0`；
   S3 报 75/86/94% 下压时播放器保持 100%。
 
+**2026-10-26 晚更新（D42 门的触发源收窄）：环境声只由 LLM 语义确认放行。**
+现场复现 S3 意图与声纹双向交替都会在单人独白/背景人声时误开环境声（固件 event/vl 把
+近场语音错判成 keyboard/wind；声纹把一个人连续说话切成 self+other 假交替），
+`ambient_gate_allows` 改为只认新鲜 `llm_confirmed`，`llm_veto` 仍最高优先。S3 意图 / self /
+dual_turn 仍驱动**媒体下压**门栓（`--ambient-gate voice` 比 `llm` 更快让位），但不再开
+环境声。代价：开门延迟 = LLM 往返约 5–10 s（准确优先于速度）。
+
 **同日追加（D44）说话人标签 unknown 修复**：设备端 `voice_likelihood` 只有 0.21 时，
 host 不再给声纹 worker 发 `speech_active=true`，worker 的 `speech_ratio=0` 会在比对分数前
 直接回 unknown。现在声纹加能量兜底（块 RMS 高于近 20 s 本底 +6 dB 也算说话），阈值不动；
