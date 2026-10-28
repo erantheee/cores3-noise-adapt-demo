@@ -249,6 +249,8 @@ class CommandFrame:
     #: 没报（D49 及更早的固件没有这个键）。它是"迟到否决有没有到设备"的现场证据，
     #: 也是判断设备固件是否已带 A1 的唯一协议依据。
     dialog_veto: bool | None = None
+    #: D53：这一拍是否判为"正在打字"（帧内键盘瞬态 + 1 s 窗口）。None = 旧固件没报。
+    typing_active: bool | None = None
     schema_version: int = SCHEMA_VERSION
     #: 越界或无法解释的字段说明。空表示这一帧通过了全部校验。
     problems: tuple[str, ...] = ()
@@ -453,6 +455,9 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
     # A1/D50：设备是否正处于 host `dialog no` 的 TTL 内。缺字段 = 旧固件（没报）。
     raw_dialog_veto = payload.get("dialog_veto")
     dialog_veto = raw_dialog_veto if isinstance(raw_dialog_veto, bool) else None
+    # D53：帧内瞬态判"正在打字"。缺字段 = 旧固件（没报）。
+    raw_typing_active = payload.get("typing_active")
+    typing_active = raw_typing_active if isinstance(raw_typing_active, bool) else None
 
     missing = [
         name
@@ -691,6 +696,7 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
             voiceprint_self=voiceprint_self,
             voiceprint_age_ms=voiceprint_age_ms,
             dialog_veto=dialog_veto,
+            typing_active=typing_active,
             schema_version=schema,
         ),
         json_line=True,

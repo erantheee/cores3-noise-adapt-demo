@@ -2554,6 +2554,17 @@ def test_dialog_override_link() -> None:
     state.feed_line(json.dumps(dict(base, dialog_veto=True)))
     eq(state.snapshot()["frame"]["dialog_veto"], True, "快照要带 dialog_veto")
 
+    # D53：typing_active 也是追加可选键；旧固件缺键必须是 None，不能猜 False。
+    typing_frame = parse_line(json.dumps(dict(base, typing_active=True))).value
+    check(typing_frame is not None and typing_frame.typing_active is True,
+          "typing_active=true 要解析进帧")
+    old_frame = parse_line(json.dumps(base)).value
+    check(old_frame is not None and old_frame.typing_active is None,
+          "旧固件没有 typing_active：必须是 None")
+    state2 = HostState(source="mock")
+    state2.feed_line(json.dumps(dict(base, typing_active=True)))
+    eq(state2.snapshot()["frame"]["typing_active"], True, "快照要带 typing_active")
+
 
 def test_relay_ambient_gate() -> None:
     """环境声走 S3 中继（当前 demo 路径）：门控必须真的拦住/放行，且状态可读。

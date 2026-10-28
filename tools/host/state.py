@@ -848,6 +848,8 @@ class HostState:
                 # A1/D50：设备是否处于 host `dialog no` 的 TTL 内。None = 这一帧没报
                 #（D49 及更早的固件）——"没报"和"报了 false"必须分得开。
                 "dialog_veto": frame.dialog_veto,
+                #: D53：设备是否判为"正在打字"（帧内瞬态）。None = 旧固件没报。
+                "typing_active": frame.typing_active,
                 "context": frame.context,
                 "context_text": context_text(frame.context),
                 "context_score": frame.context_score,
