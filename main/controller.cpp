@@ -471,7 +471,8 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms,
                                     bool non_voice_event,
                                     bool external_self_voice,
                                     bool keyboard_event,
-                                    bool speech_event) {
+                                    bool speech_event,
+                                    bool dialogue_veto) {
     EarbudCommand command;
     command.sequence = ++sequence_;
     command.timestamp_ms = frame.timestamp_ms;
@@ -583,6 +584,10 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms,
         // own_voice 一律不作为对话证据（连同 bone 的失败判据一起）。
         (void)effective;
         evidence.own_voice = 0.0f;
+        // A1/D50：Mac 的迟到否决（`dialog no` TTL 内）。只否决"是不是对话"，噪声/EQ
+        // 继续正常工作——目的是把连续电视/播客误顶起来的 engaged 放回 SONG_EQ，
+        // 让 D41/D48 的掩蔽继续工作，而不是把 EQ 压平。
+        evidence.dialogue_veto = dialogue_veto;
         awareness_out_ = awareness_.update(evidence, dt_ms);
         const conversation::Output& awareness_out = awareness_out_;
         // 对话正在发生（预测中或已确认）都算"进入对话"：EQ 必须保持平直，音乐让位。

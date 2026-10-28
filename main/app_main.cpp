@@ -103,6 +103,18 @@ int64_t g_voiceprint_us = 0;
 /// 3 s 内没有新判定就当作不可用：既用于 self veto，也用于授权过期。
 constexpr int64_t kVoiceprintHoldUs = 3000000;
 
+// ---- Mac 侧迟到否决回写（A1/D50）：`dialog no|yes [ttl_ms]` 控制行 ----
+// 背景：D34 把 LLM 定位成"迟到否决"，但过去 host 只能关执行端的环境声，没有任何
+// 通道回写 S3 的快路径。连续电视/播客会让端侧对话态一直 engaged（EQ 压平、掩蔽
+// 停摆），LLM 判 no 也纠正不回来。host 现在在 llm_veto/local_veto 时下发
+// `dialog no <ttl_ms>`，S3 在 TTL 内强制释放对话态；LLM 确认/否决过期时下发
+// `dialog yes` 提前撤销。TTL 只在控制任务里读，不跨任务共享策略。
+int64_t g_dialog_veto_until_us = 0;
+/// host 未给 ttl 时的默认持有时间：与上位机 `_DECISION_TTL_S`（20 s）对齐。
+constexpr int64_t kDialogVetoDefaultTtlMs = 20000;
+/// 上限：防御坏行把对话态锁死太久。
+constexpr int64_t kDialogVetoMaxTtlMs = 120000;
+
 /// Emit one frame of EarbudCommand v4.
 ///
 /// v3 adds the own-voice evidence (`own_voice_confidence` / `own_voice_correlation` /
@@ -133,6 +145,9 @@ void emit_command_json(const EarbudCommand& command) {
                             kVoiceprintHoldUs);
     const long voiceprint_age_ms =
         voiceprint_age_us >= 0 ? static_cast<long>(voiceprint_age_us / 1000) : -1L;
+    // A1/D50：host 的迟到否决（`dialog no`）TTL 是否还在。只读判断，过期不需要清理。
+    const bool dialog_veto_active =
+        g_dialog_veto_until_us > 0 && esp_timer_get_time() < g_dialog_veto_until_us;
     std::printf("{\"type\":\"earbud_command\",\"schema\":%lu,\"sequence\":%lu,"
                 "\"timestamp_ms\":%lu,\"speech_gain_db\":%.2f,"
                 "\"external_voice_gain_db\":%.2f,\"media_percent\":%u,"
@@ -156,6 +171,10 @@ void emit_command_json(const EarbudCommand& command) {
                 // self = 当前 verdict，age_ms = -1 表示从未收到。
                 "\"voiceprint_valid\":%s,\"voiceprint_self\":%s,"
                 "\"voiceprint_age_ms\":%ld,"
+                // A1/D50（追加可选键，不涨 schema）：本拍是否处于 host `dialog no`
+                // 的 TTL 内。它是"host 的迟到否决有没有到设备"的唯一现场证据，
+                // 也是固件版本推断依据（D49 及更早的固件没有这个键）。
+                "\"dialog_veto\":%s,"
                 "\"execution\":\"decision_only\",\"link\":\"simulated\","
                 "\"eq_gain_db\":[",
                 static_cast<unsigned long>(command.schema_version),
@@ -192,7 +211,8 @@ void emit_command_json(const EarbudCommand& command) {
                 evidence_policy_name(command.evidence_policy),
                 voiceprint.active ? "true" : "false",
                 g_voiceprint_self ? "true" : "false",
-                voiceprint_age_ms);
+                voiceprint_age_ms,
+                dialog_veto_active ? "true" : "false");
     for (std::size_t band = 0; band < kBandCount; ++band) {
         std::printf("%s%.1f", band == 0 ? "" : ",", static_cast<double>(command.eq_gain_db[band]));
     }
@@ -409,6 +429,30 @@ bool poll_console_command() {
                                 static_cast<double>(score));
                     handled = true;
                 voiceprint_done:;
+                } else if (std::strncmp(g_console_line, "dialog ", 7) == 0) {
+                    // A1/D50：host 的迟到否决回写。`dialog no [ttl_ms]` 在 TTL 内强制
+                    // 释放对话态（控制器每拍读 g_dialog_veto_until_us）；`dialog yes`
+                    // 提前撤销。ttl 缺省用上位机同款 20 s，上限 120 s 防御坏行。
+                    // 非 JSON ack：host 的协议解析器会忽略它，monitor 能看到。
+                    const char* value = g_console_line + 7;
+                    if (std::strncmp(value, "no", 2) == 0) {
+                        long ttl_ms = 0;
+                        const int parsed = std::sscanf(value + 2, "%ld", &ttl_ms);
+                        if (parsed != 1 || ttl_ms <= 0) {
+                            ttl_ms = static_cast<long>(kDialogVetoDefaultTtlMs);
+                        }
+                        if (ttl_ms > kDialogVetoMaxTtlMs) {
+                            ttl_ms = static_cast<long>(kDialogVetoMaxTtlMs);
+                        }
+                        g_dialog_veto_until_us =
+                            esp_timer_get_time() + static_cast<int64_t>(ttl_ms) * 1000;
+                        std::printf("dialog ack no %ld\n", ttl_ms);
+                        handled = true;
+                    } else if (std::strncmp(value, "yes", 3) == 0) {
+                        g_dialog_veto_until_us = 0;
+                        std::printf("dialog ack yes\n");
+                        handled = true;
+                    }
                 } else if (std::strcmp(g_console_line, "route offline") == 0) {
                     g_mac_route.mac_connected = false;
                     g_mac_route.audio_output_active = false;
@@ -923,9 +967,13 @@ void processing_task(void*) {
             evaluate_voiceprint(g_voiceprint_valid, g_voiceprint_self,
                                 now_us - g_voiceprint_us, kVoiceprintHoldUs);
         const bool external_self_voice = voiceprint.self_voice;
+        // A1/D50：host 的 `dialog no` TTL 内强制释放对话态。只否决策略里的"是不是
+        // 对话"；噪声/EQ/掩蔽照常。TTL 过期后自动恢复端侧预判（fail-open 到 D16），
+        // 不依赖 host 再发一条 yes——host 崩了也不会把 EQ 永久压平。
+        const bool dialog_veto = g_dialog_veto_until_us > 0 && now_us < g_dialog_veto_until_us;
         EarbudCommand command =
             controller.update(frame, elapsed_ms, non_voice_event, external_self_voice,
-                              keyboard_event, speech_event);
+                              keyboard_event, speech_event, dialog_veto);
         command.event.valid = sound_event_out.valid;
         command.event.class_name = sound_event::class_name(sound_event_out.cls);
         const int64_t decide_done_us = esp_timer_get_time();

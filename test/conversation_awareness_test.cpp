@@ -287,6 +287,49 @@ int main() {
               "shorter hold leaves the conversation sooner");
     }
 
+    // 16. Mac 迟到否决回写（A1/D50）：`dialog no` TTL 内强制释放对话态。
+    {
+        conversation::Awareness awareness;
+        auto engaged = feed(awareness, 0.9f, 10);
+        check(engaged.engaged, "precondition: sustained cue engages");
+        check(engaged.ambient_open, "precondition: engaged opens the environment");
+        check(engaged.media_percent < 65.0f, "precondition: engaged ducks the media");
+
+        // 否决的第一拍就离开 engaged（进 releasing），环境声意图立刻关闭。
+        conversation::Evidence veto = evidence(0.9f);
+        veto.dialogue_veto = true;
+        auto released = awareness.update(veto, kDt);
+        check(released.state == conversation::State::releasing,
+              "dialog veto releases an engaged conversation immediately");
+        check(!released.ambient_open, "dialog veto closes the environment intent at once");
+
+        // TTL 内**持续**有对话证据（连续电视/播客）也不能重新确认——这是本功能的核心：
+        // 现场同一个说话人连续说，取消一次否决后下一拍就会被顶回去，否决就失效了。
+        conversation::Output held;
+        for (int i = 0; i < 20; ++i) held = awareness.update(veto, kDt);
+        check(held.state == conversation::State::idle,
+              "a sustained veto keeps the conversation released");
+        check(!held.engaged && !held.ambient_open,
+              "sustained speech cannot re-engage during the veto");
+        check(held.media_percent > 99.0f, "media returns to 100% during the veto");
+
+        // 撤销否决后，端侧预判恢复：重新走 0.5 s 预下压 / 0.8 s 确认。
+        auto recovered = feed(awareness, 0.9f, 9);
+        check(recovered.engaged, "clearing the veto restores the local fast path");
+    }
+    {
+        // 否决先到、对话证据后到：TTL 内连预测都不该开始。
+        conversation::Awareness awareness;
+        conversation::Evidence veto = evidence(0.9f);
+        veto.dialogue_veto = true;
+        conversation::Output out;
+        for (int i = 0; i < 20; ++i) out = awareness.update(veto, kDt);
+        check(out.state == conversation::State::idle,
+              "a veto keeps a new conversation from being predicted");
+        check(!out.ambient_open, "a veto keeps the environment closed");
+        check(out.media_percent > 99.0f, "a veto leaves the media alone");
+    }
+
     std::cout << "\nconversation_awareness: " << passed << " passed, " << failed << " failed\n";
     return failed == 0 ? 0 : 1;
 }

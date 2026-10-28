@@ -584,6 +584,43 @@ int main() {
               "wind EQ leaves low-band cuts untouched (only lifts are reduced)");
     }
 
+    // ---- 17. A1/D50：Mac 迟到否决回写（dialog no TTL 内强制释放对话态）----
+    {
+        AdaptController dialogue;
+        EarbudCommand engaged;
+        for (int i = 0; i < 20; ++i) {
+            engaged = dialogue.update(frame(-38, 0.9f), 100, false, false, false,
+                                      /*speech_event=*/true);
+        }
+        check(engaged.media_percent <= 61, "precondition: sustained speech engages the fast path");
+        check(engaged.ambient_open, "precondition: engaged opens the environment intent");
+        check(engaged.tuning_mode == TuningMode::flat, "precondition: engaged keeps the song EQ flat");
+
+        // 否决后：连续证据继续喂，也必须保持释放——否则电视/播客会把状态机顶回去。
+        EarbudCommand after_veto;
+        for (int i = 0; i < 30; ++i) {
+            after_veto = dialogue.update(frame(-38, 0.9f), 100, false, false, false,
+                                         /*speech_event=*/true, /*dialogue_veto=*/true);
+        }
+        check(!after_veto.ambient_open, "dialog veto closes the ambient intent");
+        check(after_veto.conversation != ConversationState::likely,
+              "dialog veto releases the conversation state");
+        check(after_veto.media_percent >= 99, "media returns to 100% under the veto");
+        check(after_veto.tuning_mode == TuningMode::external_voice_intent,
+              "background voice falls back to masking (EXTERNAL_VOICE_INTENT) under the veto");
+        check(after_veto.external_voice_gain_db > 0.0f,
+              "masking still raises the song under the veto");
+
+        // 撤销否决：端侧预判重新生效（0.8 s 连续证据）。
+        EarbudCommand restored;
+        for (int i = 0; i < 12; ++i) {
+            restored = dialogue.update(frame(-38, 0.9f), 100, false, false, false,
+                                       /*speech_event=*/true, /*dialogue_veto=*/false);
+        }
+        check(restored.ambient_open, "clearing the veto restores the local fast path");
+        check(restored.media_percent <= 61, "the restored conversation ducks the media again");
+    }
+
     check(std::string(adapt_state_name(AdaptState::adjusting)) == "ADJUSTING",
           "state names are stable protocol values");
     check(std::string(conversation_state_name(ConversationState::anticipating)) == "ANTICIPATING",

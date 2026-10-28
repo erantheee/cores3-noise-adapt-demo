@@ -347,7 +347,8 @@ public:
                          bool non_voice_event = false,
                          bool external_self_voice = false,
                          bool keyboard_event = false,
-                         bool speech_event = false);
+                         bool speech_event = false,
+                         bool dialogue_veto = false);
     void reset();
 
     /// 最近一次对话感知输出。工具与测试用它读 own_voice / 状态 / 已下压时长，
