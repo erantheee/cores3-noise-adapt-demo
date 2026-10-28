@@ -61,6 +61,11 @@ let aggressiveBaseDb: [Float] = [
 /// 最终每段增益的上下界。用户明确不关心削波，所以放宽到 ±24 dB；
 /// 仍保留一个界是为了避免极端输入把 EQ 参数推到非法值。
 let maxAppliedGainDb: Float = 24.0
+//: 正增益**总**上限（2026-10-28 现场"人声毛刺"）：base 曲线 + 内容曲线 + D48 掩蔽
+//: 叠加后，presence 段实测 applied 峰值到 5.7–6.4 dB，而且是 0.3 oct 窄带。
+//: 掩蔽要靠"事件期间的时间门控"，不该靠无上限的静态抬升——静态抬到 6 dB 的代价
+//: 就是人声毛刺。这里给正增益一个总预算；负增益（去糊/削减）不受限。
+let maxBoostDb: Float = 5.0
 
 func emit(_ object: [String: Any]) {
     guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
@@ -235,6 +240,62 @@ final class Meter: @unchecked Sendable {
             let rms = state.frames > 0 ? sqrt(state.sumSquares / Double(state.frames)) : 0
             return (state.callbacks, state.frames, rms, state.peak)
         }
+    }
+}
+
+/// EQ **之后**的输出计量（2026-10-28）：确认"毛刺"是不是削波时，必须量 EQ 之后的
+/// 信号；tap 的 `Meter` 在 EQ 之前，EQ 抬了多少它看不到。`take()` 读走并清零窗口，
+/// 供 50 ms 控制拍做 headroom 预算；累计量留给状态上报。
+final class OutMeter: @unchecked Sendable {
+    private struct State {
+        var peak = 0.0
+        var clipFrames = 0
+        var frames = 0
+        var totalPeak = 0.0
+        var totalClipFrames = 0
+        var totalFrames = 0
+    }
+    private let lock = OSAllocatedUnfairLock(initialState: State())
+
+    func add(_ buffer: AVAudioPCMBuffer) {
+        guard let channels = buffer.floatChannelData else { return }
+        let frames = Int(buffer.frameLength)
+        let channelCount = Int(buffer.format.channelCount)
+        guard frames > 0, channelCount > 0 else { return }
+        var peak = 0.0
+        var clip = 0
+        for channel in 0..<channelCount {
+            let samples = channels[channel]
+            for index in 0..<frames {
+                let magnitude = abs(Double(samples[index]))
+                if magnitude > peak { peak = magnitude }
+                if magnitude >= 1.0 { clip += 1 }
+            }
+        }
+        let samples = frames * channelCount
+        lock.withLockUnchecked { state in
+            state.peak = max(state.peak, peak)
+            state.clipFrames += clip
+            state.frames += samples
+            state.totalPeak = max(state.totalPeak, peak)
+            state.totalClipFrames += clip
+            state.totalFrames += samples
+        }
+    }
+
+    /// 读走当前窗口（峰值、削波样本数）并清零。
+    func take() -> (peak: Double, clipFrames: Int) {
+        lock.withLockUnchecked { state in
+            let result = (state.peak, state.clipFrames)
+            state.peak = 0
+            state.clipFrames = 0
+            state.frames = 0
+            return result
+        }
+    }
+
+    func totals() -> (peak: Double, clipFrames: Int, frames: Int) {
+        lock.withLockUnchecked { ($0.totalPeak, $0.totalClipFrames, $0.totalFrames) }
     }
 }
 
@@ -922,6 +983,10 @@ for (index, center) in bandCenters.enumerated() {
     let band = eq.bands[index]
     band.filterType = .parametric
     band.frequency = center
+    // 0.30 oct：24 段是 1/3 oct 间隔，0.30 oct 的带宽让相邻段几乎不重叠（每个频点约
+    // 1 个滤波器生效）。**不要随手加宽**（2026-10-28 实测）：AVAudioUnitEQ 的段是并联
+    // 叠加的，加到 0.55 oct 后相邻段重叠，等效增益翻倍——输出峰值从 1.8 冲到 4.0、
+    // 4.6% 采样削波，"毛刺"更重。要平滑音色应该动增益预算/滤波类型，不是加宽带宽。
     band.bandwidth = 0.30
     band.gain = 0
     band.bypass = false
@@ -933,11 +998,18 @@ engine.connect(sourceNode, to: eq, format: nodeFormat)
 engine.connect(eq, to: engine.mainMixerNode, format: nodeFormat)
 engine.mainMixerNode.outputVolume = 1.0
 engine.prepare()
+// 输出（EQ 之后）计量：削波判据 + headroom 预算（2026-10-28）。
+let outMeter = OutMeter()
+engine.mainMixerNode.installTap(onBus: 0, bufferSize: 1024, format: nil) { buffer, _ in
+    outMeter.add(buffer)
+}
 
 var currentBands = [Float](repeating: 0, count: 24)
 var appliedBands = [Float](repeating: 0, count: 24)
 var cleanedUp = false
 var trimmedHarshness: Float = 0
+//: 输出削波时对**正增益动态部分**的收缩量（0…2 dB，50 ms 一拍调整）。
+var outHeadroomTrimDb: Float = 0
 var smoothedBaseGain: Float = 1.0
 var lastEnvExposure: Float = 0
 
@@ -977,8 +1049,15 @@ func applyEq(_ state: EqState) {
                 extra = -2.5 * trimmedHarshness * baseGain
             }
         }
-        let target = clamp(base + extra + currentBands[index] * snapshot.depth,
-                           -maxAppliedGainDb, maxAppliedGainDb)
+        // 正增益的"动态部分"在输出削波时收缩（负增益不动：削减永远安全）。
+        var dynamic = currentBands[index] * snapshot.depth
+        if dynamic > 0 && outHeadroomTrimDb > 0 {
+            dynamic = max(0, dynamic - outHeadroomTrimDb)
+        }
+        // 正增益总预算：base + extra + 动态 三者相加后封顶 maxBoostDb（负方向仍到
+        // -maxAppliedGainDb）。这是"听清歌曲"的硬约束：掩蔽不许把静态抬升堆到 6 dB。
+        let target = min(clamp(base + extra + dynamic,
+                               -maxAppliedGainDb, maxAppliedGainDb), maxBoostDb)
         eq.bands[index].gain = target
         appliedBands[index] = target
     }
@@ -1084,6 +1163,13 @@ let startTime = Date()
 var stallStreak = 0
 
 let controlTimer = Timer(timeInterval: 0.05, repeats: true) { _ in
+    // 先看上一拍 EQ 之后有没有削波：有就收缩正增益预算（最快 1.4 dB/s），输出干净则慢回。
+    let out = outMeter.take()
+    if out.peak >= 1.0 || out.clipFrames > 0 {
+        outHeadroomTrimDb = min(2.0, outHeadroomTrimDb + 0.10)
+    } else if out.peak < 0.90 {
+        outHeadroomTrimDb = max(0, outHeadroomTrimDb - 0.02)
+    }
     applyEq(state)
     // 链路自检（2026-10-23）：tap 采样率与输出设备不一致时（如 QQ 音乐 48 kHz、蓝牙
     // 设备 44.1 kHz），消费端永远比生产端慢，ring 持续积满 → 丢帧 = 用户听到的抖动。
@@ -1131,6 +1217,10 @@ if options.reportSeconds > 0 {
             "out_ring_fill": resampleOutRing.fillCount,
             "content_env_exposure": Double(lastEnvExposure),
             "content_trim": Double(trimmedHarshness),
+            "out_peak": outMeter.totals().peak,
+            "out_clip_frames": outMeter.totals().clipFrames,
+            "out_frames": outMeter.totals().frames,
+            "headroom_trim_db": Double(outHeadroomTrimDb),
         ])
     }
     RunLoop.main.add(reportTimer!, forMode: .common)
