@@ -1689,3 +1689,43 @@ FLAT 只占 4%（D49 前耳边 47%）、conversation 从不 LIKELY、媒体全�
    常数不变。
    验证：noise_analyzer 51/51、controller 128/128；已刷机，待现场听感（轻/重敲的掩蔽
    是否都够、停手后的 EQ 回落是否还唐突）。
+
+
+---
+
+## D54 · 2026-10-28 模式/风/EQ 预算的去抖：「歌曲声音忽大忽小」
+
+**背景**：D53 第二版现场，用户边听边反馈两点：
+① "我转头，可能引发了别的噪音？"；② **"有点歌曲声音忽大忽小"**（此前还有"完全安静后
+歌曲调 EQ 那一下唐突"）。当场 15–27 s 快照数据（`记录/位置对照/20261028-d53-verify3.jsonl`）
+显示三个抽动源：
+
+1. **模式在 SONG_EQ ↔ EXTERNAL_VOICE_INTENT 之间来回切**：音乐漏音让 1 s 事件窗偶尔报
+   `speech`，`speech_active` 单拍过线就切 EVI，presence 抬升在 1.76–2.73 dB 之间跳
+   （applied 峰值 2.1–3.9 dB）→ 亮度/响度抽动；
+2. **wind EQ 随 wind 事件跳动**：转头/衣物摩擦让 `event=wind` 在相邻拍出现（15 s 里 24 帧），
+   wind EQ 把低频正增益压到 1/4，低频抬升从 +0.3 掉到 −0.2 dB；
+3. **systemeq headroom 来回伸缩**：自适应削波预算在 1.3–2.0 dB 之间回弹（原回落
+   0.4 dB/s），响/静交替段落里 EQ 量级跟着变 → 也是"忽大忽小"。
+
+**决定**：
+
+1. `AdaptController`：背景人声模式加**滞回**——进入 EVI 要连续 300 ms `speech_active`，
+   退出要连续 500 ms 无证据；单拍音乐漏音不再切模式。
+2. app_main：wind EQ 去抖——连续 ≥800 ms `event=wind` 才应用，停止后保持 2 s；
+   `apply_wind_eq(command, wind_active)` 新增开关参数（单测覆盖关闭路径）。
+3. systemeq：headroom 回落 0.02→**0.004**/50 ms（≈0.08 dB/s），收紧仍快（秒级）；
+   避免 EQ 预算在响/静段落里来回抽。
+
+**为什么"转头"会引发这些**：转头会改变 OWS 耳机与 S3 的相对位置/漏音耦合，衣物、头发、
+耳廓摩擦在近场麦上产生 wind 类事件；这些都不是"真的风"，但都会让 1 s 事件窗的瞬时标签跳。
+
+**验证（离线）**：ctest 12/12；controller **133/133**（+5：单帧语音不切 EVI、300 ms 进入、
+单帧静音不退出、500 ms 退出、wind 去抖关闭时 EQ 不变）。**已刷机 + 重启 host（D54）**，
+待现场听感：转头/停手时"忽大忽小"是否消失。
+
+**代价**：EVI 进入慢 300 ms、退出慢 500 ms（背景人声掩蔽的起止略钝，但比抽动好）；
+wind EQ 要 800 ms 才生效（短暂阵风不再触发，符合"只在大风时动"的原始意图）。
+
+**文件**：`main/{controller.hpp,controller.cpp,app_main.cpp}`、`test/controller_test.cpp`、
+`tools/systemeq/systemeq.swift`。
