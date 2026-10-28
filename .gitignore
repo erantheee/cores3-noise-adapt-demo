@@ -45,3 +45,4 @@ experiments/*/dependencies.lock
 
 # 播放器构建产物（源码是 tools/player/player.swift）
 tools/player/player.new
+.gstack/
