@@ -134,27 +134,22 @@ def relay_reports_audio(*, relay_audio: bool, relay_ambient: object | None) -> b
 def ambient_gate_allows(*, device_intent: bool, llm_ok: bool, self_ok: bool,
                         intent_recent: bool, evidence_recent: bool,
                         dual_turn: bool = False, llm_veto: bool = False) -> bool:
-    """环境声执行门放行判定（D42；2026-10-23 加入 dual_turn 触发源）。
+    """环境声执行门放行判定（D42；2026-10-26 晚改为**仅 LLM 语义确认**）。
 
-    触发器有三个（任一成立即"对话在进行"）：
-      * device_intent：S3 端侧预判意图（快路径，但设备 vl 判据在真实对话下
-        几乎不可达——voice_likelihood 帧间 0↔1 抖动，见 12:02 录音复盘）；
-      * dual_turn：声纹双向交替（最近 10 s 内 self 与 other 都出现且交替）——
-        用户拍板的 B 方案，约 2–3 s 延迟，不依赖设备 vl。自言自语（只有 self）
-        不触发，所以不会重蹈"自己说话把环境声拉开"的覆辙；
-      * llm_ok：ASR/LLM 语义确认"这是对话"（D32 的授权语义）。2026-10-26 真实
-        对话回放实测：S3 意图全程 0、dual_turn 断续，但 LLM 对 13/29 段判 yes——
-        若 LLM 确认只能当"证据"不能当"触发器"，环境声就会在 LLM 明明说"是对话"
-        时仍被关掉（见 work/replay 复现）。LLM 确认作为触发器只是把"慢但确定"
-        的语义判定从"事后批准"升为"独立放行"，不影响 veto 优先级。
-    门证据：本拍/8 s 内 self 接话、LLM 确认、或 dual_turn 本身。LLM 明确否决
-    （llm_veto）优先级最高，任何证据都不能覆盖（D34 迟到否决）。
+    为什么只剩 llm_ok 一个触发器：现场复现证明 device_intent 与 dual_turn 都会在
+    **单人独白 / 背景人声**时误开环境声——固件 event/vl 在"近场语音+音乐"下把语音
+    错判成键盘/风（device_intent 短暂误发），声纹把一个人连续说话切成 self+other
+    假交替（dual_turn 误触）。LLM 语义判定（dialogue=yes，要求 self+other 有语义
+    轮次）是唯一能区分"对话"与"独白/背景"的信号，所以环境声只由它放行。
+
+    快触发（device_intent / dual_turn / self_ok）仍然驱动**媒体下压**（主循环里的
+    engagement_latch / dual_turn_open 分支，见下方），只是不再开环境声。代价是环境声
+    打开延迟 = LLM 往返（约 5–10 s）；准确优先于速度，这是用户本轮口径。
+    LLM 明确否决（llm_veto）优先级最高（D34 迟到否决）。
     """
     if llm_veto:
         return False
-    trigger = bool(device_intent or dual_turn or llm_ok)
-    evidence = bool(llm_ok or self_ok or dual_turn or intent_recent or evidence_recent)
-    return bool(trigger and evidence)
+    return bool(llm_ok)
 
 
 def llm_ambient_authorization(assistant) -> dict:

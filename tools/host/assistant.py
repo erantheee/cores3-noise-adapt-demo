@@ -89,6 +89,13 @@ class AssistantService:
     #: 设备明确判为非人声的事件：这些帧覆盖的时段不再送云端 ASR。实测该网关对
     #: 键盘/风/异响统一回 HTTP 400（原始现场 400 段里 65% 带这些事件）。
     _BLOCKING_EVENTS = ("keyboard", "wind", "artifact")
+    #: 是否信任设备的 event 分类器去屏蔽非人声时段（2026-10-26 晚）。
+    #: 现置 False：真机近场语音+音乐背景下，固件 event 把语音大量错判成
+    #: keyboard/wind（6 秒里 49 帧 keyboard、环境却判 VOICE），按它挖掉会把真实
+    #: 语音挖没了（详见 work/diagnosis 与 handoff「event 分类器失效」）。改为只用
+    #: 能量 VAD 找候选语音，交给 ASR 自己判"有没有人声"（网关对无人声回 400→
+    #: `AsrNoSpeech`，已 graceful，不再表现为"转写失败"）。固件 event 修好后可翻回 True。
+    _TRUST_DEVICE_EVENT = False
     #: ASR 副本最长截取多少秒（正常片段 <= 6 s + 1 s 预缓冲，这里只是防御）。
     _MAX_ASR_SECONDS = 20.0
     #: 单轮转写最多显示多少字符；防止模型跑飞把面板刷屏。
@@ -538,6 +545,10 @@ class AssistantService:
             self._stream_sample_cursor += len(pcm) // 2
             if self._continuous_stream:
                 if self._conversation_active:
+                    if not self._session_audio:
+                        # 防御：滚动分段/重连后缓冲被清空，起点必须跟着缓冲走，
+                        # 否则遥测 sample 与音频不再同一基准（见 observe_frame 的坑）。
+                        self._session_start_sample = start_sample
                     self._session_audio.extend(pcm)
                 else:
                     self._preroll.append((start_sample, pcm))
@@ -548,7 +559,11 @@ class AssistantService:
             # Bound one session to 60 seconds so a broken boundary cannot exhaust memory.
             max_bytes = self._audio_rate * 2 * 60
             if len(self._session_audio) > max_bytes:
-                del self._session_audio[:-max_bytes]
+                removed = len(self._session_audio) - max_bytes
+                removed -= removed % 2
+                del self._session_audio[:removed]
+                # 丢掉的是开头，起点同步前移（单位：样本）。
+                self._session_start_sample += removed // 2
 
     def observe_frame(self, frame) -> None:
         launch = None
@@ -586,6 +601,11 @@ class AssistantService:
                 self._last_conversation_at = now
                 self._telemetry = []
                 preroll = list(self._preroll)
+                # 坑（2026-10-27 定位）：preroll 消费后必须清空。不清空时它的第一项
+                # 永远是最早那块音频，滚动分段（6 s 上限）后的 `_session_start_sample`
+                # 会一直停在旧值——遥测 sample 映射到窗口外，键盘/风/异响事件全部被
+                # 丢掉（现场 24 段含事件帧只有 8 段真正排除就是这个原因）。
+                self._preroll.clear()
                 self._session_start_sample = preroll[0][0] if preroll else self._stream_sample_cursor
                 self._session_audio = bytearray().join(pcm for _, pcm in preroll)
                 self._task = "检测到候选人声，正在记录并等待语音证据"
@@ -1121,9 +1141,15 @@ class AssistantService:
     def _telemetry_speech_regions(telemetry: list[dict[str, object]], rate: int,
                                   start_sample: int, total_samples: int
                                   ) -> list[tuple[int, int]]:
-        """设备遥测的语音证据：连续 >=4 帧 voice_likelihood 高才算一段。
+        """设备遥测的语音证据：连续 >=4 帧"设备认为是人声"才算一段。
 
-        单帧尖峰（噪声/撞击）不再能触发 ASR；键盘/风/撞击事件直接否决。
+        单帧尖峰（噪声/撞击）不触发；键盘/风/撞击事件直接否决。
+
+        2026-10-27 修正（和 S3 判断耦合）：现场 67 段里 27 段有 >=4 连续
+        `event=speech` 帧，但这些帧的 `voice_likelihood` 中位数只有 0.16、仅 26%
+        >=0.65——旧规则要求 vl>=0.65，设备正向证据因此恒为 0 s，ASR 门控全靠能量
+        VAD。现在设备明确给 `event=speech` 也算人声证据（vl 高仍然算），让固件判断
+        真正参与门控。
         """
         if not telemetry:
             return []
@@ -1134,7 +1160,9 @@ class AssistantService:
             likelihood = float(item.get("voice_likelihood") or 0.0)
             event = str(item.get("event") or "")
             sample = int(item.get("sample") or 0) - start_sample
-            voiced = likelihood >= 0.65 and event not in ("keyboard", "wind", "artifact")
+            voiced = event not in ("keyboard", "wind", "artifact") and (
+                likelihood >= 0.65 or event == "speech"
+            )
             if voiced:
                 run.append(sample)
             else:
@@ -1285,11 +1313,18 @@ class AssistantService:
                                start_sample: int) -> tuple[list[tuple[int, int]], float, str]:
         """选择用于转写的语音区间。返回 (区间, 有效秒数, 证据说明)。
 
-        2026-10-26：设备判为键盘/风/异响的时段先从人声证据里挖掉，再判断有没有
-        足够语音——否则这些窗口会原样送去云端，换回 400。
+        2026-10-26 晚（B：ASR 当人声判据）：固件 event/vl 在"近场语音+音乐"下已证明
+        不可信（voice_likelihood 0.09–0.39 乱跳、event 把语音判成 keyboard/wind），所以
+        `_TRUST_DEVICE_EVENT=False` 时**不再用设备遥测挖语音、也不再按 event 屏蔽**，
+        只信任能量 VAD（`_audio_speech_regions`）找候选，人声与否交给 ASR 判。
+        `_TRUST_DEVICE_EVENT=True` 恢复旧行为（设备事件屏蔽 + 设备遥测优先）。
         """
         total = len(pcm) // 2
-        blocked = cls._event_blocked_regions(telemetry, rate, start_sample, total)
+        blocked = (
+            cls._event_blocked_regions(telemetry, rate, start_sample, total)
+            if cls._TRUST_DEVICE_EVENT
+            else []
+        )
         device = cls._subtract_intervals(
             cls._telemetry_speech_regions(telemetry, rate, start_sample, total), blocked
         )
@@ -1298,6 +1333,10 @@ class AssistantService:
         audio_s = _intervals_seconds(audio, rate)
         blocked_s = _intervals_seconds(blocked, rate)
         suffix = f"；已排除键盘/风噪 {blocked_s:.1f}s" if blocked_s > 0 else ""
+        if not cls._TRUST_DEVICE_EVENT:
+            if audio_s >= cls._MIN_SPEECH_S:
+                return audio, audio_s, f"能量语音证据 {audio_s:.1f}s（设备遥测不可信，交由 ASR 判）"
+            return [], audio_s, f"能量语音证据 {audio_s:.1f}s（设备遥测不可信）"
         if device_s >= cls._MIN_SPEECH_S:
             return device, device_s, (
                 f"设备语音证据 {device_s:.1f}s（能量证据 {audio_s:.1f}s）{suffix}"

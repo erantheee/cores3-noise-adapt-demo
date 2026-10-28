@@ -2463,64 +2463,37 @@ def test_ambient_executor_and_intent_parsing() -> None:
     check(state.snapshot()["ambient"] is not None, "环境声执行端必须进快照")
 
 
-def test_ambient_gate_dual_turn_trigger() -> None:
-    """2026-10-23 B 方案：声纹双向交替可作为触发源；自言自语不触发；LLM veto 优先。"""
-    check(ambient_gate_allows(device_intent=False, llm_ok=False, self_ok=False,
-                              intent_recent=False, evidence_recent=False,
-                              dual_turn=True),
-          "声纹双向交替（self+other）即使 S3 意图为 false 也放行")
-    check(not ambient_gate_allows(device_intent=False, llm_ok=False, self_ok=True,
-                                  intent_recent=False, evidence_recent=False,
-                                  dual_turn=False),
-          "只有 self（自言自语）不触发")
-    check(not ambient_gate_allows(device_intent=False, llm_ok=False, self_ok=False,
-                                  intent_recent=False, evidence_recent=False,
-                                  dual_turn=True, llm_veto=True),
-          "LLM 明确否决时 dual_turn 也不能放行（D34 迟到否决优先）")
-    check(not ambient_gate_allows(device_intent=True, llm_ok=False, self_ok=False,
-                                  intent_recent=False, evidence_recent=False,
-                                  dual_turn=False),
-          "S3 意图 + 无门证据时仍被门否决（门还是否决器）")
+def test_ambient_gate_llm_only_trigger() -> None:
+    """2026-10-26 晚：环境声只靠 LLM 语义确认开。
 
-
-def test_ambient_gate_allows() -> None:
-    """门是否决器：S3 意图是触发器；self/LLM 只批准，不发起；LLM veto 最高优先。
-
-    2026-10-23 用户现场质疑"为什么我说话的时候把环境音拉起来"——self 证据不能
-    独立触发环境声，只能批准 S3 已经发起的对话。
+    现场复现：device_intent 与 dual_turn 都在单人独白/背景人声时误开环境声
+    （固件 event/vl 把语音错判键盘/风→intent 短暂误发；声纹把单人说话切成
+    self+other 假交替→dual_turn 误触）。LLM 判 dialogue=yes 是唯一能区分
+    "对话"与"独白/背景"的信号，环境声只由它放行；快触发仍驱动媒体下压，不再开环境声。
     """
-    check(not ambient_gate_allows(device_intent=False, llm_ok=False, self_ok=True,
-                                  intent_recent=False, evidence_recent=False),
-          "你说话（self）不能触发环境声：S3 意图为 false 时必须关闭")
-    check(ambient_gate_allows(device_intent=True, llm_ok=False, self_ok=True,
-                              intent_recent=False, evidence_recent=False),
-          "S3 意图 + 你接话时放行")
-    check(ambient_gate_allows(device_intent=True, llm_ok=True, self_ok=False,
-                              intent_recent=False, evidence_recent=False),
-          "S3 意图 + LLM 确认时放行")
     check(ambient_gate_allows(device_intent=False, llm_ok=True, self_ok=False,
                               intent_recent=False, evidence_recent=False),
-          "LLM 语义确认本身可触发环境声（S3 意图真实对话下几乎不可达，2026-10-26 回放）")
+          "LLM 确认对话才开环境声（不需要 S3 意图）")
+    check(ambient_gate_allows(device_intent=True, llm_ok=True, self_ok=False,
+                              intent_recent=False, evidence_recent=False),
+          "LLM 确认 + S3 意图也放行")
+    check(not ambient_gate_allows(device_intent=True, llm_ok=False, self_ok=False,
+                                  intent_recent=False, evidence_recent=False),
+          "S3 意图单独不再开环境声（intent 会误发，见现场）")
+    check(not ambient_gate_allows(device_intent=False, llm_ok=False, self_ok=False,
+                                  intent_recent=False, evidence_recent=False,
+                                  dual_turn=True),
+          "声纹双向交替不再开环境声（单人被切 self+other 假交替会误触）")
+    check(not ambient_gate_allows(device_intent=False, llm_ok=False, self_ok=True,
+                                  intent_recent=False, evidence_recent=False),
+          "只有 self（自言自语）不触发")
     check(not ambient_gate_allows(device_intent=False, llm_ok=True, self_ok=False,
                                   intent_recent=False, evidence_recent=False,
                                   llm_veto=True),
-          "llm_ok 与 llm_veto 互斥；明确否决仍优先")
-    check(ambient_gate_allows(device_intent=True, llm_ok=False, self_ok=False,
-                              intent_recent=False, evidence_recent=True),
-          "S3 意图 + 8 秒内门证据时放行（避免一句一关）")
-    check(ambient_gate_allows(device_intent=True, llm_ok=False, self_ok=False,
-                              intent_recent=True, evidence_recent=False),
-          "S3 意图新鲜时放行")
+          "LLM 明确否决优先级最高（llm_ok 与 llm_veto 互斥，防御性检查）")
     check(not ambient_gate_allows(device_intent=False, llm_ok=False, self_ok=False,
                                   intent_recent=False, evidence_recent=False),
           "没有任何证据时必须关闭")
-    check(not ambient_gate_allows(device_intent=True, llm_ok=False, self_ok=False,
-                                  intent_recent=False, evidence_recent=False),
-          "S3 意图单独不足以放行（门必须监督）")
-    check(not ambient_gate_allows(device_intent=True, llm_ok=False, self_ok=True,
-                                  intent_recent=True, evidence_recent=True,
-                                  llm_veto=True),
-          "LLM 明确否决时即使 self 证据在场也不放行（D34 迟到否决优先）")
 
 
 def test_relay_ambient_gate() -> None:
@@ -2978,13 +2951,19 @@ def test_assistant_gates_asr_on_speech_evidence() -> None:
     check(len(trimmed) >= int(0.8 * rate) * 2, "裁剪不能把有效语音裁掉")
 
     # 设备遥测的连续语音证据也要能放行（音频本身是静音，模拟串口帧先行）。
+    # 2026-10-26 晚：B 路径默认不信任设备遥测；这条只验证"信任设备遥测"的旧路径仍可放行。
     telemetry = [
         {"voice_likelihood": 0.9, "event": "speech", "sample": int(rate * 0.05 * index)}
         for index in range(30)
     ]
     long_silence = struct.pack("<32000h", *([0] * 32000))
-    _, device_seconds, _ = AssistantService._select_speech_regions(long_silence, rate, telemetry, 0)
-    check(device_seconds >= AssistantService._MIN_SPEECH_S, "设备连续语音证据必须能独立放行 ASR")
+    saved = AssistantService._TRUST_DEVICE_EVENT
+    AssistantService._TRUST_DEVICE_EVENT = True
+    try:
+        _, device_seconds, _ = AssistantService._select_speech_regions(long_silence, rate, telemetry, 0)
+        check(device_seconds >= AssistantService._MIN_SPEECH_S, "设备连续语音证据必须能独立放行 ASR")
+    finally:
+        AssistantService._TRUST_DEVICE_EVENT = saved
 
     # 连续 4 帧也不能靠键盘/风事件混过语音证据门。
     for event in ("keyboard", "wind"):
@@ -3005,10 +2984,12 @@ def test_assistant_gates_asr_on_speech_evidence() -> None:
 
 
 def test_device_keyboard_events_block_asr() -> None:
-    """2026-10-26 用户口径：S3 判键盘/风/异响的窗口不送 ASR。
+    """设备事件与 ASR 门控的耦合，按 `_TRUST_DEVICE_EVENT` 开关两种行为都钉住。
 
-    实测该云端网关对这些窗口统一回 HTTP 400（"转写失败"刷屏），设备事件必须
-    和 ASR 门控耦合：被事件覆盖的时段从语音证据里挖掉。
+    2026-10-26 早（用户口径）：S3 判键盘/风/异响的窗口不送 ASR（`_TRUST_DEVICE_EVENT=True`）。
+    2026-10-26 晚（用户改 B）：固件 event 在"近场语音+音乐"下把语音错判成键盘/风，
+    按它挖掉会把真实语音挖没，所以默认 `_TRUST_DEVICE_EVENT=False`——只用能量 VAD，
+    人声与否交给 ASR（网关 400→nospeech）。
     """
     rate = 16000
     tone = [8000 if index % 2 else -8000 for index in range(rate)]
@@ -3019,17 +3000,27 @@ def test_device_keyboard_events_block_asr() -> None:
          "sample": int(rate * (0.3 + 0.1 * index))}
         for index in range(10)  # 覆盖 0.3–1.3 s 的全部能量
     ]
-    regions, seconds, note = AssistantService._select_speech_regions(pcm, rate, keyboard, 0)
-    eq(regions, [], "设备判为键盘的时段不得作为 ASR 输入")
-    check(seconds < AssistantService._MIN_SPEECH_S, "排掉键盘后不得再达到 ASR 门槛")
-    check("已排除键盘/风噪" in note, f"证据说明要写清排除了键盘，实际：{note}")
+    saved = AssistantService._TRUST_DEVICE_EVENT
 
-    # 键盘只覆盖前半段：后半段人声必须保留，不能整段丢。
-    samples2 = [0] * int(0.3 * rate) + tone + tone + [0] * int(0.3 * rate)
-    pcm2 = struct.pack(f"<{len(samples2)}h", *samples2)
-    regions2, seconds2, note2 = AssistantService._select_speech_regions(pcm2, rate, keyboard, 0)
-    check(seconds2 >= AssistantService._MIN_SPEECH_S, "未被键盘覆盖的人声段必须保留")
-    check("已排除键盘/风噪" in note2, "有排除时证据说明要写明")
+    # 默认（B）：不信任设备事件——键盘帧不再挖掉能量语音，交给 ASR 判。
+    AssistantService._TRUST_DEVICE_EVENT = False
+    try:
+        regions, seconds, note = AssistantService._select_speech_regions(pcm, rate, keyboard, 0)
+        check(len(regions) > 0, "B 路径：能量 VAD 找到的语音不得被键盘事件挖掉")
+        check(seconds >= AssistantService._MIN_SPEECH_S, "B 路径：能量语音证据要能达到 ASR 门槛")
+        check("已排除键盘/风噪" not in note, "B 路径：不排除键盘，证据说明不得写排除")
+    finally:
+        AssistantService._TRUST_DEVICE_EVENT = saved
+
+    # 旧路径（信任设备事件）：键盘帧仍挖掉（固件 event 修好后可翻回）。
+    AssistantService._TRUST_DEVICE_EVENT = True
+    try:
+        regions, seconds, note = AssistantService._select_speech_regions(pcm, rate, keyboard, 0)
+        eq(regions, [], "设备判为键盘的时段不得作为 ASR 输入（信任事件时）")
+        check(seconds < AssistantService._MIN_SPEECH_S, "排掉键盘后不得再达到 ASR 门槛（信任事件时）")
+        check("已排除键盘/风噪" in note, f"证据说明要写清排除了键盘，实际：{note}")
+    finally:
+        AssistantService._TRUST_DEVICE_EVENT = saved
 
 
 def test_provider_no_speech_is_not_request_failure() -> None:
@@ -3054,6 +3045,124 @@ def test_provider_no_speech_is_not_request_failure() -> None:
     check("请求失败" not in transcript, f"400/无人声不能显示成请求失败：{transcript}")
     check("没听出有效内容" in transcript, f"应显示这段没听出内容，实际：{transcript}")
     eq(service._asr_stats["filtered"], 1, "无人声片段计入 filtered，不计入请求失败")
+
+
+def test_continuous_rolling_segments_keep_telemetry_aligned() -> None:
+    """滚动分段后遥测 sample 必须仍能映射回该段音频（2026-10-27 现场 bug）。
+
+    现场：含键盘/风/异响帧的 24 段里只有 8 段真正排除。根因是 preroll 消费后没清空，
+    它的第一项永远是最早那块音频，于是滚动分段后的 `_session_start_sample` 停在旧值，
+    遥测偏移全部落到窗口外、事件排除静默失效。这里用连续流仿真钉住：
+      * 第二段的 start_sample 必须等于它第一块音频的 sample；
+      * start_sample + 缓冲长度 == 当前游标（不变量）；
+      * 用该段的键盘帧能真的生成排除区间。
+    """
+    rate = 16000
+
+    class Chunk:
+        def __init__(self, pcm: bytes) -> None:
+            self.pcm = pcm
+            self.rate = rate
+
+    class Frame:
+        conversation = "LIKELY"
+        environment = "VOICE"
+        ambient_open = False
+        voice_likelihood = 0.9
+        event = "speech"
+
+    chunk_samples = 1600  # 0.1 s
+    chunk_pcm = b"\x00\x00" * chunk_samples
+    service = AssistantService()
+    dispatched = []
+    service._spawn_dispatch = lambda *args: dispatched.append(args)  # type: ignore[method-assign]
+    service.recording_started(rate, 0)  # 持续流：不传秒数
+
+    for _ in range(5):  # 会话开始前的预缓冲
+        service.feed_audio(Chunk(chunk_pcm))
+    service.observe_frame(Frame())
+    for _ in range(50):  # 第一段 5 s
+        service.feed_audio(Chunk(chunk_pcm))
+    service._conversation_started_at = time.monotonic() - 7.0  # 触发 6 s 滚动上限
+    service.observe_frame(Frame())
+    eq(len(dispatched), 1, "第一段应已派发")
+
+    for _ in range(30):  # 滚动后的预缓冲
+        service.feed_audio(Chunk(chunk_pcm))
+    service.observe_frame(Frame())  # 第二段开始
+    for _ in range(20):
+        service.feed_audio(Chunk(chunk_pcm))
+    eq(service._session_start_sample + len(service._session_audio) // 2,
+       service._stream_sample_cursor, "起点 + 缓冲长度必须等于当前游标（不变量）")
+    service._conversation_started_at = time.monotonic() - 7.0
+    service.observe_frame(Frame())
+    eq(len(dispatched), 2, "第二段应已派发")
+
+    second_start = int(dispatched[1][7])
+    second_audio = dispatched[1][5]
+    eq(second_start, 5 * chunk_samples + 50 * chunk_samples,
+       "第二段起点必须是它第一块音频的 sample（不能沿用上一段的旧起点）")
+    eq(second_start + len(second_audio) // 2, service._stream_sample_cursor,
+       "派发出去的起点与音频必须覆盖到当前游标")
+
+    # 该段内键盘帧必须真的能生成排除区间（此前会因偏移越界被静默丢弃）。
+    total = len(second_audio) // 2
+    keyboard = [
+        {"voice_likelihood": 0.0, "event": "keyboard",
+         "sample": second_start + int(rate * (0.5 + 0.1 * index))}
+        for index in range(12)
+    ]
+    blocked = AssistantService._event_blocked_regions(keyboard, rate, second_start, total)
+    check(blocked, "第二段内的键盘帧必须能映射成排除区间")
+    check(_intervals_seconds(blocked, rate) >= 1.0,
+          f"12 帧键盘（约 1.2 s）应排除出足够时长，实际 {_intervals_seconds(blocked, rate):.2f}s")
+
+
+def test_device_speech_events_count_as_evidence() -> None:
+    """设备 `event=speech` 连续帧必须算语音证据，即使 voice_likelihood 很低。
+
+    现场 67 段里 27 段有 >=4 连续 speech 事件帧，但这些帧 vl 中位数只有 0.16、
+    仅 26% >=0.65；旧规则要求 vl>=0.65 → 设备证据恒为 0，门控全靠能量 VAD。
+
+    注意：2026-10-26 晚起 `_TRUST_DEVICE_EVENT=False`（固件 event 会漏判/错判），
+    `_select_speech_regions` 默认不再用设备遥测；这里验证的是"开关翻回 True 时
+    设备证据真的可用"，开关本身的行为另有断言。
+    """
+    rate = 16000
+    silence = struct.pack("<32000h", *([0] * 32000))  # 2 s 静音
+    telemetry = [
+        {"voice_likelihood": 0.1, "event": "speech", "sample": int(rate * 0.1 * index)}
+        for index in range(6)  # 连续 6 帧 speech（events 低 vl）
+    ]
+    regions = AssistantService._telemetry_speech_regions(telemetry, rate, 0, 32000)
+    check(_intervals_seconds(regions, rate) >= AssistantService._MIN_SPEECH_S,
+          f"连续 speech 事件帧必须构成语音证据，实际 "
+          f"{_intervals_seconds(regions, rate):.2f}s")
+
+    previous = AssistantService._TRUST_DEVICE_EVENT
+    try:
+        AssistantService._TRUST_DEVICE_EVENT = True
+        _, seconds, note = AssistantService._select_speech_regions(silence, rate, telemetry, 0)
+        check(seconds >= AssistantService._MIN_SPEECH_S,
+              f"信任设备遥测时设备语音证据必须能独立放行 ASR，实际 {seconds:.2f}s")
+        check("设备语音证据" in note, f"证据说明应写设备语音证据，实际：{note}")
+    finally:
+        AssistantService._TRUST_DEVICE_EVENT = previous
+
+    # 键盘事件仍不得被当成语音证据。
+    keyboard = [
+        {"voice_likelihood": 0.1, "event": "keyboard", "sample": int(rate * 0.1 * index)}
+        for index in range(6)
+    ]
+    eq(AssistantService._telemetry_speech_regions(keyboard, rate, 0, 32000), [],
+       "连续键盘事件帧不得成为语音证据")
+
+    # 默认不信任设备遥测：静音 + 设备 speech 帧也不该在没有能量证据时放行 ASR。
+    _, default_seconds, default_note = AssistantService._select_speech_regions(
+        silence, rate, telemetry, 0)
+    check(default_seconds < AssistantService._MIN_SPEECH_S,
+          "默认（不信任设备遥测）时纯静音不得靠设备遥测放行 ASR")
+    check("不可信" in default_note, f"默认路径要写明设备遥测不可信，实际：{default_note}")
 
 
 def test_assistant_fast_path_authorization_and_late_veto() -> None:
@@ -3823,8 +3932,7 @@ def main() -> int:
         test_voiceprint_shadow_snapshot_is_harmless,
         test_voiceprint_energy_activity_fallback,
         test_ambient_executor_and_intent_parsing,
-        test_ambient_gate_dual_turn_trigger,
-        test_ambient_gate_allows,
+        test_ambient_gate_llm_only_trigger,
         test_relay_ambient_gate,
         test_audio_relay_budget_caps_backlog,
         test_relay_measures_real_queue_depth_not_our_writes,
@@ -3849,6 +3957,8 @@ def main() -> int:
         test_assistant_gates_asr_on_speech_evidence,
         test_device_keyboard_events_block_asr,
         test_provider_no_speech_is_not_request_failure,
+        test_continuous_rolling_segments_keep_telemetry_aligned,
+        test_device_speech_events_count_as_evidence,
         test_assistant_fast_path_authorization_and_late_veto,
         test_assistant_splits_unknown_speakers_into_pause_turns,
         test_assistant_aggregates_speaker_labels_per_turn,
