@@ -145,6 +145,7 @@
 | 77 | **耳机 TWS/OWS 双设备兼容（D35/D36，2026-10-21 晚）** | ✅ **代码/文档已改；两副均可识别；延迟已实测** | `EXPECTED_TARGET` 改为 `--earphone MATCH=LABEL` 注册表（默认 `Xiaomi=Xiaomi OWS`、`AirPods=AirPods Pro`，子串匹配）；中继 `--relay-device` 默认空 = 跟随系统默认输出。`--ambient-executor airpods` 仅 TWS 可用；OWS 无聆听模式，`ambient_open` 退为意图/遥测 + 中继门控，默认仍 off（D30）。实测：Xiaomi 耳夹驱动侧 324.8 ms（44.1 kHz，总≈385–405 ms），AirPods Pro 170.7 ms（总≈211–231 ms）。见 D35/D36。 |
 | 79 | **用户记忆 memo（D38，2026-10-21 用户要求）** | 🟡 **存档+注入已实现；进入决策待验收** | 新增 `tools/host/memo.py`：rolling 事件（判定/环境声开关/纠正，保留 14 天、上限 240 条）+ `sessions.jsonl` 会话摘要 + 场景×时段 profile（半衰期 7 天），目录 `记录/memo/`（gitignore）。assistant 调 LLM 时注入 ≤300 字弱先验，并写明"与本段证据冲突时以本段为准"。当前只注入、不直接进执行；影子建议/受限执行（上限+TTL+可关）列为下一步。见 D38。 |
 | 78 | **输出设备切换后播放器"假运行"（D37，2026-10-21 现场）** | ✅ **已修复并真机验证** | 现象：点播放后 `playing=true` 但位置恒 0、耳机无声。根因：AVAudioEngine 未处理 `AVAudioEngineConfigurationChange`，设备切换后停止渲染但 `isRunning` 仍为 true。修复：重启引擎并**从最后已知位置**重排、play 锚点/墙钟校验（防位置从 1.9 s 跳到 26 s）、暂停中切设备保留位置、1.5 s 位置不动看门狗；`recoveries` 进播放器状态。真机在 MacBook 扬声器与 Xiaomi 耳夹间来回切：每次切换 recoveries +1、位置连续。见 D37。 |
+| 86 | **LLM 迟到否决回写 S3 快路径（D50 / TODOS A1，2026-10-28）** | 🟡 **已实现/单测/固件编译；未刷机、未真机验收** | 过去 D34 的迟到否决只能关 Mac 执行端的环境声，默认 demo（执行端 off）下 S3 快路径无人纠正：连续电视/播客让对话态常驻 engaged（EQ 压平、D41/D48 掩蔽停摆）。新增 S3 控制行 `dialog no [ttl_ms]` / `dialog yes`：host 只回写新鲜否决（TTL 20 s、每 5 s 续期、撤销/退出立即 yes）；S3 在 TTL 内释放对话态（媒体回 100%、`ambient_open` 关闭），背景人声回落 `EXTERNAL_VOICE_INTENT`；TTL 到点端侧自 fail-open 回 D16。命令帧追加 `dialog_veto` 键（旧固件缺键 = None）。C++ controller 127/127、conversation 67/67；host 94 组 / 7946 断言。待真机：连续播客/电视下 LLM 判 no 后设备 `dialog_veto=true`、mode 从 FLAT 回 SONG_EQ/EXTERNAL_VOICE_INTENT。见 D50。 |
 | 85 | **说话人归属聚合 + 工作台拆分（D45，2026-10-22 用户复测）** | ✅ **已实现/单测/离线 A/B；真机待复测** | 用户仍见同一句 self+unknown，且 UI 内容过多。查证：`_speaker_segments` 自 e96b309 未改；13 个会话约 1580 轮里 self 仅 6 条，无"之前大规模分清"记录。修复：① 逐片判定 + 短 unknown 片边界平滑（只挨一侧身份就并入；self/other 边界不猜）；② LLM 工作台拆为「ASR 转写」与「判定窗口」，判定/上下文/录音收进 details，去掉重复最近转写。离线 A/B：1035 self 3.0→3.7s、1036 0.8→1.0s，电视段仍 other；host 75 组/7779 条、渲染 58/0。见 D45。 |
 | 84 | **声纹 unknown 根因修复（D44，2026-10-22 用户对着说话仍 unknown）** | ✅ **已实现/单测/端到端验证；待真机复测** | 转写正确但说话人 unknown。根因两层：设备 voice_likelihood 仅 0.21；host 只在 S3 判 speech≥0.6 时才发 `speech_active=true`，worker 的 `speech_ratio=0` 直接回 unknown，WavLM 没参与。离线重放 `seg1035` 得 self 0.9527。修复：voiceprint 加能量兜底（块 RMS ≥ 近 20 s 本底 +6 dB 也算说话），阈值不动。验证：activity_chunks=5 / speech_ratio=1.0 / 连续 self 0.82–0.97。见 D44。 |
 | 83 | **转写可读性四项（D43，2026-10-22 用户疑问）** | ✅ **已实现并重启验证** | ASR 不慢（0.3–2.1 s/段），但 15 段只有 2 段通过；面板只留 8 段。修复：短应答词表扩充（对啊/是的/行吧…）、VAD 合并 0.35→0.5 s（轮次切分保持 0.35）、面板保留 24 段、ASR 延迟与通过率进 `asr_stats` 并在面板顶部显示。重启后首段 1/1 通过、ASR p50 352 ms。见 D43。 |
@@ -153,9 +154,9 @@
 | 80 | **调音重做 + 对话确认改为持续证据（D39/D40，2026-10-21 深夜现场反馈）** | ✅ **已实现、单测、已烧机真机复验；真人对话首响待验收** | 用户现场："环境很嘈杂，调音一般般；该凸显的没凸显"。量化：旧 SONG_EQ 在实测低频谱下最大建议 0.34 dB（×2.5 复合 ≤0.7 dB、1–4 kHz 恒 0）；同时 87–95% 时间卡在 FLAT+media60%（断续噪声连续段 p50 110 ms、最长 640 ms 被 200 ms 确认+2 帧续命积分成常驻对话）。修复：① 歌曲 EQ 改为有符号内容曲线 `clamp(C·N·(1−k·D), −4,+4)`（低频/人声 presence/空气为正、346–842 Hz 去糊为负；风只压正增益；safety_hold 只保留削减）；② 协议/面板/播放器支持负值（0 dB 零线；applied=clamp(suggest×2.5, −12,+10)）；③ 模式路由改用 250 ms 平滑电平；④ 对话确认：0.5 s 连续证据预下压、0.8 s 确认、engaged 续命≥0.8 s、releasing 内重新确认。真机复验（同一嘈杂现场）：media=100%、SONG_EQ≈84%、EXTERNAL_VOICE_INTENT≈5%、ambient=false；SONG_EQ 设备建议低频+1.4/去糊−1.2/presence+1.6/空气+1.8 dB，Mac applied ×2.5 后低频+3.7/+3.9、去糊−3.2、presence+2.7…4.0、空气+4.7 dB。代价：真人对话首响 0.2–0.3 s → 0.5 s 预览/0.8 s 确认。见 D39/D40。 |
 
 
-**断言计数（2026-10-26 实测）**：主机 C++ 单测 **12 套件**（`ctest` 12/12 全部通过；
-新增 D47 的 `dual_mic_test`；条数以 ctest 输出为准，不在此手工维护）。上位机自测
-`python3 tools/host/tests/test_host.py` 输出 **90 组、7928 条断言**；
+**断言计数（2026-10-28 实测）**：主机 C++ 单测 **12 套件**（`ctest` 12/12 全部通过；
+controller 127/127、conversation_awareness 67/67；条数以 ctest 输出为准，不在此手工维护）。
+上位机自测 `python3 tools/host/tests/test_host.py` 输出 **94 组、7946 条断言**；
 `node tools/host/tests/render_check.js <快照.json>` 用真实快照运行 **约 80 条通过、0 条失败**
 （条数随快照内容略变）；检查器 `--selftest` **8/8 场景符合预期**。
 这些数字会随代码变化，改完代码要重新跑一遍再同步到 README。

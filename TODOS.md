@@ -22,6 +22,10 @@
 - **依赖**：设备 + 真人。
 
 ### A1. LLM 迟到否决回写 S3 快路径（补全 D34 闭环）
+> **状态（2026-10-28）：已实现，未刷机/未真机验收。** 见 D50：S3 控制行
+> `dialog no [ttl_ms]` / `dialog yes`、host 只回写新鲜否决（每 5 s 续期、撤销/退出发
+> yes、S3 TTL 自 fail-open）、命令帧追加 `dialog_veto` 键。C++ 12/12、host 94 组 /
+> 7946 断言通过；真实场景（连续电视/播客）验收仍需设备。原 What 保留作验收依据。
 - **What**：默认启动配置下 host 不登记 ASR 采集（mic 块在流但 assistant 丢弃）；且
   host→S3 只有 route/rec/voiceprint 控制行，没有把 `dialogue=no` 回写快路径的通道。
   需：① 加 `--assistant-capture`（或首个 `MicChunk` 补登记）让 ASR/LLM 在默认 demo 也能跑；

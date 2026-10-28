@@ -67,6 +67,11 @@ Mac（播放器与原型执行器）
   keyboard/wind、单人连续说话被声纹切成 self+other 假交替）。`self`/交替证据仍驱动**媒体
   下压门栓**（`voice` 门比 `llm` 门更快让位）；背景人声只显示意图、不执行。代价：环境声
   开门延迟 = LLM 往返约 5–10 s（准确优先于速度）。门只拦执行，不拦 S3 的媒体下压与 EQ。
+- **迟到否决回写快路径（D50）**：host 把新鲜否决（LLM `dialogue=no` 或本地"无有效语音"）
+  经 `dialog no [ttl_ms]` 回写 S3（TTL 20 s、每 5 s 续期）；S3 在 TTL 内释放对话态
+  （媒体回 100%、`ambient_open` 意图关闭），背景人声回落为掩蔽。
+  它只否决策略里的"是不是对话"，不改噪声/EQ；撤销/过期/退出时 host 发 `dialog yes`，
+  且 S3 自己 fail-open（TTL 到点恢复 D16 预判，不依赖 host）。
 - 没有 Mac 执行回执前，协议固定报 `execution: decision_only`。
 
 ## 延迟口径（已实测）

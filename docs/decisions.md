@@ -1521,3 +1521,41 @@ host 自测 92 组 / 7925 条；离线工具 conversation_replay / voice_decisio
 
 **文件**：`main/{controller.hpp,controller.cpp,app_main.cpp}`、
 `test/controller_test.cpp`、`tools/{conversation_replay.cpp,voice_decision_offline.cpp}`。
+
+
+---
+
+## D50 · 2026-10-28 LLM 迟到否决回写 S3 快路径（补全 D34 闭环 / TODOS A1）
+
+**背景**：D34 把 LLM 定位成"迟到否决"，但过去它只能关 Mac 执行端的 `ambient_open`；
+默认演示 `--ambient-executor off` 下环境声本来就关着，而 S3 的快路径没有任何回写通道。
+后果：连续电视/播客会让端侧对话态一直 engaged（EQ 压平、D41/D48 掩蔽停摆），即使 LLM
+判 `dialogue=no` 也纠正不回来。D40 当时明确把这部分列为 TODOS A1（"LLM 迟到否决回写
+S3 快路径"），本轮实现。
+
+**决定**：
+
+1. 新增 S3 控制行 `dialog no [ttl_ms]` / `dialog yes`（纯文本控制行，与 `voiceprint` 同
+   风格；ack 也是纯文本，monitor 可见，host 协议解析器忽略）。TTL 缺省 20 s（与上位机
+   `_DECISION_TTL_S` 一致），上限 120 s 防御坏行。
+2. S3 在 TTL 内**只否决"是不是对话"**：已 engaged/anticipating 立刻转入 releasing
+   （媒体按 restore 常数平滑回 100%、`ambient_open` 意图关闭）；TTL 内新的对话证据
+   不认——否则同一段连续语音下一拍又把状态机顶回 engaged，否决就失效。噪声/EQ/掩蔽
+   照常：背景人声回落到 `EXTERNAL_VOICE_INTENT`（掩蔽），这是本决定想要的结果。
+3. host 只回写**新鲜**否决（`ambient_authorization()` 的 `age_s <= ttl_s`），每 5 s
+   续期一次；判定过期或撤销时只发一次 `dialog yes`；退出/串口断开时也撤销。
+4. 遥测：命令帧追加 `dialog_veto` 布尔键（不涨 schema，旧固件缺键 = `None`）。它是
+   "否决有没有到设备"的现场证据，也是判断固件是否已带 A1 的协议依据。
+5. TTL 在端侧也有一份：host 崩了 / 串口断了 / LLM 超时，S3 必须自己 fail-open 回
+   D16 预判，不能永久压平 EQ。
+
+**验证**：C++ 12/12（controller 127/127：否决关闭环境声意图、媒体回 100%、背景人声转
+掩蔽、撤销后 0.8 s 重新 engaged；conversation_awareness 67/67：TTL 内持续证据不能
+重新确认）；host 94 组 / 7946 断言（回写节流/新鲜度/撤销、旧固件缺键 = None）；固件
+编译通过。**未刷机、未真机验收**：连续播客/电视场景下 LLM 判 no 后设备应报
+`dialog_veto=true`、mode 从 FLAT 回到 SONG_EQ/EXTERNAL_VOICE_INTENT（D49 固件没有
+`dialog_veto` 键，可直接据此判断是否已刷到 A1）。
+
+**文件**：`main/app_main.cpp`、`main/{controller.hpp,controller.cpp}`、
+`main/conversation_awareness.{hpp,cpp}`、`test/{controller_test.cpp,conversation_awareness_test.cpp}`、
+`tools/host/{__main__.py,protocol.py,state.py,tests/test_host.py}`。

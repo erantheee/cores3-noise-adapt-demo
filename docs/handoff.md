@@ -3,15 +3,30 @@
 > 每轮收尾更新本文件（≤2.5KB）。新会话顺序：`AGENTS.md` → 本文件 → `docs/INDEX.md` → 按需读。
 > 旧版交接已归档 `docs/handoff-archive-20261023.md`。
 
-## 最新补充（2026-10-28 上午）：补提交上一轮 host 修复 + D42 门文档同步
+## 最新补充（2026-10-28 上午）
 - 工作树里 2026-10-26 晚/10-27 的两处 host 修复已提交 **`1bade26`**（环境声门只认
-  LLM 语义确认；滚动分段遥测/声纹对齐），host 93 组 / 7932 断言 + 千问 11 项 + ctest 12/12 复跑通过。
-- 文档同步：D42 加"2026-10-26 晚更新（触发源收窄）"、`product-alignment` 执行门口径、
-  README D42 段；此前只写在代码注释里。
+  LLM 语义确认；滚动分段遥测/声纹对齐）；**A1/D50 已实现**（见下节，代码待提交）。
+- 文档同步：D42 加"2026-10-26 晚更新（触发源收窄）"；新增 D50（LLM 迟到否决回写 S3）；
+  `product-alignment`/README/TODOS/plan-status 同步。
 - **设备当前未连**（无 `/dev/cu.usbmodem*`，8787 未运行）：D49 贴耳打字听感验收、A1 刷机
-  验收都要等设备到。下一步代码项 = TODOS **A1**（LLM 迟到否决回写 S3 快路径；host 采集
-  登记 10-26 已修，只剩 `dialog no|yes [ttl]` 控制行 + S3 强制释放）。
+  验收都要等设备到。固件二进制已按 A1 编译好（`build/cores3_noise_adapt_demo.bin`）。
 - 下方"最新补充：千问接口切换"为 10-26 记录，HEAD 行已过期，以本段为准。
+
+## 本轮内容（2026-10-28 · D50 / TODOS A1：LLM 迟到否决回写 S3 快路径）
+- 控制行：S3 新增 `dialog no [ttl_ms]` / `dialog yes`（纯文本，ack `dialog ack ...`，
+  非 JSON；TTL 缺省 20 s、上限 120 s）。host 只在否决**新鲜**（`age_s <= ttl_s`）时回写，
+  每 5 s 续期；撤销/判定过期/退出时发一次 `dialog yes`。默认 `--ambient-executor off`
+  也回写——默认 demo 最需要它（环境声本就关，但 S3 对话态会压平 EQ、停掉掩蔽）。
+- S3 行为：TTL 内只否决"是不是对话"——engaged/anticipating 立即转 releasing（媒体平滑
+  回 100%、ambient_open 关），TTL 内新证据不认；背景人声回落 `EXTERNAL_VOICE_INTENT`
+  掩蔽。TTL 到点端侧自 fail-open 回 D16（host 崩了不会永久压平 EQ）。
+- 遥测：命令帧追加 `dialog_veto`（不涨 schema）；host protocol/state 解析为可选键。
+- 验证：C++ 12/12（controller 127/127、conversation 67/67）；host 94 组 / 7946 断言；
+  千问 11 项；**固件编译通过（未刷机）**。待真机：连续电视/播客下 LLM no 后设备报
+  `dialog_veto=true`、mode 从 FLAT 回 SONG_EQ/EXTERNAL_VOICE_INTENT。
+- 现场刷机验收命令（设备到场后）：
+  `sh tools/free_port.sh --kill` → `sh tools/build.sh flash` → `sh tools/host_up.sh --detach`
+  → 面板看 mode/`dialog_veto`；串口 monitor 可见 `dialog ack no 20000`。
 
 ## 最新补充：千问接口切换（2026-10-26）
 - 分支 `feature/apple-conversation-awareness`；千问轮改动已于 10-26 提交，HEAD 见 `git log`。
@@ -75,16 +90,19 @@
   `kNoiseMask*` / `kKeyboardMask*` 常量，改后 ctest → free_port → flash → host_up。
 - 键盘掩蔽在 SAFETY_HOLD 豁免：猛敲把 250 ms 平滑电平顶过 -30 dBFS 仍会有模式边界抽动
   （D38 既有）；若仍刺耳可给 keyboard_event 加模式滞回。
-- 下一步代码项：**A1 LLM 迟到否决回写 S3 快路径**（host 采集登记 10-26 已修，只剩
-  `dialog no|yes [ttl]` 控制行 + S3 在 TTL 内强制释放对话态；无设备只能做离线测试）。
+- 下一步代码项：~~A1~~ **已实现（D50，待刷机+真机验收）**。真机验收场景：连续电视/
+  播客说话时看设备 `dialog_veto=true`、`mode` 从 FLAT 回 SONG_EQ/EXTERNAL_VOICE_INTENT，
+  且 LLM 判 yes 后能恢复对话下压。
 - 遗留（不变）：A0 真人验收、#38 房间本底、D47 三态阈值、6.5 vs 8.0 dB、
   声纹 self-veto 默认关、other 快锁。
 
-## 当前环境（2026-10-28 11:5x）
+## 当前环境（2026-10-28 12:1x）
 - 8787 host **未运行**；CoreS3 **未连**（无 `/dev/cu.usbmodem*`，只有蓝牙端口）；
-  工作树在 `1bade26` 之后。设备到场后：`sh tools/free_port.sh --kill` →
+  工作树已按"固件 / 上位机 / 文档"提交 D50（HEAD 见 `git log`）。固件二进制已按 D50
+  编译（`build/cores3_noise_adapt_demo.bin`，未刷机）。
+- 设备到场后：`sh tools/free_port.sh --kill` → `sh tools/build.sh flash`（刷 D49+D50）→
   `sh tools/host_up.sh --detach`（默认三件套：QQ音乐 systemeq basic + ambient-gate voice +
-  voiceprint）；要刷固件再加 `sh tools/build.sh flash`。LLM 千问（见上方"最新补充"）。
+  voiceprint）。先验收 D49 贴耳打字掩蔽，再做 D50 连续播客/电视验收。LLM 千问（见上方）。
 
 ## 千问 ASR 400 根因（2026-10-26 16:4x 只读诊断；结论已落到 10-26 提交的 400 语义）
 - 结论：模型没坏。实测干净 TTS / -52 dBFS 弱语音 / SNR 0 dB 混噪 / 400 ms 短句均 200；HTTP 400 `{}` 只出现在窗口内无可识别人声（静音、键盘、房间噪声）。seg0001 最响 1.5 s（键盘）400、最安静 2.5 s 200（"你是写出来了。"）；本地 qwen3-asr 判断一致（噪声→"嗯。"）。
