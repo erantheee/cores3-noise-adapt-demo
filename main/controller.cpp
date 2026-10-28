@@ -675,15 +675,36 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms,
         } else if (smoothed_dbfs_ < -56.0f) {
             command.environment = EnvironmentKind::quiet;
             command.tuning_mode = TuningMode::flat;
-        } else if (speech_active || command.conversation == ConversationState::likely) {
-            command.environment = EnvironmentKind::voice_likely;
-            command.tuning_mode = TuningMode::external_voice_intent;
-        } else if (smoothed_dbfs_ > -30.0f) {
-            command.environment = EnvironmentKind::loud;
-            command.tuning_mode = TuningMode::safety_hold;
         } else {
-            command.environment = EnvironmentKind::steady_noise;
-            command.tuning_mode = TuningMode::song_eq;
+            // D54：背景人声模式加滞回。`speech_active` 来自 1 s 事件窗 + 逐帧 voice，
+            // 音乐漏音/转头会让它在相邻拍之间跳；直接跟它切模式 = 歌曲 brightness 抽动
+            // （2026-10-28 现场"声音忽大忽小"）。进 300 ms、出 500 ms。
+            const bool voice_candidate =
+                speech_active || command.conversation == ConversationState::likely;
+            if (voice_candidate) {
+                voice_mode_on_ms_ += dt_ms;
+                voice_mode_off_ms_ = 0.0f;
+            } else {
+                voice_mode_off_ms_ += dt_ms;
+                voice_mode_on_ms_ = 0.0f;
+            }
+            if (!voice_mode_active_ && voice_mode_on_ms_ >= 300.0f) {
+                voice_mode_active_ = true;
+            } else if (voice_mode_active_ && voice_mode_off_ms_ >= 500.0f) {
+                voice_mode_active_ = false;
+            }
+            if (!voice_mode_active_) {
+                if (smoothed_dbfs_ > -30.0f) {
+                    command.environment = EnvironmentKind::loud;
+                    command.tuning_mode = TuningMode::safety_hold;
+                } else {
+                    command.environment = EnvironmentKind::steady_noise;
+                    command.tuning_mode = TuningMode::song_eq;
+                }
+            } else {
+                command.environment = EnvironmentKind::voice_likely;
+                command.tuning_mode = TuningMode::external_voice_intent;
+            }
         }
 
         // Exaggeration is deliberate and it is not applied uniformly:

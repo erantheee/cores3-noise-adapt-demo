@@ -303,7 +303,8 @@ constexpr std::size_t kLowBandCount = 5;
 /// 2026-10-21（D38）：曲线已经是有符号的，低频 346/452 Hz 可能是**负值（去糊）**。
 /// 风策略只压"抬升"（正增益），负的去糊段原样保留——把削减也乘 1/4 等于风一吹就少削，
 /// 与"风噪占满低频、少抬低频"的目标相反。
-inline void apply_wind_eq(EarbudCommand& command) {
+inline void apply_wind_eq(EarbudCommand& command, bool wind_active = true) {
+    if (!wind_active) return;
     if (command.tuning_mode != TuningMode::song_eq) return;
     if (command.conversation != ConversationState::none) return;
     for (std::size_t band = 0; band < wind_eq::kLowBandCount; ++band) {
@@ -389,6 +390,13 @@ private:
     float keyboard_mask_depth_ = 0.0f;
     float valid_ms_ = 0.0f;
     float invalid_ms_ = 0.0f;
+    /// 背景人声模式（EXTERNAL_VOICE_INTENT）的滞回状态（D54，2026-10-28 现场
+    /// "歌曲声音忽大忽小"）。1 s 事件窗的音乐漏音会让 `speech_active` 在相邻拍之间跳，
+    /// 模式在 SONG_EQ↔EVI 之间来回切、presence 抬升忽有忽无 → 听成音量/亮度抽动。
+    /// 进 EVI 要连续 300 ms 证据，退出要连续 500 ms 无证据。
+    float voice_mode_on_ms_ = 0.0f;
+    float voice_mode_off_ms_ = 0.0f;
+    bool voice_mode_active_ = false;
     /// Apple 式对话感知：自身语音触发 → 下压媒体 → 保持 → 恢复。
     /// 触发证据、时序参数与状态机都在 main/conversation_awareness.hpp 里；
     /// 旧实现的轮次启发式（语音→停顿→再语音）已删除，理由见 docs/apple-conversation-awareness.md。

@@ -1104,7 +1104,27 @@ void processing_task(void*) {
 
         // 风场景 EQ（D21）：只在放歌且没有对话时压低频抬升上限；对话优先。
         if (sound_event_out.valid && sound_event_out.cls == sound_event::Class::wind) {
-            apply_wind_eq(command);
+            // D54：wind 事件去抖（转头/呼吸/衣物摩擦会让 wind 在相邻拍跳变，wind EQ 把
+            // 低频抬升压到 1/4 → 现场听成"歌曲声音忽大忽小"）。连续 ≥800 ms wind 才应用，
+            // 停止后保持 2 s；事件遥测本身不变。
+            {
+                static int64_t wind_start_us = 0;
+                static int64_t wind_last_us = 0;
+                static int64_t wind_hold_until_us = 0;
+                const bool wind_frame =
+                    sound_event_out.valid && sound_event_out.cls == sound_event::Class::wind;
+                if (wind_frame) {
+                    if (wind_last_us == 0 || now_us - wind_last_us > 300 * 1000) {
+                        wind_start_us = now_us;
+                    }
+                    wind_last_us = now_us;
+                    wind_hold_until_us = now_us + 2 * 1000 * 1000;
+                }
+                const bool wind_active =
+                    wind_start_us != 0 && wind_hold_until_us > now_us &&
+                    now_us - wind_start_us >= 800 * 1000;
+                apply_wind_eq(command, wind_active);
+            }
         }
 
         const float analyse_ms = static_cast<float>(analyse_done_us - analyse_started_us) / 1000.0f;

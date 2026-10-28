@@ -243,7 +243,9 @@ int main() {
         EarbudCommand out;
         // -54 dBFS、voice 0.8：speech_active 成立，但对话 cue（-58 起按 16 dB 归一）
         // 只有 0.25，低于 0.5 门限 -> 不进入 anticipating，走 external_voice_intent。
-        for (int i = 0; i < 12; ++i) out = background.update(frame(-54, 0.8f), 150,
+        // D54：进 EXTERNAL_VOICE_INTENT 需要 300 ms 滞回，之后还有 650 ms EQ 平滑；
+        // 20 拍 × 150 ms 让曲线收敛。
+        for (int i = 0; i < 20; ++i) out = background.update(frame(-54, 0.8f), 150,
                                                               false, false, false,
                                                               /*speech_event=*/true);
         check(out.conversation == ConversationState::speech_nearby,
@@ -299,12 +301,40 @@ int main() {
 
         AdaptController strong;
         EarbudCommand full_mask;
-        for (int i = 0; i < 12; ++i) {
+        for (int i = 0; i < 20; ++i) {
             full_mask = strong.update(frame(-54.0f, 0.8f), 150, false, false, false,
                                       /*speech_event=*/true);
         }
         check(full_mask.eq_gain_db[14] >= 3.0f,
               "high-confidence background voice still reaches the full masking depth");
+    }
+
+    // ---- D54：背景人声模式滞回（2026-10-28 现场"歌曲声音忽大忽小"）----
+    {
+        AdaptController flicker;
+        EarbudCommand out;
+        // 先让平滑电平进入正常区间（-54 dBFS）。
+        for (int i = 0; i < 12; ++i) out = flicker.update(frame(-54.0f, 0.0f), 100);
+        // 单帧 speech：不能立刻切 EVI（1 s 事件窗漏音会让它每拍跳）。
+        out = flicker.update(frame(-54.0f, 0.8f), 100, false, false, false,
+                             /*speech_event=*/true);
+        check(out.tuning_mode != TuningMode::external_voice_intent,
+              "a single speech-like frame does not flip the mode to EVI");
+        // 连续 300 ms 之后进入 EVI。
+        for (int i = 0; i < 3; ++i) {
+            out = flicker.update(frame(-54.0f, 0.8f), 100, false, false, false,
+                                 /*speech_event=*/true);
+        }
+        check(out.tuning_mode == TuningMode::external_voice_intent,
+              "300 ms of sustained voice enters EVI (hysteresis)");
+        // 单帧静音也不能立刻退出。
+        out = flicker.update(frame(-54.0f, 0.0f), 100);
+        check(out.tuning_mode == TuningMode::external_voice_intent,
+              "a single quiet frame does not immediately leave EVI");
+        // 连续 500 ms 静音后退出（回到 SONG_EQ）。
+        for (int i = 0; i < 5; ++i) out = flicker.update(frame(-54.0f, 0.0f), 100);
+        check(out.tuning_mode == TuningMode::song_eq,
+              "500 ms without voice leaves EVI");
     }
 
     // ---- 对话门槛高于 EQ 门槛：一般噪声不能把对话顶起来 ----
@@ -590,6 +620,14 @@ int main() {
         for (std::size_t band = 0; band < kBandCount; ++band) flat.eq_gain_db[band] = 6.0f;
         apply_wind_eq(flat);
         check(flat.eq_gain_db[0] == 6.0f, "wind EQ does not shape non-song modes");
+
+        EarbudCommand no_wind;
+        no_wind.tuning_mode = TuningMode::song_eq;
+        no_wind.conversation = ConversationState::none;
+        for (std::size_t band = 0; band < kBandCount; ++band) no_wind.eq_gain_db[band] = 6.0f;
+        apply_wind_eq(no_wind, /*wind_active=*/false);
+        check(no_wind.eq_gain_db[0] == 6.0f && no_wind.eq_gain_db[4] == 6.0f,
+              "wind EQ stays off while the wind debounce is not satisfied (D54)");
 
         EarbudCommand already_low;
         already_low.tuning_mode = TuningMode::song_eq;

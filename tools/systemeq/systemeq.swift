@@ -1165,10 +1165,13 @@ var stallStreak = 0
 let controlTimer = Timer(timeInterval: 0.05, repeats: true) { _ in
     // 先看上一拍 EQ 之后有没有削波：有就收缩正增益预算（最快 1.4 dB/s），输出干净则慢回。
     let out = outMeter.take()
+    // D54（2026-10-28 现场"歌曲声音忽大忽小"）：headroom 的回落要**很慢**。原来 0.02/50ms
+    // （≈0.4 dB/s）会在响/静交替的段落里来回收缩又放开，听成音量抽动；改成 0.004/50ms
+    // （≈0.08 dB/s，20 s 才回 1 dB），收紧仍然快（秒级），避免削波。
     if out.peak >= 1.0 || out.clipFrames > 0 {
         outHeadroomTrimDb = min(2.0, outHeadroomTrimDb + 0.10)
     } else if out.peak < 0.90 {
-        outHeadroomTrimDb = max(0, outHeadroomTrimDb - 0.02)
+        outHeadroomTrimDb = max(0, outHeadroomTrimDb - 0.004)
     }
     applyEq(state)
     // 链路自检（2026-10-23）：tap 采样率与输出设备不一致时（如 QQ 音乐 48 kHz、蓝牙
