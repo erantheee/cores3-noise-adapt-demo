@@ -1560,6 +1560,15 @@ S3 快路径"），本轮实现。
 `main/conversation_awareness.{hpp,cpp}`、`test/{controller_test.cpp,conversation_awareness_test.cpp}`、
 `tools/host/{__main__.py,protocol.py,state.py,tests/test_host.py}`。
 
+**2026-10-28 真机修正：只回写 `llm_veto`，不回写 `local_veto`。** 默认 demo（千问）启动
+10 s 内设备就报 `dialog_veto=true`——ASR 段"连续静音 3 秒 / 服务端未检出人声"产生本地
+否决（source=local），host 把它也回写了。后果：没人说话时 S3 被锁在"释放对话态"的 TTL
+里；用户随后真开口，端侧预判反而被压住，首响退化到 LLM 往返，违背 D34/D40 的"端侧快
+路径先动"。本地否决只是"这段音频没抽出人声"，**不是**"这不是对话"的语义证据。
+现在只有 `state == "llm_veto"` 才回写；语义否决之后若降级成本地否决，host 发
+`dialog yes` 让 S3 提前解除。host 94 组 / 7947 断言；真机：`dialog_veto` 在静音时
+保持 false，`control.last` 不再出现静音触发的 `dialog no`。
+
 
 ---
 
@@ -1593,3 +1602,36 @@ FLAT 只占 4%（D49 前耳边 47%）、conversation 从不 LIKELY、媒体全�
 下一步用它驱动 D48 键盘掩蔽 + 把瞬态帧按非语音处理（保护对话证据）。
 
 **文件**：`main/controller.cpp`、`test/controller_test.cpp`。
+
+---
+
+## D52 · 2026-10-28 歌曲清晰度预算：输出削波计量 + 正增益封顶 + 自适应 headroom
+
+**背景**：同一天贴耳混噪现场，用户听感：「敲击声仍然清晰，但歌曲里的人声已经开始有
+毛刺」。把"歌曲掩蔽"（用歌曲盖噪声）与"听清歌曲"（歌曲自身不失真）拆开后，后者确实
+在被前者的增益链破坏：
+
+1. 安静时 applied 峰值 **3.9 dB**、打字时 **5.5–6.4 dB**（demo 基线 + 内容曲线 + D48
+   噪声/键盘掩蔽三层叠加，24 段 0.30 oct 窄带）；
+2. tap 输入峰值已 **0.98–1.03**（QQ 音乐素材本身接近满幅），叠加后 EQ **输出**峰值
+   **1.8**、硬削波 **0.89%** 采样——这是"毛刺"的直接来源（D39 的既有边界：不加 limiter）。
+
+**决定（tools/systemeq，host 侧，不刷固件）**：
+
+1. EQ 之后加输出计量：`out_peak` / `out_clip_frames` / `out_frames`（tap 上的 `peak`
+   在 EQ 之前，看不到 EQ 抬了多少）。
+2. 50 ms 控制拍按输出削波调 `headroom_trim_db`（0…2 dB；最快 1.4 dB/s 收紧、输出干净
+   后慢回），只收缩**正增益的动态部分**（S3 建议），削减/去糊（负增益）不动。
+3. 正增益总预算封顶 `maxBoostDb = 5.0`（负方向仍到 -24 dB）。
+4. **不加宽滤波带宽**：实测 0.30→0.55 oct 会让并联相邻段重叠、等效增益翻倍（输出峰值
+   1.8→4.0、削波 4.6%），毛刺更重——0.30 保持不动。这是本条的实测教训，写进代码注释。
+
+**数值结果**：10 s 窗口削波 **0.89% → 0.03%**；applied 峰值由 headroom 在 2.7–3.6 dB
+之间自动收紧/恢复。注意：这只能减少"EQ 附加的削波"，源素材自身满幅的极少数峰值仍可能
+削波；要彻底零削波需要 limiter 或整体降增益，那是产品取舍，本轮不做。
+
+**验收（待用户）**：贴耳 + 音乐 + 打字再听一次——人声毛刺是否明显减轻。敲击掩蔽不靠
+继续抬静态增益，下一步是 D51 后续的"帧内瞬态检测 + 短时窄带补"。
+
+**文件**：`tools/systemeq/systemeq.swift`、`tools/host/systemeq.py`、构建产物
+`tools/systemeq/systemeq`；数据 `记录/位置对照/20261028-d49-ear-typing.jsonl`。

@@ -40,8 +40,26 @@
   高出底噪 16–36 dB；不敲 <1 次/s），但 event 分类器在 1 s 窗里基本看不到（打字段
   keyboard 帧只占少数，多数标 speech/quiet；音乐内容大量标 speech）。下一步：帧内瞬态
   检测器驱动 D48 键盘掩蔽 + 把瞬态帧按非语音处理。
-- 固件已按 D50+D51 编译（`build/cores3_noise_adapt_demo.bin`），**未刷机**；当前在线设备
-  仍是 D49（帧里无 `dialog_veto` 键）。
+- **2026-10-28 12:26 已刷机 D50+D51**（`sh tools/build.sh flash`，Hash verified；重启后
+  帧里已有 `dialog_veto` 键、`mic2_valid=true`）。同时验证到 D50 的一个真机问题并修正：
+  **本地否决（local_veto）也回写**会让静音时的 ASR 段把 S3 快路径锁在"释放"TTL 里，
+  现在只回写 `llm_veto`（见 D50 2026-10-28 修正段）。host 94 组 / 7947 断言。
+- **2026-10-28 12:3x D52（systemeq，host 侧）**：实测 EQ 输出峰值 1.8、0.89% 采样硬削波
+  → 用户听到的"人声毛刺"。加 EQ 后输出计量（`out_peak`/`out_clip_frames`）、50 ms 拍
+  自适应 headroom（只收正动态增益 0…2 dB）、正增益总预算 5 dB；**不要加宽滤波带宽**
+  （0.55 oct 让并联段重叠、等效增益翻倍：峰值 1.8→4.0、削波 4.6%）。
+- **刷机后 150 s 验收数据**（`记录/位置对照/20261028-d51-d52-accept.jsonl`，1441 帧）：
+  * D51 验证：FLAT 只剩 **7 帧 / 5 段**（旧 34 段/124 s），且全部 ≤200 ms、都是
+    "confirmed anticipation（500 ms 证据）"或 artifact（削波帧）——单帧瞬态闪平消失；
+    conversation 从不 LIKELY；media 全程 100。
+  * D50 修正验证：`dialog_veto` 全程 false；静音时不再下发 `dialog no`。
+  * D52 计量：150 s 累计削波 0.2%（改前 0.89%）；headroom 在 0–2 dB 间自动调节，
+    applied 峰值 2.0–5.0 dB。剩余削波集中在"响歌 + SONG_EQ/quiet"与
+    "音乐漏音被标成 speech → EXTERNAL_VOICE_INTENT"（12% 帧）——见下一步。
+- 当前在线：D50+D51 固件 + 新 systemeq/host；host 日志 `/tmp/cores3host/host.log`。
+- **下一步（待用户听感）**：① 人声毛刺是否减轻；② 敲击掩蔽是否更弱（headroom 收缩的
+  代价）；③ 若毛刺仍在，优先做"音乐漏音不当作背景人声"（EXTERNAL_VOICE_INTENT 抑制，
+  需要固件+刷机）；键盘掩蔽的帧内瞬态检测（D51 后续）排在后面。
  
 ## 最新补充：千问接口切换（2026-10-26）
 - 分支 `feature/apple-conversation-awareness`；千问轮改动已于 10-26 提交，HEAD 见 `git log`。
