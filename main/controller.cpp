@@ -93,9 +93,14 @@ constexpr std::size_t kKeyboardFirstBand = 8;     // 996.8 Hz
 constexpr std::size_t kKeyboardLastBand = 16;     // 3414.7 Hz
 constexpr float kKeyboardMaskFloorDbfs = -52.0f;
 constexpr float kKeyboardMaskSpanDb = 18.0f;
-/// 掩蔽深度的独立时间平滑：起音 400 ms、释放 1200 ms。
+/// 掩蔽深度的独立时间平滑：起音 400 ms、释放 1200 ms（噪声掩蔽）。
 constexpr float kMaskDepthAttackMs = 400.0f;
 constexpr float kMaskDepthReleaseMs = 1200.0f;
+/// 键盘掩蔽单独的时间常数（2026-10-28 现场追加）：起音要跟手（轻/重敲响应快一点），
+/// 释放要慢——用户反馈"完全安静后，歌曲调 EQ 的那一下比较唐突"，1.2 s 的回落太陡；
+/// 2.6 s 让"盖住键盘"自然退场，而不是一下子把音乐音色拨回去。噪声掩蔽仍用上面那组。
+constexpr float kKeyboardMaskAttackMs = 250.0f;
+constexpr float kKeyboardMaskReleaseMs = 2600.0f;
 
 float clamp01(float value) { return std::clamp(value, 0.0f, 1.0f); }
 
@@ -231,10 +236,11 @@ float soft_below(float value, float edge, float softness) {
 /// reaches 19, so the longest run is the discriminating signal. The pinned-share test
 /// additionally catches square-ish waveforms.
 /// 帧内瞬态（键盘）检测阈值（D53）。离线标定：现场肩上打字时 `hf_crest` p90≈6 dB、
-/// 点击帧 9–15 dB；停手/纯音乐 p90≈4 dB。阈值 9 dB 让"打字 2–4 次/s vs 停手 0.2–0.6
-/// 次/s"分开；噪声/音乐鼓点偶尔超过时只影响一拍，后面还有 1 s 窗口的 2 次门限。
+/// 点击帧 9–15 dB；停手/纯音乐 p90≈4 dB。2026-10-28 现场追加：重打命中好、轻打不明显
+/// → 阈值从 9 dB 收到 7.5 dB；纯音乐鼓点偶发的单拍由 1 s 窗口"≥2 次"门限挡掉
+/// （实测纯音乐 0.3–0.6 次/s）。
 namespace transient_thresholds {
-constexpr float kHfCrestDb = 9.0f;
+constexpr float kHfCrestDb = 7.5f;
 }  // namespace transient_thresholds
 
 namespace clip_thresholds {
@@ -748,7 +754,7 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms,
         noise_mask_depth_ = slew(noise_mask_depth_, noise_mask_target, dt_ms,
                                  kMaskDepthAttackMs, kMaskDepthReleaseMs);
         keyboard_mask_depth_ = slew(keyboard_mask_depth_, keyboard_mask_target, dt_ms,
-                                    kMaskDepthAttackMs, kMaskDepthReleaseMs);
+                                    kKeyboardMaskAttackMs, kKeyboardMaskReleaseMs);
 
         // 曲线只在三种"在放歌"的模式下写：稳态噪声、背景人声、安全保持。
         // 安静与对话/自身语音保持平直（flat 的 eq 目标为 0，由下面的 slew 带回）。

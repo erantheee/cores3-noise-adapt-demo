@@ -66,9 +66,16 @@
   1 s 内 ≥2 次 → `typing_active`（保持 300 ms），并入 keyboard_event / non_voice_event；
   遥测 `typing_active`。离线：noise_analyzer 51/51、controller 128/128、host 94/7950。
   **待现场验证**：肩上打字时 typing_active 占比、键盘掩蔽抬升、听感（稳/够不够）。
-- **下一步**：① 肩上位听感验证（当前录制）；② 若仍偏弱 → 调 D48 键盘掩蔽幅度/攻击时间；
-  ③ "音乐漏音不当作背景人声"（EXTERNAL_VOICE_INTENT 抑制）——建议加 host→S3 `music on|off`
-  控制行（S3 不知道音乐是自己放的）；④ A0 真人对话验收仍未做。
+- **D53 第一版现场追加（2026-10-28 15:05，已再刷机）**：① 轻敲不明显 → 帧内瞬态阈值
+  9→**7.5 dB**；② "完全安静后歌曲调 EQ 那一下唐突" → 键盘掩蔽改独立包络（起音 250 ms、
+  释放 **2600 ms**，原与噪声掩蔽共用 400/1200）；噪声掩蔽不变。noise_analyzer 51/51、
+  controller 128/128。待现场听感（轻/重敲 + 停手后的 EQ 回落）。
+- **D53 第一版数据（14:53–14:58 录制，`记录/位置对照/20261028-d53-verify2.jsonl`）**：
+  重打段 `typing_active` 35–60%、gainKb 2.9–3.05；轻打段 typing_active 0–20%、gainKb 1.5–2.0
+  ——这就是"轻敲不明显"的量化依据；停手 2 s 内 gainKb 从 3.0 掉到 1.7（回落太陡）。
+- **下一步**：① 轻/重敲 + 停手 EQ 回落听感验证；② "音乐漏音不当作背景人声"
+  （EXTERNAL_VOICE_INTENT 抑制）——建议加 host→S3 `music on|off` 控制行（S3 不知道
+  音乐是自己放的）；③ A0 真人对话验收仍未做。
  
 ## 最新补充：千问接口切换（2026-10-26）
 - 分支 `feature/apple-conversation-awareness`；千问轮改动已于 10-26 提交，HEAD 见 `git log`。
