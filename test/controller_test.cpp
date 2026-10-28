@@ -109,6 +109,14 @@ int main() {
     // external_self_voice 显式给 false：声纹没有 self 判定时，D16 的预判必须照常发生。
     {
         AdaptController predictor;
+        // 先把 250 ms 平滑电平带到 -45 左右，模拟"房间有底噪"（现场演示不在静音房）。
+        // 否则前几拍 smoothed_dbfs_ 仍在 -56 以下，模式会因为"安静"而 flat，掩盖掉
+        // 下面这条断言要验证的行为（未确认预判不压平 EQ）。
+        for (int i = 0; i < 10; ++i) {
+            predictor.update(frame(-45, 0.0f), 100, /*non_voice_event=*/false,
+                             /*external_self_voice=*/false,
+                             /*keyboard_event=*/false, /*speech_event=*/false);
+        }
         // -50 dBFS：比近场代理的门限（-45）更低，所以 own_voice 证据为 0；但对话 cue 的
         // 门限是 -58 起，仍应触发预判。这条就是"预判不依赖我开口"的最小证明。
         auto first = predictor.update(frame(-50, 0.8f), 100, /*non_voice_event=*/false,
@@ -130,14 +138,20 @@ int main() {
         check(preview.conversation == ConversationState::speech_nearby,
               "400 ms is not yet anticipating at the controller (preview needs 500 ms)");
         check(!preview.ambient_open, "no ambient intent before confirmation");
-        check(all_bands_flat(preview), "nearby voice leaves the song EQ flat");
+        // 2026-10-28 贴耳打字现场修正：单帧/短瞬态不能压平 EQ。旧写法在状态机一进
+        // anticipating（首帧证据）就 flat，导致敲击/音乐瞬态让 EQ 100–400 ms 闪平
+        // （124 s 里 34 次，掩蔽被反复打断）。现在 EQ 压平跟着"预览确认（500 ms）"走。
+        check(preview.tuning_mode == TuningMode::external_voice_intent,
+              "未确认的预判不压平 EQ：背景人声先走掩蔽");
 
-        // 再 100 ms（累计 500 ms）→ 预下压。
+        // 再 100 ms（累计 500 ms）→ 预下压 + EQ 压平（预览确认）。
         preview = predictor.update(frame(-50, 0.8f), 100, /*non_voice_event=*/false,
                                    /*external_self_voice=*/false,
                                    /*keyboard_event=*/false, /*speech_event=*/true);
         check(preview.media_percent < 95, "500 ms of evidence ducks the media before I speak");
         check(preview.media_percent >= 69, "anticipation preview stays above its bounded floor");
+        check(preview.tuning_mode == TuningMode::flat,
+              "预览确认（500 ms）后 EQ 才压平");
 
         // 再 300 ms（累计 800 ms）→ 确认（2026-10-23：确认保持连续 800 ms，
         // 事件帧中立；见 conversation_awareness 注释）。
@@ -159,8 +173,18 @@ int main() {
         check(engaged.media_percent <= 61, "confirmed conversation ducks to the floor");
         check(engaged.tuning_mode == TuningMode::flat,
               "a conversation never lifts the song EQ");
-        check(all_bands_flat(engaged), "every EQ band stays flat during a conversation");
-        check(engaged.external_voice_gain_db == 0,
+        // EQ 曲线有 650/850 ms 的一阶平滑（D38）：mode 变 flat 之后 band_gain 还要几秒
+        // 才收敛到 0；2026-10-28 起 EQ 从"预览确认（500 ms）"才开始压平、比旧写法晚
+        // 400 ms，所以这里必须给足平滑时间，否则测到的是 slew 尾巴而不是行为。
+        for (int i = 0; i < 70; ++i) {
+            engaged = predictor.update(frame(-50, 0.8f), 100, /*non_voice_event=*/false,
+                                       /*external_self_voice=*/false,
+                                       /*keyboard_event=*/false, /*speech_event=*/true);
+        }
+        check(all_bands_flat(engaged), "every EQ band converges to flat during a conversation");
+        // 标量增益也是 600 ms 一阶释放（D38）：从"预览阶段的背景人声强调"收敛到 0，
+        // 7 s 后只剩 1e-5 量级，按容差判"没有在报现实人声增益"。
+        check(std::fabs(engaged.external_voice_gain_db) < 0.01f,
               "no fake 'real-voice gain' is reported during a conversation");
     }
 

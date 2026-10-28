@@ -590,10 +590,14 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms,
         evidence.dialogue_veto = dialogue_veto;
         awareness_out_ = awareness_.update(evidence, dt_ms);
         const conversation::Output& awareness_out = awareness_out_;
-        // 对话正在发生（预测中或已确认）都算"进入对话"：EQ 必须保持平直，音乐让位。
+        // 对话正在发生（**已确认的预览下压**或确认）都算"进入对话"：EQ 必须保持平直，
+        // 音乐让位。注意这里用 `out.anticipating`（连续证据 ≥500 ms 的预览），而不是
+        // `state == anticipating`（第一帧证据就进）——2026-10-28 贴耳打字现场：
+        // 单帧瞬态会被 1 s 事件窗标成 speech、4 判据 voice 被音乐/敲击顶到 1.0，旧写法
+        // 让状态机 1 帧就 anticipating → EQ 在 100–400 ms 内闪平再回 SONG_EQ（124 s 里
+        // 34 次），掩蔽被反复打断。预览前 500 ms 媒体本来也没下压，EQ 不应先动。
         const bool conversation_active =
-            awareness_out.state == conversation::State::anticipating ||
-            awareness_out.state == conversation::State::engaged;
+            awareness_out.anticipating || awareness_out.engaged;
 
         command.conversation =
             awareness_out.engaged
