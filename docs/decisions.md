@@ -1738,3 +1738,39 @@ wind EQ 要 800 ms 才生效（短暂阵风不再触发，符合"只在大风时
 
 **文件**：`main/{controller.hpp,controller.cpp,app_main.cpp}`、`test/controller_test.cpp`、
 `tools/systemeq/systemeq.swift`。
+
+## D55 · 2026-10-28 环境声不开的根因：跨段上下文被静音清空 + "身份 unknown" 被当成 unclear
+
+**背景（用户 17:33「环境声还是没有开啊」）**：现场 host 17:07–17:36 的 132 段候选里，
+LLM 判 `dialogue=yes` **0 次**（no 44 / unclear 88），S3 只在 17:29:12 发过 35 帧
+`ambient_open` 意图；而当时 host 还是 `--ambient-executor off`（当天 17:04 用
+「启动演示.command」启动的默认值）。两层叠加 → 环境声永远不出声。现场 98 段有转写的
+片段**身份全部 unknown**（voiceprint self 分数 0.35–0.59，阈值 0.8），这是门关着的直接原因。
+
+**根因 1（实现 bug）**：`observe_frame()` 每遇"连续静音 3 秒"结束一段就置
+`_new_episode_pending`，下一次开口推进授权 `epoch` 时**顺手把 `_llm_context` 清空**。
+132 段里 96 段是以静音结束的 → LLM 每次只看到一句 unknown 转写，既无 self/other 交替，
+也无"前文已判 yes"的延续证据。修：静音切新 episode 只推进授权轮次（旧 LLM 判定必须失效），
+**不清语义上下文**；轮次/判定带 `at`，按 `_CONTEXT_TTL_S=120s` 淘汰；`_context_facts()`
+对 LLM 输出 `age_s`（距现在秒数），prompt 明确"age_s 约 60 s 内的轮次才算同一场对话延续"。
+
+**根因 2（prompt 自相矛盾）**：原 prompt 第 3) 条允许 `identity_available=false` 时按"两个
+由静音分开、语义像问答/接话的轮次"判 yes，但下一句"判 unclear：开场、**身份不足**、…"
+又把 unknown 一律兜底成 unclear。修：明确"identity_available=false **本身不是** unclear
+的理由”；全 unknown 的连续转写若语义像多人讨论/接话（问答、称呼、承接、反驳、短应答），
+也判 yes；只有内容确实像单人独白/播音/朗读才 unclear。**风险**：放宽后播客/电视（也是
+两人对话语义）可能被误判 yes → 环境声误开；本轮只在现场会议数据上验到正样本，负样本
+（播客/电视）未采集，D42 的"背景声不误开"护栏因此变弱，后续需补负样本回归。
+
+**验证（离线重放今天真实分段，逐段调千问）**：
+* 17:31–17:33 会议窗口：14/14 段判 yes（修复前同窗口 yes=0）；
+* 17:29–17:31 窗口：11 段中 9 段 yes（含 17:29:12 那次的 S3 意图段）；
+* 17:08–17:11（语义更像播客/独白）窗口：0 段 yes；16:58 耳语独白：0 段 yes（不过度触发）。
+* host 自测 **98 组 / 7967 断言**（新增 2 组：上下文跨 episode 保留 / TTL 淘汰）。
+
+**执行端**：同日 17:48 起 host 改为 `--ambient-executor relay`（快照 `executor=s3-relay`、
+`available=true`、device=Xiaomi 耳夹）；门仍是 `--ambient-gate voice`（环境声实际只由新鲜
+`llm_confirmed` 放行）。**待真机验收**：真实对话时面板判定 yes、环境声卡片"中继已开"、
+耳机里听到中继声（Xiaomi 耳夹总时延约 385–405 ms）；独白/电视保持不开。
+
+**文件**：`tools/host/assistant.py`、`tools/host/tests/test_host.py`。

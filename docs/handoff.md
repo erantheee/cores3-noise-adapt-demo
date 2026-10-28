@@ -3,6 +3,29 @@
 > 每轮收尾更新本文件（≤2.5KB）。新会话顺序：`AGENTS.md` → 本文件 → `docs/INDEX.md` → 按需读。
 > 旧版交接已归档 `docs/handoff-archive-20261023.md`。
 
+## 最新补充（2026-10-28 17:4x · 环境声不开：上下文被清 + unknown 被当 unclear，D55）
+- 用户报「环境声还是没有开啊」。查当天 17:07–17:36 的 132 段：LLM `dialogue=yes` **0 次**
+  （no 44 / unclear 88），S3 只在 17:29:12 发过 35 帧 `ambient_open` 意图；且 host 是
+  17:04「启动演示.command」起的默认 **`--ambient-executor off`** → 意图再真也不出声。
+- 根因 1（bug）：96/132 段以"连续静音3秒"结束，`observe_frame` 推进授权 epoch 时把
+  `_llm_context` 清空 → LLM 每段只看到一句 unknown，永远拼不出交替/延续。
+  修：静音切轮次**只推进 epoch，不清语义上下文**；条目带 `at`，`_CONTEXT_TTL_S=120s`
+  淘汰；给 LLM 的 `_context_facts()` 输出 `age_s`，prompt 写清 age_s 用法。
+- 根因 2（prompt 自相矛盾）：第 3) 条允许 unknown 按语义判 yes，但"判 unclear：身份不足"
+  把它盖掉；当天 98 段转写身份**全 unknown**（声纹 0.35–0.59 vs 0.8）。修：明确
+  "identity_available=false 本身不是 unclear 的理由"，全 unknown 语义像多人接话也判 yes。
+  ⚠️ 风险：播客/电视也可能像两人对话 → 误判 yes 时环境声会误开；本轮只测到会议正样本。
+- 验证：host **98 组 / 7967 断言**（新增 2 组）；离线重放真实分段逐段调千问：
+  17:31–17:33 **14/14 yes**（原 0）、17:29–17:31 9/11 yes；17:08–17:11（像播客/独白）0 yes、
+  16:58 耳语独白 0 yes。
+- 执行端：17:48 起 host 为 `--ambient-executor relay`（快照 `executor=s3-relay`、
+  `available=true`、device=Xiaomi 耳夹，`opens=0`），门仍 `--ambient-gate voice`。
+  **待真机验收（下一步）**：真实对话时面板判定 yes、环境声卡片"中继已开"、耳机听到
+  中继声（Xiaomi 总时延约 385–405 ms）；独白/电视应保持不开。若不 open，优先看
+  `authorization` 的 epoch/age（`assistant.ambient_authorization`）与门时序。
+- 详见 `docs/decisions.md` D55；本轮改动：`tools/host/assistant.py`、
+  `tools/host/tests/test_host.py`。
+
 ## 最新补充（2026-10-28 傍晚 · ASR 路由修复 + 真机耳语验收，提交 `8695186`）
 - 问题：短/稀疏耳语送千问返回 HTTP 400（空体=无人声），面板写成"未检出人声/未转写"，
   用户说了话却拿不到正文；旧云端路径还会把候选按能量 VAD 裁剪、按声纹边界拆成

@@ -3537,6 +3537,66 @@ def test_training_writer_records_segment_and_llm_context() -> None:
     eq(service._context_facts()["turn_count"], 0, "新一轮采集必须清空 LLM 上下文")
 
 
+def test_llm_context_survives_silence_episode_but_resets_on_capture() -> None:
+    """静音切新授权轮次时**不得**清空语义上下文（2026-10-28 现场 0 次 yes 的根因）。
+
+    真实对话的 3 s 停顿会推进 epoch（旧 LLM 判定必须失效），但 LLM 仍需要看到上一两句
+    才能判断"对话还在继续"；只有「新一次采集」才清空语义上下文。
+    """
+    class Frame:
+        conversation = "LIKELY"
+        environment = "VOICE"
+        ambient_open = False
+        voice_likelihood = 0.9
+        event = "speech"
+
+    service = AssistantService()
+    service._spawn_dispatch = lambda *args: None  # type: ignore[method-assign]
+    service.recording_started(16000, 0)
+    service.observe_frame(Frame())
+    first_epoch = service._authorization_epoch_id
+    service._note_context_turns(1, first_epoch, [("unknown", "今天这个价格怎么算？")])
+    # 静音 4 s：片段按"连续静音3秒"结束，下一次开口推进授权轮次。
+    service._last_conversation_at = time.monotonic() - 4.0
+    service.observe_frame(type("Silent", (), {"conversation": "NONE"})())
+    service.observe_frame(Frame())
+    eq(service._authorization_epoch_id, first_epoch + 1,
+       "静音后重新开口必须推进授权轮次")
+    facts = service._context_facts()
+    eq(facts["turn_count"], 1, "新 episode 不得清空跨片段语义上下文")
+    eq(facts["recent_turns"][0]["text"], "今天这个价格怎么算？",
+       "上一句必须留给 LLM 判断对话是否在延续")
+    check(isinstance(facts["recent_turns"][0].get("age_s"), float),
+          "上下文轮次要带 age_s（距现在秒数），LLM 才能区分新旧")
+    service.recording_started(16000, 0)
+    eq(service._context_facts()["turn_count"], 0, "新一次采集必须清空语义上下文")
+
+
+def test_llm_context_prunes_turns_and_verdicts_older_than_ttl() -> None:
+    """超过 `_CONTEXT_TTL_S` 的轮次/判定必须淘汰，久远的 yes 不能延续"对话进行中"。"""
+    service = AssistantService()
+    service.recording_started(16000, 0)
+    epoch = service._authorization_epoch_id
+    service._note_context_turns(1, epoch, [("unknown", "旧话题")])
+    service._note_context_turns(2, epoch, [("unknown", "新话题")])
+    with service._lock:
+        service._llm_context[0]["at"] = (
+            time.monotonic() - service._CONTEXT_TTL_S - 5.0
+        )
+    facts = service._context_facts()
+    eq(facts["turn_count"], 1, "超过 _CONTEXT_TTL_S 的轮次必须淘汰")
+    eq(facts["recent_turns"][0]["text"], "新话题", "保留的必须是最新轮次")
+    check(facts["recent_turns"][0]["age_s"] >= 0.0, "age_s 必须是非负秒数")
+
+    service._publish_decision(2, "yes", "open", 0.9, "轮流接话", "llm")
+    with service._lock:
+        service._llm_context_verdicts[-1]["at"] = (
+            time.monotonic() - service._CONTEXT_TTL_S - 5.0
+        )
+    eq(len(service._context_facts()["previous_verdicts"]), 0,
+       "超过 _CONTEXT_TTL_S 的历史判定也必须淘汰")
+
+
 def test_assistant_uses_absolute_sample_offset_for_speakers() -> None:
     """裁剪后的 ASR 片段仍要按**绝对**流样本号对齐声纹窗口（连续中继 start_sample>0）。"""
     absolute_start = 100_000
@@ -4137,6 +4197,8 @@ def main() -> int:
         test_assistant_splits_unknown_speakers_into_pause_turns,
         test_assistant_aggregates_speaker_labels_per_turn,
         test_training_writer_records_segment_and_llm_context,
+        test_llm_context_survives_silence_episode_but_resets_on_capture,
+        test_llm_context_prunes_turns_and_verdicts_older_than_ttl,
         test_assistant_uses_absolute_sample_offset_for_speakers,
         test_qianwen_cloud_asr_keeps_full_context_and_single_request,
         test_local_asr_still_preserves_speaker_segments,

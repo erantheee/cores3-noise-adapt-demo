@@ -82,6 +82,12 @@ class AssistantService:
     #: LLM 判定有效多久。两个片段之间（6 s + ASR + LLM）必须留在窗口内，
     #: 但对话结束后设备意图会立刻关掉环境声，所以 20 s 只用于跨片段续期。
     _DECISION_TTL_S = 20.0
+    #: LLM 跨片段语义上下文的保留时长（2026-10-28 现场修复）。
+    #: **授权轮次**（epoch）在静音后重新开口时必须推进；但**语义上下文**不能跟着清：
+    #: 真实对话里 3 s 停顿很常见，每段清空后 LLM 永远只看到一句身份 unknown 的转写，
+    #: 于是当天 132 段里 0 次判 yes、环境声门永远不开（现场数据）。
+    #: 超过这个时长的轮次按"之前的话题"处理，不再作为"同一场对话延续"的证据。
+    _CONTEXT_TTL_S = 120.0
     #: 至少要有这么多秒的语音证据才送 ASR。低于它基本是噪声/呼吸/键盘。
     #: 2026-10-26 从 1.0 放到 0.55：一句短应答（"嗯，对""在吗"）能量证据常只有
     #: 0.6–0.9 s，1.0 会把真实短句整段跳过（现场 seg0376：0.84 s 被丢）。
@@ -176,6 +182,8 @@ class AssistantService:
         self._training_pending: dict[int, dict] = {}
         #: LLM 的跨片段上下文：同一轮对话里最近几轮转写 + 最近几次判定。
         #: 6 s 分段会把一来一回切到两个请求里，没有它 LLM 每段都是"单方发言"。
+        #: 条目带 `at`（monotonic）用于按 `_CONTEXT_TTL_S` 淘汰；静音切新 episode
+        #: 只推进授权轮次，不清这里（2026-10-28 修复：清了永远拼不出对话）。
         self._llm_context: deque[dict[str, object]] = deque(maxlen=24)
         self._llm_context_verdicts: deque[dict[str, object]] = deque(maxlen=4)
         # 对话状态机（2026-10-26 用户口径）：LLM 维护"是不是还在对话里"，而不是每 6 s
@@ -603,8 +611,10 @@ class AssistantService:
                     self._authorization_epoch_id += 1
                     self._authorization_epoch_started_at = now
                     self._new_episode_pending = False
-                    self._llm_context.clear()
-                    self._llm_context_verdicts.clear()
+                    # 只推进授权轮次（旧 LLM 判定必须失效），**不清语义上下文**：
+                    # 真实对话的 3 s 停顿很常见，清了 LLM 每段只看到一句 unknown，
+                    # 永远拼不出"交替轮次"（2026-10-28 现场 132 段 / 0 次 yes 的根因）。
+                    # 旧轮次由 `_CONTEXT_TTL_S` 按时间淘汰。
                     self._dialogue_confirmed = False
                     self._consecutive_no = 0
                 self._conversation_started_wall = datetime.now().astimezone().strftime("%H:%M:%S")
@@ -721,10 +731,36 @@ class AssistantService:
 
     # ------------------------------------------------------------------ 上下文/训练
 
+    def _prune_context_locked(self, now: float | None = None) -> None:
+        """按 `_CONTEXT_TTL_S` 淘汰过旧的跨片段上下文（调用方必须持锁）。
+
+        授权轮次（epoch）可以因静音切新，但语义上下文保留一段时间：真实对话
+        的停顿不能把"上一句"一起抹掉。超过窗口的轮次不再算同一场对话的证据。
+        """
+        now = time.monotonic() if now is None else now
+        cutoff = now - self._CONTEXT_TTL_S
+        for name, maxlen in (
+            ("_llm_context", 24),
+            ("_llm_context_verdicts", 4),
+        ):
+            items = getattr(self, name)
+            kept = [item for item in items
+                    if float(item.get("at", 0.0) or 0.0) >= cutoff]
+            if len(kept) != len(items):
+                setattr(self, name, deque(kept, maxlen=maxlen))
+
     def _context_facts(self) -> dict[str, object]:
+        now = time.monotonic()
         with self._lock:
+            self._prune_context_locked(now)
             turns = [dict(item) for item in self._llm_context]
             verdicts = [dict(item) for item in self._llm_context_verdicts]
+        # monotonic 时间戳对 LLM 没意义，换成"距现在多少秒"，让它判断哪些轮次
+        # 还算同一场对话（prompt 里有对应规则）。快照/训练同样可 JSON 序列化。
+        for item in turns + verdicts:
+            at = item.pop("at", None)
+            item["age_s"] = (round(now - float(at), 1)
+                             if isinstance(at, (int, float)) else None)
         return {
             "turn_count": len(turns),
             "recent_turns": turns,
@@ -736,6 +772,8 @@ class AssistantService:
         with self._lock:
             if int(epoch_id) != self._authorization_epoch_id:
                 return
+            now = time.monotonic()
+            self._prune_context_locked(now)
             for speaker, text in turns:
                 if not text and speaker != "self":
                     continue
@@ -745,6 +783,7 @@ class AssistantService:
                     # self 说了话但内容被过滤时也要留下轮次证据：LLM 判"无 self 回应"
                     # 是环境声门不开的主因（2026-10-22 事故复盘）。
                     "text": str(text)[:160] if text else "（短应答，内容未识别）",
+                    "at": now,
                 })
 
     def _update_training(self, number: int, extra: dict[str, object]) -> None:
@@ -1495,12 +1534,14 @@ class AssistantService:
                 "epoch_id": self._authorization_epoch_id if epoch_id is None else int(epoch_id),
                 "at": time.monotonic(),
             }
+            self._prune_context_locked()
             self._llm_context_verdicts.append({
                 "segment": number,
                 "dialogue": str(self._decision["dialogue"]),
                 "ambient": str(self._decision["ambient"]),
                 "source": str(self._decision["source"]),
                 "reason": str(self._decision["reason"])[:80],
+                "at": float(self._decision["at"]),
             })
             # 对话状态机（只认 LLM 判定；本地"无语音证据"不算语义结论）。
             if source == "llm":
@@ -1769,12 +1810,21 @@ class AssistantService:
             "2) 前文 context.previous_verdicts 已判 yes，且本段是同一场对话的延续——"
             "   哪怕是某一方连续陈述、另一方只是偶尔短回应或在听（面试/讲解/汇报都算），"
             "   也判 yes 保持打开；"
-            "3) identity_available=false 但逐字稿里出现至少两个由静音分开、语义像问答/接话的轮次。"
+            "3) identity_available=false 但逐字稿（本段 + context.recent_turns 里 age_s 小的"
+            "   轮次合起来看）出现至少两个由静音分开、语义像问答/接话的轮次。"
+            "   全 unknown 的连续转写若语义上像多人讨论/接话（一问一答、称呼、承接、"
+            "   反驳、不同立场、短应答穿插），即使没有任何身份也判 yes——**不要因为"
+            "   unknown 就默认成单人独白**。"
             "判 no（已结束/不是对话）的情形：明确对话结束（长静音后话题完全改变/换了一群人）、"
             "或从头就是媒体/播客/电视播音、单人对着空气的连续独白且前文从未确认过对话。"
-            "判 unclear：开场、身份不足、或无法确定是否同一场对话的延续。"
+            "判 unclear：开场、或无法确定是否同一场对话的延续。identity_available=false"
+            "**本身不是 unclear 的理由**（按第 3) 条看语义）；只有内容确实像单人独白/"
+            "播音/朗读时才判 unclear。"
             "重要：前文已判 yes 时，本段单独看不清不要轻易改判 no——只有明确证据表明对话结束才 no；"
             "本段是单向陈述本身不构成结束，除非前文从未确认过对话。"
+            "context.recent_turns 与 previous_verdicts 都带 age_s（距现在秒数）：age_s 很小"
+            "（约 60 s 内）的轮次/判定才可能算**同一场对话**的延续，只用来维持/承接；"
+            "age_s 很大（超过约 60 s）只作背景，不能单独据此判 yes，也不能因此延续旧对话。"
             "facts.interaction 是声纹轮次结构；s3_ambient_open_intent_frames 只是 S3 意图，"
             "不等于对话证据，也不等于实际执行。"
             "facts.memo 是历史记忆（可能有偏/过期），只作弱先验；与本段逐字稿/遥测冲突时"
