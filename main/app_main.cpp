@@ -115,6 +115,33 @@ constexpr int64_t kDialogVetoDefaultTtlMs = 20000;
 /// 上限：防御坏行把对话态锁死太久。
 constexpr int64_t kDialogVetoMaxTtlMs = 120000;
 
+// ---- 键盘瞬态 → "正在打字"证据（D53，2026-10-28）----
+// 为什么需要：肩上/近耳位置，1 s 事件窗的 keyboard 命中率只有 15–20%（贴键盘时 52%），
+// 键盘掩蔽（D48）因此时有时无/节奏对不上；而同一位置帧内瞬态（NoiseAnalyzer 的
+// `click_transient`）仍有 2–4 次/s（停手 0.2–0.6 次/s）。这里用 1 s 窗口 ≥2 次点击判
+// "正在打字"，再保持 300 ms（击键间隙不把掩蔽放下）。它只驱动键盘掩蔽与事件中立，
+// 不改音量/对话判定，也不替代 1 s 事件分类器。
+constexpr std::size_t kTypingHistoryFrames = 10;
+bool g_typing_history[kTypingHistoryFrames] = {};
+std::size_t g_typing_history_index = 0;
+int g_typing_history_count = 0;
+int64_t g_typing_hold_until_us = 0;
+bool g_typing_active = false;
+
+bool update_typing_active(bool click, int64_t now_us) {
+    const bool previous = g_typing_history[g_typing_history_index];
+    g_typing_history[g_typing_history_index] = click;
+    g_typing_history_index = (g_typing_history_index + 1) % kTypingHistoryFrames;
+    if (previous != click) {
+        g_typing_history_count += click ? 1 : -1;
+    }
+    if (g_typing_history_count >= 2) {
+        g_typing_hold_until_us = now_us + 300 * 1000;
+    }
+    g_typing_active = g_typing_history_count >= 2 || now_us < g_typing_hold_until_us;
+    return g_typing_active;
+}
+
 /// Emit one frame of EarbudCommand v4.
 ///
 /// v3 adds the own-voice evidence (`own_voice_confidence` / `own_voice_correlation` /
@@ -175,6 +202,8 @@ void emit_command_json(const EarbudCommand& command) {
                 // 的 TTL 内。它是"host 的迟到否决有没有到设备"的唯一现场证据，
                 // 也是固件版本推断依据（D49 及更早的固件没有这个键）。
                 "\"dialog_veto\":%s,"
+                // D53（追加可选键）：这一拍是否判为"正在打字"（帧内瞬态 + 1 s 窗口）。
+                "\"typing_active\":%s,"
                 "\"execution\":\"decision_only\",\"link\":\"simulated\","
                 "\"eq_gain_db\":[",
                 static_cast<unsigned long>(command.schema_version),
@@ -212,7 +241,8 @@ void emit_command_json(const EarbudCommand& command) {
                 voiceprint.active ? "true" : "false",
                 g_voiceprint_self ? "true" : "false",
                 voiceprint_age_ms,
-                dialog_veto_active ? "true" : "false");
+                dialog_veto_active ? "true" : "false",
+                g_typing_active ? "true" : "false");
     for (std::size_t band = 0; band < kBandCount; ++band) {
         std::printf("%s%.1f", band == 0 ? "" : ",", static_cast<double>(command.eq_gain_db[band]));
     }
@@ -891,6 +921,8 @@ void processing_task(void*) {
         // 不丢掉的话，削波段和恢复后的干净段会被当成同一个连续声音。NoiseAnalyzer::reset()
         // 的文档要求调用，这里补上——在此之前主循环从来没调用过它。
         if (!frame.mic_valid) analyzer.reset();
+        // D53：帧内瞬态 → "正在打字"证据（与 1 s 事件分类器相互独立）。
+        const bool typing_active = update_typing_active(frame.click_transient, now_us);
         if (g_record_seconds >= 0) {
             capture_analyse_us += static_cast<uint32_t>(esp_timer_get_time() - analyse_started_us);
         }
@@ -946,15 +978,19 @@ void processing_task(void*) {
             frame.band_dbfs, frame.broadband_dbfs, frame.mic_valid,
             static_cast<float>(now_us) / 1.0e6f);
         event_timing->record(static_cast<float>(esp_timer_get_time() - event_started_us));
+        // D53：帧内瞬态也算"非语音"事件——敲击瞬态不进入对话证据累计，语义与事件层
+        // keyboard 相同；这是肩上位置键盘命中率低（15–20%）时的主要证据来源。
         const bool non_voice_event =
-            sound_event_out.valid &&
-            (sound_event_out.cls == sound_event::Class::keyboard ||
-             sound_event_out.cls == sound_event::Class::wind ||
-             sound_event_out.cls == sound_event::Class::artifact);
+            typing_active ||
+            (sound_event_out.valid &&
+             (sound_event_out.cls == sound_event::Class::keyboard ||
+              sound_event_out.cls == sound_event::Class::wind ||
+              sound_event_out.cls == sound_event::Class::artifact));
         // 键盘单独进控制器：键盘特殊掩蔽（D48）只在"键盘事件 + SONG_EQ"时抬 EQ；
         // 风/撞击仍只做否决与风 EQ，不叠键盘掩蔽。
         const bool keyboard_event =
-            sound_event_out.valid && sound_event_out.cls == sound_event::Class::keyboard;
+            typing_active ||
+            (sound_event_out.valid && sound_event_out.cls == sound_event::Class::keyboard);
         // speech 单独进控制器（D49）：对话证据与背景人声判定必须过事件层 speech，
         // 否则贴耳时 OWS 耳机漏音会把对话状态机锁进 engaged、掩蔽被打断。
         const bool speech_event =

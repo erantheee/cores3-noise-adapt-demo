@@ -79,6 +79,13 @@ struct AnalysisFrame {
     /// Center frequency of each band in Hz, same order as band_dbfs.
     std::array<float, kBandCount> band_center_hz{};
     bool mic_valid = false;
+    // ── 帧内瞬态（键盘点击）检测（D53，2026-10-28）────────────────────────────────
+    // 2048 样本分成 8 个 5.3 ms 子块，取"最响子块的一阶差分能量（≈4 kHz 以上）比中位
+    // 子块高多少"。键盘点击 2–15 ms、宽带、HF 突出；音乐/稳态噪声子块能量均匀。
+    // 现场（肩上/近耳，2026-10-28）实测：打字时 2–4 次/s、停手 0.2–0.6 次/s（阈值 9 dB）。
+    // 为什么不用 1 s 事件窗：架上位置键盘命中率只有 15–20%，而帧内瞬态仍可检出。
+    float hf_crest_db = 0.0f;
+    bool click_transient = false;
     // ── 双麦遥测（D47 取数阶段，只上报、不参与任何决策）──────────────────────────
     // 由采集任务在 NoiseAnalyzer::analyze() **之后**填入（analyzer 只算第 1 路），
     // 统计函数在 main/dual_mic.hpp。近场期望：coherence 低、|diff_db| 大；

@@ -472,6 +472,41 @@ int main() {
               "band centre frequencies are populated and ascending");
     }
 
+    // --- Keyboard transient detection (D53) ---------------------------------------
+    // 键盘点击 = 帧内 2–15 ms 的宽带瞬态：2048 样本分 8 个 5.3 ms 子块后，最响子块的
+    // 一阶差分能量（≈4 kHz 以上）明显高于中位子块；稳态噪声/音乐在各子块间是均匀的。
+    // 阈值 9 dB 来自 2026-10-28 现场（肩上打字 2–4 次/s vs 停手 0.2–0.6 次/s）。
+    {
+        NoiseAnalyzer analyzer;
+        const std::vector<float> steady = white_signal();
+        const auto pcm = quantise(steady, -30.0f);
+        const AnalysisFrame frame = analyzer.analyze(pcm.data(), pcm.size(), 0);
+        check(!frame.click_transient, "steady noise is not a keyboard transient");
+        check(frame.hf_crest_db < 9.0f, "steady noise keeps the HF crest below the threshold");
+    }
+    {
+        NoiseAnalyzer analyzer;
+        const std::vector<float> steady = white_signal();
+        auto pcm = quantise(steady, -40.0f);
+        const auto add_click = [&pcm](std::size_t start, std::size_t length) {
+            for (std::size_t i = 0; i < length; ++i) {
+                pcm[start + i] = (i % 2 == 0) ? 24000 : -24000;
+            }
+        };
+        add_click(300, 96);    // ~2 ms，落在第 2 个子块
+        add_click(1300, 96);   // ~2 ms，落在第 6 个子块
+        const AnalysisFrame frame = analyzer.analyze(pcm.data(), pcm.size(), 0);
+        check(frame.click_transient,
+              "a keyboard-sized HF transient inside the frame is detected");
+        check(frame.mic_valid, "a short transient does not invalidate the microphone");
+    }
+    {
+        NoiseAnalyzer analyzer;
+        std::vector<int16_t> silence(kFrame, 0);
+        const AnalysisFrame frame = analyzer.analyze(silence.data(), silence.size(), 0);
+        check(!frame.click_transient, "digital silence is not a keyboard transient");
+    }
+
     std::cout << "NoiseAnalyzer: " << passed << "/" << (passed + failed) << " passed\n";
     return failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

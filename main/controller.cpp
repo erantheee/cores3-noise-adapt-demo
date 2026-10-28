@@ -230,6 +230,13 @@ float soft_below(float value, float edge, float softness) {
 /// content tops out at a 6-sample run, a 1.2x overload reaches 9, and a 3x overload
 /// reaches 19, so the longest run is the discriminating signal. The pinned-share test
 /// additionally catches square-ish waveforms.
+/// 帧内瞬态（键盘）检测阈值（D53）。离线标定：现场肩上打字时 `hf_crest` p90≈6 dB、
+/// 点击帧 9–15 dB；停手/纯音乐 p90≈4 dB。阈值 9 dB 让"打字 2–4 次/s vs 停手 0.2–0.6
+/// 次/s"分开；噪声/音乐鼓点偶尔超过时只影响一拍，后面还有 1 s 窗口的 2 次门限。
+namespace transient_thresholds {
+constexpr float kHfCrestDb = 9.0f;
+}  // namespace transient_thresholds
+
 namespace clip_thresholds {
 constexpr float kPinnedValue = 32760.0f;
 constexpr std::size_t kMaxPinnedRun = 12;
@@ -364,6 +371,37 @@ AnalysisFrame NoiseAnalyzer::analyze(const int16_t* mono, std::size_t count,
     frame.broadband_dbfs = 20.0f * std::log10(std::max(rms, 1.0e-6f));
     frame.mic_valid = std::isfinite(frame.broadband_dbfs) &&
                       !frame_is_clipped(pinned, longest_run, count);
+
+    // D53：帧内瞬态（键盘点击）。把这一帧切成 8 个 5.3 ms 子块，看最响子块的
+    // 一阶差分能量（≈4 kHz 以上）比中位子块高多少。键盘点击是 2–15 ms 的宽带瞬态，
+    // 而音乐/稳态噪声在各子块之间的能量是均匀的。用一阶差分是廉价的高频加权：
+    // 不需要再做 8 次 FFT，几个乘加就能在 48 kHz 下每帧算完。
+    {
+        constexpr std::size_t kSubBlocks = 8;
+        const std::size_t block = count / kSubBlocks;
+        if (block >= 32) {
+            std::array<double, kSubBlocks> sub_hf{};
+            for (std::size_t b = 0; b < kSubBlocks; ++b) {
+                const std::size_t start = b * block;
+                double sum = 0.0;
+                for (std::size_t i = 1; i < block; ++i) {
+                    const float delta =
+                        (static_cast<float>(mono[start + i]) -
+                         static_cast<float>(mono[start + i - 1])) / 32768.0f;
+                    sum += static_cast<double>(delta) * static_cast<double>(delta);
+                }
+                sub_hf[b] = sum / static_cast<double>(block - 1);
+            }
+            std::array<double, kSubBlocks> sorted = sub_hf;
+            std::sort(sorted.begin(), sorted.end());
+            const double median = 0.5 * (sorted[kSubBlocks / 2 - 1] + sorted[kSubBlocks / 2]);
+            const double loudest = sorted[kSubBlocks - 1];
+            frame.hf_crest_db = static_cast<float>(
+                10.0 * std::log10(std::max(loudest, 1.0e-12) / std::max(median, 1.0e-12)));
+            frame.click_transient =
+                frame.hf_crest_db >= transient_thresholds::kHfCrestDb;
+        }
+    }
 
     for (std::size_t band = 0; band < kBandCount; ++band) {
         frame.band_center_hz[band] = kBandCenter[band];
