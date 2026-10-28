@@ -28,6 +28,21 @@
   `sh tools/free_port.sh --kill` → `sh tools/build.sh flash` → `sh tools/host_up.sh --detach`
   → 面板看 mode/`dialog_veto`；串口 monitor 可见 `dialog ack no 20000`。
 
+## 本轮内容（2026-10-28 · D51：混噪/敲击下掩蔽不再闪断）
+- 2026-10-28 现场第一次"贴耳 + 音乐 + 打字"验收（`记录/位置对照/20261028-d49-ear-typing.jsonl`，
+  124 s / 1203 帧，采集脚本 `/tmp/d49_accept_recorder.py`）：D49 目标达成——FLAT 4%
+  （D49 前 47%）、conversation 从不 LIKELY、media 全程 100。
+- 但抓到 34 次 EQ 闪平（100–400 ms）：单帧瞬态（敲击/音乐鼓点/漏音）被 1 s 事件窗标成
+  speech、voice_likelihood 顶到 1.0 → 状态机首帧进 anticipating → 旧写法立刻压平 EQ。
+  修：`conversation_active` 改用 `awareness_out.anticipating`（≥500 ms 预览确认）才压平。
+  代价：真实对话 EQ 压平晚 ≤400 ms（媒体预下压时序不变）。controller 128/128。
+- 混噪识别现状（供下一步）：设备录的键盘瞬态在 2–4 kHz 很干净（打字时冲击率 5–30 次/s、
+  高出底噪 16–36 dB；不敲 <1 次/s），但 event 分类器在 1 s 窗里基本看不到（打字段
+  keyboard 帧只占少数，多数标 speech/quiet；音乐内容大量标 speech）。下一步：帧内瞬态
+  检测器驱动 D48 键盘掩蔽 + 把瞬态帧按非语音处理。
+- 固件已按 D50+D51 编译（`build/cores3_noise_adapt_demo.bin`），**未刷机**；当前在线设备
+  仍是 D49（帧里无 `dialog_veto` 键）。
+ 
 ## 最新补充：千问接口切换（2026-10-26）
 - 分支 `feature/apple-conversation-awareness`；千问轮改动已于 10-26 提交，HEAD 见 `git log`。
 - LLM 改用千问 OpenAI Chat API：`qwen3.7-flash`、关闭 thinking、JSON；ASR 新 worker 使用 `qwen-audio-3.0-asr-flash`，WAV Base64 上传。provider 可分别回退；配置见 `docs/qianwen-api.md`。Key 仅在 gitignore 的 `.env`，0600。

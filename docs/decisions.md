@@ -1559,3 +1559,37 @@ S3 快路径"），本轮实现。
 **文件**：`main/app_main.cpp`、`main/{controller.hpp,controller.cpp}`、
 `main/conversation_awareness.{hpp,cpp}`、`test/{controller_test.cpp,conversation_awareness_test.cpp}`、
 `tools/host/{__main__.py,protocol.py,state.py,tests/test_host.py}`。
+
+
+---
+
+## D51 · 2026-10-28 未确认的预判不压平 EQ：混噪/敲击下掩蔽不再闪断
+
+**背景**：D49 刷机后第一次"贴耳 + 音乐 + 打字"现场验收
+（`记录/位置对照/20261028-d49-ear-typing.jsonl`，124 s / 1203 帧）。D49 的目标达成：
+FLAT 只占 4%（D49 前耳边 47%）、conversation 从不 LIKELY、媒体全程 100（执行门）。
+但发现一类新的闪断：124 s 内 **34 次** EQ 闪平、每次 100–400 ms，几乎全部是
+`state=HOLDING event=speech`——单帧瞬态（敲击/音乐鼓点/漏音）被 1 s 事件窗标成 speech、
+4 判据 voice 被顶到 1.0，状态机第一帧就进 `anticipating`；旧写法
+`conversation_active = state==anticipating || engaged` 让 EQ 立刻压平，下一帧证据消失又
+回 SONG_EQ。听感就是"掩蔽忽有忽无/抽动"。
+
+**决定**：`conversation_active` 改用 `awareness_out.anticipating || engaged`（连续证据
+≥500 ms 的预览确认之后才压平 EQ），不再用状态机内部状态。理由：
+① 预览前 500 ms 媒体本来也没下压，EQ 不应先动；
+② 真实对话仍在 500 ms 预览时压平（D40 的时序不变），只是单帧/短瞬态不再触发；
+③ "确认要动"的动作（媒体下压、EQ 压平）用同一个 `anticipating` 标志，语义一致。
+
+**代价**：真实对话的 EQ 压平比旧写法晚最多 400 ms（媒体预下压时间不变）；D40 已接受
+0.5 s 预览，EQ 与媒体同时动作，可接受。
+
+**验证（离线）**：controller 128/128（新增"未确认预判走 EXTERNAL_VOICE_INTENT、不压平；
+500 ms 预览后才 flat"；对话建立后 band gain 按 650/850 ms 平滑收敛到全平）。
+**未刷机、未真机复测**。现场数据里 34 次闪断全部 <500 ms，机制上应全部消失。
+
+**后续（未做）**：真正提高混噪识别要靠帧内瞬态检测（键盘活动度）。今天录音里键盘瞬态
+2–4 kHz 冲击率打字时 5–30 次/s、高出底噪 16–36 dB，不敲时 <1 次/s，分离度很高；但 1 s
+事件窗的 event 分类器基本看不到它（打字段 keyboard 帧只占少数，多数标 speech/quiet）。
+下一步用它驱动 D48 键盘掩蔽 + 把瞬态帧按非语音处理（保护对话证据）。
+
+**文件**：`main/controller.cpp`、`test/controller_test.cpp`。
