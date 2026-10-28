@@ -2525,14 +2525,18 @@ def test_dialog_override_link() -> None:
     eq(link.update(fresh, 9.0), b"dialog no 20000\r\n", "重新出现否决 → 再发 no")
     eq(link.update(not_veto, 10.0), b"dialog yes\r\n", "否决撤销 → yes 提前解除 S3 TTL")
 
-    # 本地否决（无有效语音）也回写；LLM 未配置的授权没有 age/ttl，仍要撤销旧否决。
+    # 本地否决（"这段音频没抽出人声"）**不回写**：2026-10-28 真机发现静音时几乎每段
+    # 都会产生 local_veto，回写会把 S3 快路径在没人说话时锁进"释放对话态"，用户随后
+    # 真开口反而被压住、首响退化到 LLM 往返。只有 LLM 的语义 no 才算证据。
     local = {"veto": True, "state": "local_veto", "age_s": 1.0, "ttl_s": 20}
-    eq(DialogOverrideLink().update(local, 0.0), b"dialog no 20000\r\n",
-       "本地否决也回写 S3 快路径")
+    eq(DialogOverrideLink().update(local, 0.0), None, "本地否决不回写 S3 快路径")
     link2 = DialogOverrideLink()
-    eq(link2.update(local, 0.0), b"dialog no 20000\r\n", "前置：先建立一条否决")
-    eq(link2.update({"veto": False, "state": "not_configured"}, 1.0), b"dialog yes\r\n",
-       "未配置 LLM 的授权没有 age/ttl，但仍要撤销上一条否决")
+    llm_no = {"veto": True, "state": "llm_veto", "age_s": 0.5, "ttl_s": 20}
+    eq(link2.update(llm_no, 0.0), b"dialog no 20000\r\n", "前置：先建立一条语义否决")
+    eq(link2.update(local, 1.0), b"dialog yes\r\n",
+       "语义否决之后转成本地否决：不再续期，应撤销")
+    eq(link2.update({"veto": False, "state": "not_configured"}, 2.0), None,
+       "撤销只发一次")
 
     # 协议：`dialog_veto` 是追加可选键；缺字段 = 旧固件（None），不能默认成 False。
     base = {

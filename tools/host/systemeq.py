@@ -349,6 +349,13 @@ class SystemEqService:
             "out_ring_fill": state.get("out_ring_fill"),
             "content_env_exposure": state.get("content_env_exposure"),
             "content_trim": state.get("content_trim"),
+            #: EQ **之后**的输出峰值与削波计数（2026-10-28）：判断"人声毛刺"是不是
+            #: 削波造成的，只能量 EQ 之后的信号；tap 的 peak 在 EQ 之前。
+            "out_peak": state.get("out_peak"),
+            "out_clip_frames": state.get("out_clip_frames"),
+            "out_frames": state.get("out_frames"),
+            #: 输出削波时对正增益动态部分的收缩量（0…2 dB）。
+            "headroom_trim_db": state.get("headroom_trim_db"),
             #: 设备建议（S3 原始 24 段）与 systemeq 真正设进 EQ 的值（含 demo 基线 + ×depth）。
             "source_bands": state.get("bands") or [],
             "applied_bands": values,

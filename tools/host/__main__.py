@@ -188,8 +188,13 @@ class DialogOverrideLink:
     `ambient_open`，没有通道让 S3 自己放开快路径。连续电视/播客会让端侧对话态一直
     engaged（EQ 压平、D41/D48 掩蔽停摆），即使 LLM 判 `dialogue=no` 也纠正不回来。
 
-    只回写**新鲜**的否决（`age_s <= ttl_s`）：过期后停止续期，交给 S3 的 TTL 自己
-    解除（fail-open 回 D16 预判）——host 崩了或串口断了也不会把 EQ 永久压平。
+    只回写**新鲜的语义否决**（`state == "llm_veto"` 且 `age_s <= ttl_s`）：
+      * 过期后停止续期，交给 S3 的 TTL 自己解除（fail-open 回 D16 预判）——
+        host 崩了或串口断了也不会把 EQ 永久压平；
+      * **本地否决（`local_veto`）不回写**。2026-10-28 真机发现：ASR 段"无有效语音"
+        几乎在每次静音都会产生本地否决，若也回写 S3，设备会在没人说话时被锁在
+        "释放对话态"的 TTL 里；用户随后真的开口，端侧预判反而被压住，首响退化到
+        LLM 往返。本地的"这段音频没抽出人声"不是"这不是对话"的语义证据。
     """
 
     def __init__(self, ttl_ms: int = DIALOG_VETO_TTL_MS,
@@ -208,7 +213,8 @@ class DialogOverrideLink:
             and isinstance(ttl_s, (int, float))
             and 0.0 <= float(age) <= float(ttl_s)
         )
-        veto = bool(authorization.get("veto")) and fresh
+        semantic_veto = str(authorization.get("state") or "") == "llm_veto"
+        veto = bool(authorization.get("veto")) and semantic_veto and fresh
         if veto:
             if not self._sent or now - self._sent_at >= self.refresh_s:
                 self._sent = True
