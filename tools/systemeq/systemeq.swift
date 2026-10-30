@@ -1404,14 +1404,50 @@ func applyEq(_ state: EqState) {
             // 只要遮蔽证据成立，都允许进入至少 2 dB 的可听调节。
             let overlap = min(noiseProminence, songPresence)
             let need = 0.45 + 0.55 * deficit
-            let budget: Float = (index < 4 ? 2.35 : (index >= 19 ? 2.35 : 2.50)) * maskingDose
+            // 预算按频段分：存在感区（1–4 kHz）给最多，低频只给一半。
+            // 2026-10-30 真机："掩蔽完全没效果 + 声音还变小了"。根因是旧版把 15 段都抬
+            // ~2 dB（≈整条谱一起抬，听不出音色变化），而抬了低频峰值 → 输出余量把整条
+            // 链压低 4 dB。现在的分工：低频少抬（不推峰），存在感区多抬（听得见）。
+            let bandBudget: Float = (index >= 8 && index <= 16) ? 5.0
+                : (index <= 7 ? 2.4 : 3.0)
+            let budget: Float = bandBudget * maskingDose
             // Demo 要让用户能在一次切换里确认方向：重叠证据成立后提高到可听区间，
             // 但仍由每段 budget 硬封顶。强重叠时反推瞬态安全门前的目标，让安全门后
             // 仍约为 2 dB；真正的强瞬态允许临时低于 2 dB，优先不打碎鼓点/钢琴起音。
-            target = min(budget, maskingExposure * overlap * need * budget * 2.2)
-            if maskingExposure >= 0.65 && overlap >= 0.25 {
-                let transientScale = max(0.25, 1.0 - 0.75 * content.transientRisk)
-                target = max(target, min(budget, 2.15 * maskingDose / transientScale))
+            // 只有"噪声在该段确实压过歌曲"（≥3 dB）才动——否则抬的是歌本来就强的段，
+            // 只会推高峰值、换来整条链被压低。
+            let masked = (noiseRelative - songRelative) >= 3.0
+            if masked {
+                let transientScale = max(0.35, 1.0 - 0.75 * content.transientRisk)
+                let exposureScale = clamp((maskingExposure - 0.35) / 0.45, 0, 1)
+                // 分段目标（× 剂量）：存在感区听得见，低频只做小幅（低频往往就是峰值所在）。
+                let floorDb: Float = (index >= 8 && index <= 16) ? 3.6
+                    : (index <= 7 ? 1.6 : 2.6)
+                let audible = floorDb * maskingDose * exposureScale / transientScale
+                let shaped = maskingExposure * max(0.25, overlap) * need * budget * 1.8
+                target = min(budget, max(shaped, audible))
+            } else {
+                target = 0
+            }
+            // 2026-10-30 用户两次反馈："掩蔽完全没效果" / "声音还变小了"。
+            // 根因：源（QQ 音乐输出）本身贴满量程（峰值 0.98–1.20），链路没有余量再抬总响度；
+            // 只抬不削时输出必然削波，防削波又会把整条链压低 → 听感"更小声且没变化"。
+            // 现在的做法是**清晰度倾斜**：环境够吵时，存在感区（1–4 kHz）抬、低频让位削，
+            // 峰值由低频的削减换出来，所以不削波、也不用压整条链的总音量。
+            if maskingExposure >= 0.50 {
+                let transientScale = max(0.35, 1.0 - 0.75 * content.transientRisk)
+                let exposureScale = clamp((maskingExposure - 0.45) / 0.35, 0, 1)
+                if index >= 8 && index <= 16 {
+                    let presenceFloor: Float = 3.2 * maskingDose * exposureScale / transientScale
+                    target = max(target, min(budget, presenceFloor))
+                } else if index <= 7 {
+                    // 低频只削不抬：既给峰值让余量，也避免"更闷"。
+                    let cut: Float = -2.5 * exposureScale * (index <= 3 ? 1.0 : 0.6)
+                    target = min(target, cut)
+                } else {
+                    // 高频别推太多：再往上推只会多出削波和嘶声。
+                    target = min(target, 1.5 * exposureScale)
+                }
             }
         }
         let coefficient: Float = target > maskingBands[index] ? 0.18 : 0.05
@@ -1457,18 +1493,36 @@ func applyEq(_ state: EqState) {
     eq.bypass = snapshot.bypass
     // 可听掩蔽档会把重点段推到 1–1.8 dB；后级峰值目标从 -0.5 dBFS
     // 收紧到约 -0.9 dBFS，避免用零星削波换取“听起来有变化”。
-    let feedbackTarget = latestOutPeak > 0.001 ? min(1.0, 0.90 / latestOutPeak) : 1.0
+    // 2026-10-30 用户："声音还变小了"。旧策略用预测峰值把整条链压低 ~4 dB，而掩蔽
+    // 只抬了 ~2 dB、且抬得很宽 → 听感是"变小且没变化"。现在只在**实测输出超过满量程**
+    // 时才收，且最多 -1 dB；真正的防削波交给 50 ms 拍的正增益收缩（只削抬升，不降总音量）。
+    // 代价：源本身已到 1.15 峰值（QQ 音乐输出）时会有零星硬削波——用户口径允许削波、
+    // 不允许加限幅器/延迟；先保证"听得见"，毛刺再单独收。
+    let feedbackTarget = latestOutPeak > 1.0 ? min(1.0, 1.0 / latestOutPeak) : 1.0
     let sourcePeak = Float(capture.meter.snapshot().peak)
-    let maxPositive = appliedBands.reduce(Float(0)) { max($0, $1) }
-    let predictedPeak = max(sourcePeak, 0.001) * pow(10.0, maxPositive / 20.0)
-    let predictedTarget = min(1.0, 0.94 / predictedPeak)
+    // 旧实现对"预测峰值"的算法是 sourcePeak × max(段增益)——它默认被抬的频段就是峰值
+    // 所在的那一段。2026-10-30 真机：矩阵抬的是存在感区（比峰值低 10–30 dB），它却按
+    // +3 dB 把整条链压低，结果"没效果 + 变小"。改成按内容谱形加权：只有被抬的频段
+    // 本身接近峰值时，才需要压整条链。
+    let shape = content.bandShapeDb
+    let shapeMax = shape.max() ?? 0
+    var predictedRatio: Float = 1.0
+    if shape.count == 24 {
+        for index in 0..<24 {
+            let relativeDb = shape[index] - shapeMax
+            let boosted = relativeDb + appliedBands[index]
+            predictedRatio = max(predictedRatio, pow(10.0, boosted / 20.0))
+        }
+    }
+    let predictedPeak = max(sourcePeak, 0.001) * predictedRatio
+    let predictedTarget = predictedPeak > 1.0 ? min(1.0, 1.0 / predictedPeak) : 1.0
     let peakTarget = min(feedbackTarget, predictedTarget)
     let peakCoefficient: Float = peakTarget < outputHeadroomGain ? 0.60 : 0.015
     outputHeadroomGain += (peakTarget - outputHeadroomGain) * peakCoefficient
     // 必须放在 EQ 链里，不能只改 mainMixer.outputVolume：后者不一定被
     // 下方的输出 tap 测到，上一版事实上就没有形成反馈回路。EQ 链里的
     // globalGain 不增加算法延迟，且测到就能下一拍收紧。
-    eq.globalGain = 20.0 * log10(clamp(outputHeadroomGain, 0.5, 1.0))
+    eq.globalGain = 20.0 * log10(clamp(outputHeadroomGain, 0.891, 1.0))
     engine.mainMixerNode.outputVolume = clamp(snapshot.mediaPercent / 100.0, 0, 1)
 }
 
@@ -1599,9 +1653,13 @@ let controlTimer = Timer(timeInterval: 0.05, repeats: true) { _ in
     // D54（2026-10-28 现场"歌曲声音忽大忽小"）：headroom 的回落要**很慢**。原来 0.02/50ms
     // （≈0.4 dB/s）会在响/静交替的段落里来回收缩又放开，听成音量抽动；改成 0.004/50ms
     // （≈0.08 dB/s，20 s 才回 1 dB），收紧仍然快（秒级），避免削波。
-    if out.peak >= 1.0 || out.clipFrames > 0 {
-        outHeadroomTrimDb = min(2.0, outHeadroomTrimDb + 0.10)
-    } else if out.peak < 0.90 {
+    // 2026-10-30：源本身已经贴满量程（QQ 音乐输出峰值 0.98–1.2），零星的 1–2 个削波
+    // 样本不是掩蔽造成的，冲正增益只会把"抬升"削掉一半——实测 out.peak 1.21 就把
+    // 2 dB 的 trim 顶满，存在感区目标 4.3 dB 到耳朵只剩 2.2 dB。改成只有**明显削波**
+    // （>1.05 或窗口内 ≥24 样本）才收缩，并且最多 1.5 dB。
+    if out.peak >= 1.05 || out.clipFrames >= 24 {
+        outHeadroomTrimDb = min(1.5, outHeadroomTrimDb + 0.10)
+    } else if out.peak < 0.95 {
         outHeadroomTrimDb = max(0, outHeadroomTrimDb - 0.004)
     }
     applyEq(state)

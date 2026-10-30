@@ -135,22 +135,27 @@ def tuning_lines(systemeq: dict, frame: dict | None, leak: dict | None) -> list[
         return lines
 
     bands = systemeq.get("masking_bands") or []
-    indices = [i for i, value in enumerate(bands) if _num(value, 0.0) > 0.05]
+    boosts = [i for i, value in enumerate(bands) if _num(value, 0.0) > 0.3]
+    cuts = [i for i, value in enumerate(bands) if _num(value, 0.0) < -0.3]
     peak = _num(systemeq.get("masking_peak_db"), 0.0) or 0.0
     dose = _num(systemeq.get("masking_dose"), 1.0) or 1.0
     exposure = _num(systemeq.get("masking_exposure"), 0.0) or 0.0
     transient = _num(systemeq.get("content_transient_risk"), 0.0) or 0.0
     headroom = _num(systemeq.get("output_headroom_gain"), 1.0) or 1.0
     clip = _num(systemeq.get("out_clip_frames"), 0) or 0
-    ranges = _band_ranges(indices)
-    if indices:
-        if len(ranges) > 3:
-            where = "、".join(ranges[:3]) + f" 等 {len(ranges)} 个频段组"
-        else:
-            where = "、".join(ranges) if ranges else f"{len(indices)} 个频段"
+    if boosts or cuts:
+        parts = []
+        if boosts:
+            ranges = _band_ranges(boosts)
+            where = "、".join(ranges[:3]) + (f" 等 {len(ranges)} 组" if len(ranges) > 3 else "")
+            parts.append(f"存在感区抬 {len(boosts)} 段（{where}，目标峰值 {peak:.1f} dB）")
+        if cuts:
+            cut_ranges = _band_ranges(cuts)
+            lowest = min(_num(bands[i], 0.0) for i in cuts)
+            where = "、".join(cut_ranges[:3]) + (f" 等 {len(cut_ranges)} 组" if len(cut_ranges) > 3 else "")
+            parts.append(f"低频让位 {len(cuts)} 段（{where}，最低 {lowest:.1f} dB）")
         lines.append(
-            f"环境噪声在 {where} 压过歌曲 → 抬 {len(indices)}/24 段，"
-            f"目标峰值 {peak:.1f} dB（剂量 {dose:.1f}×）。"
+            "；".join(parts) + f"（剂量 {dose:.1f}×）。"
         )
     else:
         lines.append("这一拍没有「噪声压过歌曲」的频段：不抬，保持原声。")

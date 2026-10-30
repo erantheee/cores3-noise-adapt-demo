@@ -2824,7 +2824,7 @@ def test_media_card() -> None:
     eq(card["content_kind"], "pop_vocal", "中频主导、瞬态低 → 人声流行（估计）")
     check("（估计）" in card["content_text"], "类型标签必须带（估计），不能冒充流派识别")
     tuning = "\n".join(card["tuning"])
-    check("抬 5/24 段" in tuning, "调音思路写明抬了几段")
+    check("存在感区抬 5 段" in tuning, "调音思路写明抬了几段")
     check("中频 1–2.2 kHz" in tuning, "并把动的频段翻成人话")
     check("剂量 1.4" in tuning, "写明当前剂量（基础/激进）")
     check("正增益被收缩" in tuning, "瞬态风险高时要说明安全门在收缩")
