@@ -183,6 +183,27 @@ if (frame) {
     check(text("ctx-note").includes("未通过真机验收"),
           "情境卡必须写明是实验模型、未通过真机验收（TODOS A-1）");
   }
+  // 当前媒体卡（2026-10-30 用户口径）：媒体源 / 内容类型（估计）/ 调音思路必须分开显示；
+  // 快照没有 media 时如实写"还没有判断"，不能画成"没有媒体"。
+  if (snapshot.media) {
+    check(text("media-source") === snapshot.media.source_text,
+          `媒体源显示为 ${snapshot.media.source_text}`);
+    if (snapshot.media.track) {
+      check(text("media-track").includes(snapshot.media.track), "曲目名要显示");
+    }
+    check(text("media-kind").includes(snapshot.media.content_text),
+          "内容类型要显示");
+    check(text("media-kind").includes("置信") === (snapshot.media.content_confidence > 0),
+          "有置信度才显示置信度");
+    const firstTuning = (snapshot.media.tuning || [])[0] || "";
+    if (firstTuning) {
+      check(text("media-tuning").includes(firstTuning.slice(0, 12)),
+            "调音思路要显示（不只是一句状态）");
+    }
+  } else {
+    check(text("media-kind").includes("还没有媒体判断"),
+          "快照没有 media 时如实写还没有判断");
+  }
   check(text("state") === frame.state_text, `动作显示为 ${frame.state_text}`);
   // 「现实人声增益意图」这一格显示的是 external_voice_gain_db。旧断言比的是
   // speech_gain_db——提交 eb53704 把这一格换了语义之后它就成了假断言：真机上两者恰好都是

@@ -251,26 +251,40 @@
       <div class="sub" id="relay-detail">—</div>
       <div class="sub" id="relay-note">—</div>
     </div>
-    <div class="card wide">
-      <h2>播放（Mac · 原版原曲）</h2>
+    <!--
+      当前媒体（2026-10-30 用户口径）：这一块负责说明"现在听到的是什么、大概什么类型、
+      调音思路是什么"。判断在 host（tools/host/media.py），面板只照实显示。
+      本机播放器控件保留在下面的 details 里——它是调试/原版对照用的，不再是主路径。
+    -->
+    <div class="card wide" id="media-card">
+      <h2>当前媒体（听到的）</h2>
       <div class="row">
-        <span class="value small" id="track">—</span>
-        <span class="sub" id="track-pos" style="margin-top:0">—</span>
+        <span class="value small" id="media-source">—</span>
+        <span class="sub" id="media-track" style="margin-top:0">—</span>
       </div>
-      <!-- 进度条：0…1000 是千分比。拖动时不跟随状态更新，松手才下发 seek。 -->
-      <div class="row" style="margin-top:6px">
-        <input type="range" id="player-seek" min="0" max="1000" step="1" value="0" style="flex:1">
-      </div>
-      <div class="row" style="margin-top:6px">
-        <button id="btn-prev">上一首</button>
-        <button id="btn-play">▶ 播放</button>
-        <button id="btn-next">下一首</button>
-        <span class="sub">播放增益</span>
-        <input type="range" id="player-vol" min="0" max="200" step="5" value="150" style="flex:1 1 120px">
-        <span class="sub" id="player-vol-text">150%</span>
-      </div>
-      <div class="sub" id="player-note">—</div>
-      <div class="sub" id="systemeq-note" style="margin-top:4px">—</div>
+      <div class="sub" id="media-kind">—</div>
+      <div class="sub" id="media-tuning" style="white-space:pre-line">—</div>
+      <details style="margin-top:8px">
+        <summary class="sub">本机播放器（调试 / 原版对照，不参与 QQ 音乐链路）</summary>
+        <div class="row" style="margin-top:6px">
+          <span class="value small" id="track">—</span>
+          <span class="sub" id="track-pos" style="margin-top:0">—</span>
+        </div>
+        <!-- 进度条：0…1000 是千分比。拖动时不跟随状态更新，松手才下发 seek。 -->
+        <div class="row" style="margin-top:6px">
+          <input type="range" id="player-seek" min="0" max="1000" step="1" value="0" style="flex:1">
+        </div>
+        <div class="row" style="margin-top:6px">
+          <button id="btn-prev">上一首</button>
+          <button id="btn-play">▶ 播放</button>
+          <button id="btn-next">下一首</button>
+          <span class="sub">播放增益</span>
+          <input type="range" id="player-vol" min="0" max="200" step="5" value="150" style="flex:1 1 120px">
+          <span class="sub" id="player-vol-text">150%</span>
+        </div>
+        <div class="sub" id="player-note">—</div>
+        <div class="sub" id="systemeq-note" style="margin-top:4px">—</div>
+      </details>
     </div>
     <div class="card">
       <h2>人声置信度</h2>
@@ -716,6 +730,7 @@ function render(s) {
       ? tuningNote(f.tuning)
       : "这一帧没有调音数据（旧固件不发 eq_gain_db）；图形是由语音段增益推导的";
   $("control-warn").style.display = s.control && s.control.unresponsive ? "block" : "none";
+  renderMedia(s);
   renderPlayer(s);
   renderSystemEq(s);
   renderStemAction(s);
@@ -1018,6 +1033,30 @@ function renderStemAction(s) {
   const action = cuts.length ? `让位 ${cuts.join(" / ")}` : "不改变原混音";
   const caveat = se.stem_environment === "wind" ? " · 防风=避让低频，不消耳外风声" : "";
   el.textContent = `分轨：${policy} · ${action}${riskText}${caveat}`;
+}
+
+// 当前媒体卡：媒体源 / 内容类型（估计）/ 调音思路。判断在 host，这里只显示；
+// 缺字段时如实写"还没有判断"，不把"没报"画成"没有媒体"。
+function renderMedia(s) {
+  const media = s.media;
+  if (!media) {
+    $("media-source").textContent = "—";
+    $("media-track").textContent = "";
+    $("media-kind").textContent =
+      "还没有媒体判断（刚启动或数据源不支持）";
+    $("media-tuning").textContent = "";
+    return;
+  }
+  $("media-source").textContent = media.source_text || "—";
+  $("media-track").textContent = media.track
+    ? " · " + media.track
+    : (media.track_note ? " · " + media.track_note : "");
+  const confidence = Math.round((Number(media.content_confidence) || 0) * 100);
+  const basis = media.content_basis ? `（${media.content_basis}）` : "";
+  $("media-kind").textContent = media.content_text
+    ? `内容类型：${media.content_text}${confidence > 0 ? " · 置信 " + confidence + "%" : ""}${basis}`
+    : "内容类型：—";
+  $("media-tuning").textContent = (media.tuning || []).join("\n");
 }
 
 function renderPlayer(s) {

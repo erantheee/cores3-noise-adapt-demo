@@ -379,6 +379,11 @@ class HostState:
         with self.lock:
             self.player = player
 
+    def set_media(self, media: dict | None) -> None:
+        """面板「当前媒体」卡的内容（媒体源 / 内容类型估计 / 调音思路）。"""
+        with self.lock:
+            self.media = dict(media) if media else None
+
     def set_leak(self, leak: dict | None) -> None:
         """B2：歌曲漏音残差的一次估计结果（只读遥测，不参与判定）。"""
         with self.lock:
@@ -751,6 +756,8 @@ class HostState:
             "systemeq": self.systemeq.snapshot() if self.systemeq is not None else None,
             #: B2：歌曲漏音残差估计（off/observe/apply + 电平/置信度/原因）。
             "leak": getattr(self, "leak", None),
+            #: 当前媒体卡：媒体源、曲目（能读就读）、内容类型（估计）、调音思路。
+            "media": getattr(self, "media", None),
             #: 中继的实时读数。measurable=False 表示这个播放端不报告排队深度——
             #: 界面必须把"测不到"和"延迟为零"分开显示。
             "relay": self.relay.live() if self.relay is not None else None,

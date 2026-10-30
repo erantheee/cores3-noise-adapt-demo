@@ -54,6 +54,7 @@ from host.mac_audio import (  # noqa: E402
     route_command,
 )
 from host.leak import estimate_leak  # noqa: E402
+from host.media import describe_media  # noqa: E402
 from host.voiceprint import VoiceprintService  # noqa: E402
 from host.server import (  # noqa: E402
     Broadcaster,
@@ -2777,6 +2778,77 @@ def test_masking_dose_for_eq_mode() -> None:
     eq(masking_dose_for("loud"), 1.0, "非法档位也退回 1.0×（不猜）")
 
 
+def test_media_card() -> None:
+    """面板「当前媒体」卡（2026-10-30 用户口径）：媒体源 / 歌曲类型（估计）/ 调音思路。
+
+    三条纪律：
+      * 媒体源只认执行端：systemeq 是 QQ 音乐、播放器在播是本机播放器，都没有就写没有；
+      * 类型没有流派元数据，只能从内容谱形做**粗分类估计**，标签必须带「（估计）」；
+      * 调音思路只写实测动作与被哪道门限制（段数/峰值/剂量/瞬态/余量/漏音），不写"智能"。
+    """
+    # 1) 没有执行端：如实说原声
+    card = describe_media(systemeq=None, player=None, frame=None, leak=None)
+    eq(card["source"], "none", "没有执行端时媒体源是 none")
+    check("没有媒体" in card["source_text"], "并如实写没有媒体在出声")
+    check(any("执行端没在跑" in line for line in card["tuning"]),
+          "调音思路要说明现在听到的是原声")
+
+    # 2) 只有本地播放器：曲目名读得到
+    card = describe_media(systemeq=None,
+                          player={"playing": True, "track_title": "渡口"},
+                          frame=None, leak=None)
+    eq(card["source"], "player", "播放器在播时媒体源是 player")
+    eq(card["track"], "渡口", "曲目名要如实显示")
+
+    shape = [-30.0] * 24
+    for index in range(8, 16):
+        shape[index] = 0.0  # 中频主导
+    for index in range(16, 20):
+        shape[index] = -10.0  # 有一点高频（真实流行歌不会是高中频全空）
+    systemeq = {
+        "available": True, "execution": "applied",
+        "content_band_shape_db": shape, "content_analyses": 120,
+        "content_window_rms": 0.3, "content_harshness": 0.2,
+        "content_transient_risk": 0.2,
+        "masking_matrix_enabled": True,
+        "masking_bands": [0.0] * 8 + [2.0] * 5 + [0.0] * 11,
+        "masking_peak_db": 2.0, "masking_dose": 1.4, "masking_exposure": 0.9,
+        "output_headroom_gain": 0.63, "out_clip_frames": 3,
+    }
+    # 3) QQ 音乐 + 中频主导 → 人声流行（估计）+ 完整调音思路
+    card = describe_media(systemeq=systemeq, player=None,
+                          frame={"mode": "SONG_EQ"},
+                          leak={"applied": False, "reason": "disabled"})
+    eq(card["source"], "qqmusic", "systemeq 在跑时媒体源是 QQ 音乐")
+    check(card["source_text"].startswith("QQ 音乐"), "媒体源文案写明 QQ 音乐")
+    eq(card["content_kind"], "pop_vocal", "中频主导、瞬态低 → 人声流行（估计）")
+    check("（估计）" in card["content_text"], "类型标签必须带（估计），不能冒充流派识别")
+    tuning = "\n".join(card["tuning"])
+    check("抬 5/24 段" in tuning, "调音思路写明抬了几段")
+    check("中频 1–2.2 kHz" in tuning, "并把动的频段翻成人话")
+    check("剂量 1.4" in tuning, "写明当前剂量（基础/激进）")
+    check("正增益被收缩" in tuning, "瞬态风险高时要说明安全门在收缩")
+    check("输出余量" in tuning and "-4.0" in tuning, "写明输出余量与削波计数")
+    check("漏音残差：未扣" in tuning, "漏音残差状态要一起说")
+
+    # 4) 低频主导 + 强瞬态 → 节奏/电子（估计）
+    low_shape = [-30.0] * 24
+    for index in range(0, 5):
+        low_shape[index] = 0.0
+    rhythmic = dict(systemeq)
+    rhythmic["content_band_shape_db"] = low_shape
+    rhythmic["content_transient_risk"] = 0.6
+    card = describe_media(systemeq=rhythmic, player=None, frame=None, leak=None)
+    eq(card["content_kind"], "rhythmic", "低频+强瞬态 → 节奏/电子（估计）")
+
+    # 5) 直通：调音思路只有一句"原声"
+    bypassed = dict(systemeq)
+    bypassed["bypass"] = True
+    card = describe_media(systemeq=bypassed, player=None, frame=None, leak=None)
+    check(card["tuning"] == ["已直通（关闭EQ）：听到的是原声，不做任何调音。"],
+          "直通时不编造调音动作")
+
+
 def test_leak_residual_estimator() -> None:
     """阶段二/B2：把"Mac 自己放的歌"从 24 段环境谱里估出来。
 
@@ -4463,6 +4535,7 @@ def main() -> int:
         test_dialog_override_link,
         test_music_keepalive,
         test_masking_dose_for_eq_mode,
+        test_media_card,
         test_leak_residual_estimator,
         test_relay_ambient_gate,
         test_audio_relay_budget_caps_backlog,

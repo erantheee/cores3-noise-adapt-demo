@@ -54,6 +54,7 @@ from .sources import (
     build_source,
 )
 from .leak import estimate_leak
+from .media import describe_media
 from .memo import MemoStore
 from .state import CONTEXT_TEXT, HostState, environment_text
 
@@ -1546,6 +1547,21 @@ def main(argv: list[str] | None = None) -> int:
                                                 masking_dose=masking_dose_for(systemeq_mode))
             else:
                 player_service.apply_decision(bands, media_target)
+        # 面板「当前媒体」卡（2026-10-30 用户口径）：媒体源 / 内容类型（估计）/
+        # 调音思路。判断全在这里做，面板只负责显示。执行端暂停时也照实报，
+        # 但要说清"现在听到的是原声"。
+        try:
+            state.set_media(describe_media(
+                systemeq=systemeq_service.snapshot() if systemeq_service is not None else None,
+                player=player_service.snapshot() if player_service is not None else None,
+                frame=None if latest is None else {
+                    "mode": latest.mode,
+                    "broadband_dbfs": latest.broadband_dbfs,
+                },
+                leak=getattr(state, "leak", None),
+            ))
+        except Exception:  # noqa: BLE001 - 媒体卡不是关键路径，绝不能因此停主循环
+            state.set_media(None)
         # A1/D50：把 LLM/本地的迟到否决回写 S3 快路径。**与执行端配置无关**——
         # 默认 `--ambient-executor off` 的演示最需要它：环境声本来就关着，但 S3 的
         # 对话态会把歌曲 EQ 压平、把 D41/D48 的掩蔽停掉，LLM 的 no 必须能纠正快路径。
