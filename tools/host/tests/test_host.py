@@ -53,6 +53,7 @@ from host.mac_audio import (  # noqa: E402
     parse_default_output,
     route_command,
 )
+from host.eq_profile import profile_for, protected_bands  # noqa: E402
 from host.leak import estimate_leak  # noqa: E402
 from host.media import describe_media  # noqa: E402
 from host.voiceprint import VoiceprintService  # noqa: E402
@@ -84,6 +85,7 @@ from host.__main__ import (  # noqa: E402
     MusicKeepalive,
     masking_dose_for,
     music_is_playing,
+    song_eq_depth,
     DialogueTurnGate,
     ambient_spectrum_for,
     ambient_gate_allows,
@@ -2824,14 +2826,15 @@ def test_media_card() -> None:
     eq(card["content_kind"], "pop_vocal", "中频主导、瞬态低 → 人声流行（估计）")
     check("（估计）" in card["content_text"], "类型标签必须带（估计），不能冒充流派识别")
     tuning = "\n".join(card["tuning"])
-    check("存在感区抬 5 段" in tuning, "调音思路写明抬了几段")
+    check("抬 5 段" in tuning, "调音思路写明抬了几段")
     check("中频 1–2.2 kHz" in tuning, "并把动的频段翻成人话")
     check("剂量 1.4" in tuning, "写明当前剂量（基础/激进）")
     check("正增益被收缩" in tuning, "瞬态风险高时要说明安全门在收缩")
     check("输出余量" in tuning and "-4.0" in tuning, "写明输出余量与削波计数")
     check("漏音残差：未扣" in tuning, "漏音残差状态要一起说")
-    check("基础 EQ：S3 24 段 × 深度 1.3×" in tuning,
-          "可听的 S3 基础层要写出来（旧版能听见的就是这一层）")
+    check("环境自适应 EQ（S3 24 段 × 深度 1.3×" in tuning,
+          "可听的环境自适应 EQ 要写出来（旧版能听见的就是这一层）")
+    check("人声流行向" in tuning, "类型保护要写出来")
 
     # 4) 低频主导 + 强瞬态 → 节奏/电子（估计）
     low_shape = [-30.0] * 24
@@ -2849,6 +2852,49 @@ def test_media_card() -> None:
     card = describe_media(systemeq=bypassed, player=None, frame=None, leak=None)
     check(card["tuning"] == ["已直通（关闭EQ）：听到的是原声，不做任何调音。"],
           "直通时不编造调音动作")
+
+
+def test_eq_profile_and_noise_depth() -> None:
+    """Layer 0/1（2026-10-30 用户口径）：噪声连续深度 + 类型保护。
+
+    * 类型保护只做 ±1.5 dB 段偏移 + 0.85～1.0 剂量系数，**不替代基础 EQ**；
+    * 基础 EQ 深度 = 面板深度 × 噪声系数（安静 0.8× → 嘈杂 1.2×，夹 [0.8, 3.0]）；
+    * protected_bands 必须夹回 S3 处方合法范围 [-4, +4] dB，坏输入不猜。
+    """
+    # 1) 类型保护：各类型的段偏移与剂量系数
+    offsets, scale, summary = profile_for("bass_heavy")
+    eq(len(offsets), 24, "偏移必须覆盖 24 段")
+    eq(offsets[0], -1.5, "低频偏重：低频 0–4 段 −1.5 dB（防轰）")
+    eq(offsets[8], 0.0, "低频偏重：presence 不动")
+    eq(scale, 1.0, "低频偏重：剂量不变")
+    check("防轰" in summary, "面板说明写清保护意图")
+
+    offsets, scale, _ = profile_for("rhythmic")
+    eq(offsets[0], 0.5, "节奏型：低频 +0.5 dB")
+    eq(scale, 0.85, "节奏型：整体剂量 ×0.85（避免过冲）")
+
+    offsets, _, _ = profile_for("dense")
+    eq(offsets[16], -1.5, "高频密集：6 kHz 以上收 1.5 dB")
+
+    offsets, _, _ = profile_for("nonsense_kind")
+    check(all(value == 0.0 for value in offsets), "未知类型不调整")
+
+    # 2) protected_bands：偏移 + 剂量 + 夹回 ±4
+    base = [4.0] * 5 + [0.0] * 19
+    bands = protected_bands(base, "bass_heavy")
+    eq(bands[0], 2.5, "4 dB + (−1.5) = 2.5 dB，没有越界")
+    eq(bands[8], 0.0, "presence 原样")
+    eq(protected_bands(base[:12], "bass_heavy"), base[:12], "段数不对不猜，原样返回")
+    bands = protected_bands(base, "rhythmic")
+    check(abs(bands[0] - 3.825) < 1e-3, "节奏型：(4 + 0.5) × 0.85 = 3.825 dB")
+    bands = protected_bands([-6.0] * 24, "bass_heavy")
+    eq(bands[0], -4.0, "负向越界夹回 −4 dB")
+
+    # 3) 噪声连续深度：安静 0.8×、嘈杂 1.2×、坏输入用面板值、上限 3.0
+    eq(song_eq_depth(-52.0, 1.3), 1.04, "安静时 0.8× 面板深度")
+    check(abs(song_eq_depth(-30.0, 1.3) - 1.56) < 1e-3, "嘈杂时 1.2× 面板深度")
+    eq(song_eq_depth(None, 2.5), 2.5, "没有电平用面板深度")
+    eq(song_eq_depth(-20.0, 3.0), 3.0, "深度夹在 3.0×")
 
 
 def test_leak_residual_estimator() -> None:
@@ -4537,6 +4583,7 @@ def main() -> int:
         test_dialog_override_link,
         test_music_keepalive,
         test_masking_dose_for_eq_mode,
+        test_eq_profile_and_noise_depth,
         test_media_card,
         test_leak_residual_estimator,
         test_relay_ambient_gate,

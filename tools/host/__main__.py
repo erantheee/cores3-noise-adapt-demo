@@ -53,8 +53,9 @@ from .sources import (
     SourceError,
     build_source,
 )
+from .eq_profile import protected_bands
 from .leak import estimate_leak
-from .media import describe_media
+from .media import describe_media, estimate_content_kind
 from .memo import MemoStore
 from .state import CONTEXT_TEXT, HostState, environment_text
 
@@ -77,6 +78,20 @@ def masking_depth(mode: str | None, broadband_dbfs: float | None,
         return peak
     t = max(0.0, min(1.0, (broadband_dbfs + 54.0) / 24.0))
     return base + (peak - base) * t
+
+
+def song_eq_depth(broadband_dbfs: float | None, panel_depth: float) -> float:
+    """基础 EQ 的噪声连续深度（Layer 0，2026-10-30）。
+
+    面板档位决定基准（basic 1.3× / 激进 2.5×），噪声决定起伏：
+    安静（≤ -52 dBFS）0.8× 面板深度 → 嘈杂（≥ -30 dBFS）1.2×。
+    这样"噪声多大推多少"是连续量，而不是固定两档；上限夹到 3.0×，
+    避免激进档 + 高噪声把削减推到刺耳。基础层的正增益仍由执行端 5/6 dB 预算封顶。
+    """
+    if broadband_dbfs is None:
+        return float(panel_depth)
+    exposure = max(0.0, min(1.0, (float(broadband_dbfs) + 52.0) / 22.0))
+    return max(0.8, min(3.0, float(panel_depth) * (0.8 + 0.4 * exposure)))
 
 
 def stem_environment_for(frame) -> str:
@@ -1528,15 +1543,22 @@ def main(argv: list[str] | None = None) -> int:
                     # 选择性补偿（两者相加，正增益总预算 5 dB 封顶，安全门不变）。
                     # 量随噪声走：S3 曲线本身由环境谱生成，深度由面板档位决定。
                     bands = list(latest.tuning.band_gain_db) if latest.tuning else [0.0] * 24
+                    # Layer 1（类型保护）：按内容类型给 24 段做 ±1～2 dB 保护偏移，
+                    # 不替代基础 EQ（2026-10-30 用户口径"给轨道做保护，一样回归 EQ"）。
+                    kind = estimate_content_kind(systemeq_service.snapshot() or {}).get("kind")
+                    bands = protected_bands(bands, kind)
                 else:
                     # 旧固件/坏帧才使用克制的类别处方作为兼容回退。
                     bands = low_latency_strategy_bands(latest)
                 # 掩蔽时按噪声大小自动加深处方深度（安静 1.3× → 嘈杂 2.5×）；
                 # 非掩蔽模式不覆盖面板深度。
-                # 分轨路径按场景自动加深；低延迟路径恢复面板深度（basic 1.3×/激进 2.5×），
-                # 这是旧版"能明显听出来"的来源。掩蔽矩阵在它之上再加选择性补偿。
-                depth_override = (masking_depth(latest.mode, latest.broadband_dbfs)
-                                  if args.stem_remix else None)
+                # 分轨路径按场景自动加深；低延迟路径 = 面板深度 × 噪声连续系数
+                # （Layer 0，安静 0.8× → 嘈杂 1.2×）。掩蔽矩阵在它之上再加选择性补偿。
+                depth_override = (
+                    masking_depth(latest.mode, latest.broadband_dbfs)
+                    if args.stem_remix
+                    else song_eq_depth(latest.broadband_dbfs, systemeq_service.depth)
+                )
                 # 安静/对话（S3 报 FLAT）时基线归零：EQ 完全平直，不留 demo 音染
                 # （2026-10-23 用户口径"安静时应该是完全没有"）。
                 # 低延迟智能路径不再叠“所有歌曲一个味道”的固定 demo 基线；
@@ -1565,6 +1587,9 @@ def main(argv: list[str] | None = None) -> int:
                     "broadband_dbfs": latest.broadband_dbfs,
                     # 可听的基础层：S3 24 段处方（面板要能写出"到底调了多少"）。
                     "tuning_bands": list(latest.tuning.band_gain_db) if latest.tuning else [],
+                    # 掩蔽层 B 的事件证据（S3 侧的包络已合进处方，面板只需要说明来源）。
+                    "event": latest.event,
+                    "typing_active": bool(latest.typing_active),
                 },
                 leak=getattr(state, "leak", None),
             ))

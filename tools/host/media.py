@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import math
 
+from .eq_profile import profile_for
+
 #: 24 段中心频率分组（与固件/systemeq 的 log 段一致）：只用于把"哪几段在动"讲成人话。
 BAND_GROUPS = (
     ("超低频 70–140 Hz", range(0, 2)),
@@ -148,17 +150,17 @@ def tuning_lines(systemeq: dict, frame: dict | None, leak: dict | None) -> list[
         if boosts:
             ranges = _band_ranges(boosts)
             where = "、".join(ranges[:3]) + (f" 等 {len(ranges)} 组" if len(ranges) > 3 else "")
-            parts.append(f"存在感区抬 {len(boosts)} 段（{where}，目标峰值 {peak:.1f} dB）")
+            parts.append(f"抬 {len(boosts)} 段（{where}，目标峰值 {peak:.1f} dB）")
         if cuts:
             cut_ranges = _band_ranges(cuts)
             lowest = min(_num(bands[i], 0.0) for i in cuts)
             where = "、".join(cut_ranges[:3]) + (f" 等 {len(cut_ranges)} 组" if len(cut_ranges) > 3 else "")
-            parts.append(f"低频让位 {len(cuts)} 段（{where}，最低 {lowest:.1f} dB）")
+            parts.append(f"让位 {len(cuts)} 段（{where}，最低 {lowest:.1f} dB）")
         lines.append(
-            "；".join(parts) + f"（剂量 {dose:.1f}×）。"
+            "舒适层（内容 × 环境补偿）：" + "；".join(parts) + f"（剂量 {dose:.1f}×）。"
         )
     else:
-        lines.append("这一拍没有「噪声压过歌曲」的频段：不抬，保持原声。")
+        lines.append("舒适层：这一拍没有「噪声压过歌曲」的频段，不做补偿。")
     gate = "正增益被收缩" if transient >= 0.15 else "未触发收缩"
     lines.append(f"遮蔽强度 {exposure:.0%}；内容瞬态 {transient:.0%} → {gate}。")
     headroom_db = 20.0 * math.log10(headroom) if headroom > 0 else 0.0
@@ -166,17 +168,31 @@ def tuning_lines(systemeq: dict, frame: dict | None, leak: dict | None) -> list[
         f"输出余量 {headroom_db:+.1f} dB（防止抬完削波）；自启动累计削波 {int(clip)} 帧"
         "（不增长＝没在削）。"
     )
-    # 2026-10-30 用户："旧版 S3 EQ 能明显听出来"。可听的那层是 S3 24 段处方 × 深度，
-    # 面板要把它写出来——否则用户只看到矩阵的 1–3 dB，会以为"没调"。
+    # 2026-10-30 用户口径：S3 24 段处方 × 深度 = 环境自适应 EQ（舒适层 A）的可听主体，
+    # 而且它内部已经包含 S3 固件的事件驱动掩蔽包络（键盘 250 ms/2.6 s、EVI 1–4 kHz 拉满）。
+    # 面板必须把它写出来，否则用户只看到补偿层的 1–3 dB，会以为"没调"。
     base_bands = [float(value) for value in ((frame or {}).get("tuning_bands") or [])]
     depth = _num(systemeq.get("depth"))
+    kind = estimate_content_kind(systemeq).get("kind")
+    _, _, protection = profile_for(kind)
+    if protection:
+        lines.append(f"类型保护：{protection}。")
     if len(base_bands) == 24 and depth:
         peak_db = max(base_bands) * depth
         low_db = min(base_bands) * depth
         lines.append(
-            f"基础 EQ：S3 24 段 × 深度 {depth:.1f}×（最高 {peak_db:+.1f} / 最低 {low_db:+.1f} dB，"
-            "随环境强度变化）。"
+            f"环境自适应 EQ（S3 24 段 × 深度 {depth:.1f}×，随噪声连续变化）："
+            f"最高 {peak_db:+.1f} / 最低 {low_db:+.1f} dB。"
         )
+    # 掩蔽层 B：事件驱动的增益包络，主体在 S3 固件侧完成，处方里已经带上。
+    if (frame or {}).get("typing_active"):
+        lines.append(
+            "掩蔽：正在打字 → 键盘包络（起 250 ms / 落 2.6 s，作用 1–3.4 kHz，已在 S3 处方内）。"
+        )
+    elif (frame or {}).get("event") == "keyboard":
+        lines.append("掩蔽：键盘事件 → S3 已在 1–3.4 kHz 加包络。")
+    if (frame or {}).get("mode") == "EXTERNAL_VOICE_INTENT":
+        lines.append("掩蔽：背景人声 → 1–4 kHz 拉满 + 全段 +1（S3 处方内）。")
     if leak:
         state = "已扣" if leak.get("applied") else "未扣"
         reason = {

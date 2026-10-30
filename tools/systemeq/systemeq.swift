@@ -1480,8 +1480,11 @@ func applyEq(_ state: EqState) {
         }
         // 正增益总预算：base + extra + 动态 三者相加后封顶 maxBoostDb（负方向仍到
         // -maxAppliedGainDb）。这是"听清歌曲"的硬约束：掩蔽不许把静态抬升堆到 6 dB。
+        // 正增益总预算：基础 5 dB / 激进 6 dB（2026-10-30 用户要"激进要存在"，
+        // 但只放宽总预算，段别 budget、瞬态门、输出余量照旧）。负向去糊不受限。
+        let boostCap: Float = snapshot.mode == "aggressive" ? 6.0 : maxBoostDb
         var target = min(clamp(base + extra + dynamic,
-                               -maxAppliedGainDb, maxAppliedGainDb), maxBoostDb)
+                               -maxAppliedGainDb, maxAppliedGainDb), boostCap)
         // 强瞬态时不去抬鼓点/钢琴起音；只收缩正增益，负向去糊
         // 保持不变。最强时收掉 75%，不会因为一个鼓点把音色硬切。
         if target > 0 {
