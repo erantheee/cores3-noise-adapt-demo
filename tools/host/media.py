@@ -166,6 +166,17 @@ def tuning_lines(systemeq: dict, frame: dict | None, leak: dict | None) -> list[
         f"输出余量 {headroom_db:+.1f} dB（防止抬完削波）；自启动累计削波 {int(clip)} 帧"
         "（不增长＝没在削）。"
     )
+    # 2026-10-30 用户："旧版 S3 EQ 能明显听出来"。可听的那层是 S3 24 段处方 × 深度，
+    # 面板要把它写出来——否则用户只看到矩阵的 1–3 dB，会以为"没调"。
+    base_bands = [float(value) for value in ((frame or {}).get("tuning_bands") or [])]
+    depth = _num(systemeq.get("depth"))
+    if len(base_bands) == 24 and depth:
+        peak_db = max(base_bands) * depth
+        low_db = min(base_bands) * depth
+        lines.append(
+            f"基础 EQ：S3 24 段 × 深度 {depth:.1f}×（最高 {peak_db:+.1f} / 最低 {low_db:+.1f} dB，"
+            "随环境强度变化）。"
+        )
     if leak:
         state = "已扣" if leak.get("applied") else "未扣"
         reason = {

@@ -1521,16 +1521,22 @@ def main(argv: list[str] | None = None) -> int:
                 if args.stem_remix:
                     systemeq_service.set_stem_environment(stem_environment_for(latest))
                 elif masking_enabled:
-                    # S3 已经提供真实 24 段环境谱时，不再套固定“风/键盘/人声”音色。
-                    # 逐段动作由 systemeq 内的环境谱 × 歌曲谱矩阵实时生成。
-                    bands = [0.0] * 24
+                    # 2026-10-30 用户："旧版 S3 EQ 能明显听出修改，新版怎么做不到？"
+                    # 原因不是物理，是 2026-10-29 把 S3 的 24 段处方整条置零、只留矩阵
+                    # （1–3 dB）。旧版可听的那层正是 S3 曲线 × 深度（basic 1.3×/激进 2.5×，
+                    # 单段到 ±5–10 dB）。现在恢复它作为"可听基础层"，矩阵继续做内容感知的
+                    # 选择性补偿（两者相加，正增益总预算 5 dB 封顶，安全门不变）。
+                    # 量随噪声走：S3 曲线本身由环境谱生成，深度由面板档位决定。
+                    bands = list(latest.tuning.band_gain_db) if latest.tuning else [0.0] * 24
                 else:
                     # 旧固件/坏帧才使用克制的类别处方作为兼容回退。
                     bands = low_latency_strategy_bands(latest)
                 # 掩蔽时按噪声大小自动加深处方深度（安静 1.3× → 嘈杂 2.5×）；
                 # 非掩蔽模式不覆盖面板深度。
+                # 分轨路径按场景自动加深；低延迟路径恢复面板深度（basic 1.3×/激进 2.5×），
+                # 这是旧版"能明显听出来"的来源。掩蔽矩阵在它之上再加选择性补偿。
                 depth_override = (masking_depth(latest.mode, latest.broadband_dbfs)
-                                  if args.stem_remix else 1.0)
+                                  if args.stem_remix else None)
                 # 安静/对话（S3 报 FLAT）时基线归零：EQ 完全平直，不留 demo 音染
                 # （2026-10-23 用户口径"安静时应该是完全没有"）。
                 # 低延迟智能路径不再叠“所有歌曲一个味道”的固定 demo 基线；
@@ -1557,6 +1563,8 @@ def main(argv: list[str] | None = None) -> int:
                 frame=None if latest is None else {
                     "mode": latest.mode,
                     "broadband_dbfs": latest.broadband_dbfs,
+                    # 可听的基础层：S3 24 段处方（面板要能写出"到底调了多少"）。
+                    "tuning_bands": list(latest.tuning.band_gain_db) if latest.tuning else [],
                 },
                 leak=getattr(state, "leak", None),
             ))

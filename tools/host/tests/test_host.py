@@ -2813,11 +2813,11 @@ def test_media_card() -> None:
         "masking_matrix_enabled": True,
         "masking_bands": [0.0] * 8 + [2.0] * 5 + [0.0] * 11,
         "masking_peak_db": 2.0, "masking_dose": 1.4, "masking_exposure": 0.9,
-        "output_headroom_gain": 0.63, "out_clip_frames": 3,
+        "output_headroom_gain": 0.63, "out_clip_frames": 3, "depth": 1.3,
     }
     # 3) QQ 音乐 + 中频主导 → 人声流行（估计）+ 完整调音思路
     card = describe_media(systemeq=systemeq, player=None,
-                          frame={"mode": "SONG_EQ"},
+                          frame={"mode": "SONG_EQ", "tuning_bands": [0.5] * 8 + [4.0] * 8 + [2.0] * 8},
                           leak={"applied": False, "reason": "disabled"})
     eq(card["source"], "qqmusic", "systemeq 在跑时媒体源是 QQ 音乐")
     check(card["source_text"].startswith("QQ 音乐"), "媒体源文案写明 QQ 音乐")
@@ -2830,6 +2830,8 @@ def test_media_card() -> None:
     check("正增益被收缩" in tuning, "瞬态风险高时要说明安全门在收缩")
     check("输出余量" in tuning and "-4.0" in tuning, "写明输出余量与削波计数")
     check("漏音残差：未扣" in tuning, "漏音残差状态要一起说")
+    check("基础 EQ：S3 24 段 × 深度 1.3×" in tuning,
+          "可听的 S3 基础层要写出来（旧版能听见的就是这一层）")
 
     # 4) 低频主导 + 强瞬态 → 节奏/电子（估计）
     low_shape = [-30.0] * 24
