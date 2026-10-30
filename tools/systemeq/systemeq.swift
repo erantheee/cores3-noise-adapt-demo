@@ -1480,11 +1480,20 @@ func applyEq(_ state: EqState) {
         }
         // 正增益总预算：base + extra + 动态 三者相加后封顶 maxBoostDb（负方向仍到
         // -maxAppliedGainDb）。这是"听清歌曲"的硬约束：掩蔽不许把静态抬升堆到 6 dB。
-        // 正增益总预算：基础 5 dB / 激进 6 dB（2026-10-30 用户要"激进要存在"，
-        // 但只放宽总预算，段别 budget、瞬态门、输出余量照旧）。负向去糊不受限。
-        let boostCap: Float = snapshot.mode == "aggressive" ? 6.0 : maxBoostDb
+        // 正增益总预算（2026-10-30 用户："基础整首歌已经有点毛 + 激进声音变小"）。
+        // 实测源峰值 1.03（QQ 音乐输出已满量程），旧预算 5/6 dB 推得越狠，输出实测
+        // 峰值越到 2.57、每秒上千个削波样本（毛），同时余量把整条链压 2~4 dB（变小）。
+        // 源满量程时正增益没有可用空间：把预算收到 基础 2.0 / 激进 2.5 dB，
+        // 声音对比主要交给负向去糊/让位（削低不推高，峰值不升）；音量最多被压
+        // 与抬升同量（≤2.5 dB），削波由反馈余量拦住。
+        // 激进不再靠"抬得更高"（源满量程，抬只会被余量压回来 → 变小），
+        // 而是"削得更深"：正增益比基础还少 0.5 dB，负向去糊/让位 ×1.3（夹到 -8 dB）。
+        let boostCap: Float = snapshot.mode == "aggressive" ? 1.5 : 2.0
         var target = min(clamp(base + extra + dynamic,
                                -maxAppliedGainDb, maxAppliedGainDb), boostCap)
+        if target < 0 && snapshot.mode == "aggressive" {
+            target = max(-8.0, target * 1.3)
+        }
         // 强瞬态时不去抬鼓点/钢琴起音；只收缩正增益，负向去糊
         // 保持不变。最强时收掉 75%，不会因为一个鼓点把音色硬切。
         if target > 0 {
@@ -1501,7 +1510,7 @@ func applyEq(_ state: EqState) {
     // 时才收，且最多 -1 dB；真正的防削波交给 50 ms 拍的正增益收缩（只削抬升，不降总音量）。
     // 代价：源本身已到 1.15 峰值（QQ 音乐输出）时会有零星硬削波——用户口径允许削波、
     // 不允许加限幅器/延迟；先保证"听得见"，毛刺再单独收。
-    let feedbackTarget = latestOutPeak > 1.0 ? min(1.0, 1.0 / latestOutPeak) : 1.0
+    let feedbackTarget = latestOutPeak > 0.95 ? min(1.0, 0.95 / latestOutPeak) : 1.0
     let sourcePeak = Float(capture.meter.snapshot().peak)
     // 旧实现对"预测峰值"的算法是 sourcePeak × max(段增益)——它默认被抬的频段就是峰值
     // 所在的那一段。2026-10-30 真机：矩阵抬的是存在感区（比峰值低 10–30 dB），它却按
@@ -1525,7 +1534,9 @@ func applyEq(_ state: EqState) {
     // 必须放在 EQ 链里，不能只改 mainMixer.outputVolume：后者不一定被
     // 下方的输出 tap 测到，上一版事实上就没有形成反馈回路。EQ 链里的
     // globalGain 不增加算法延迟，且测到就能下一拍收紧。
-    eq.globalGain = 20.0 * log10(clamp(outputHeadroomGain, 0.891, 1.0))
+    // 允许压到 -6 dB：反馈在 0.95 目标下能真正拦住削波；压的幅度受正增益预算
+    // （≤2.5 dB）约束，不会再现"激进 -4 dB"。
+    eq.globalGain = 20.0 * log10(clamp(outputHeadroomGain, 0.5, 1.0))
     engine.mainMixerNode.outputVolume = clamp(snapshot.mediaPercent / 100.0, 0, 1)
 }
 
