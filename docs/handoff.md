@@ -20,6 +20,11 @@
   （需要 QQ 音乐在播才有实时内容谱；本轮 QQ 音乐静音，本地播放器出声时 systemeq 无内容谱）。见 D58。
 - **A-1 止损**：面板情境卡逐字写「实验模型／未通过真机验收」，render_check 加断言；
   九分类仍只遥测，采集/重训未开始。
+- **面板三档语义（2026-10-30 12:0x 用户拍板）**：`基础` = 掩蔽剂量 1.0×（约 2.15 dB），
+  `激进` = 1.4×（约 3 dB，更明显），`关闭EQ` = 执行端 bypass（原声直通）。**不要新增按钮**
+  （用户明确要求，刚加的「掩蔽 A/B」已删除）。剂量只放大逐段目标与段别 budget，安全门全保留；
+  快照 `masking_dose`（执行端回报）/`masking_dose_sent`（host 实发）分列。真机 basic→1.0 /
+  aggressive→1.4 已验证；听感验收现在用「基础 vs 激进 vs 关闭EQ」三档。
 - 工具：`free_port.sh` 自动发现串口（不再写死 `usbmodem1101`）；`test_launcher.sh` 接入 CI；
   `live_band_capture.py` 新增 systemeq 列与分阶段摘要。
 - 回归（实测）：host **104 组 / 8049 断言**、ctest **13/13**、render **68/68**、launcher 通过；

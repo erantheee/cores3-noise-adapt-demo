@@ -81,6 +81,7 @@ from host.continuous_audio import ContinuousAudioWriter  # noqa: E402
 from host.__main__ import (  # noqa: E402
     DialogOverrideLink,
     MusicKeepalive,
+    masking_dose_for,
     music_is_playing,
     DialogueTurnGate,
     ambient_spectrum_for,
@@ -2343,9 +2344,19 @@ def test_eq_mode_and_bypass_control() -> None:
         "智能掩蔽上下文能下发",
     )
     eq(sent[-1]["ambient_band_dbfs"], ambient, "eq 带完整 S3 24 段环境谱")
+    eq(sent[-1]["masking_dose"], 1.0, "eq 默认带 1.0× 掩蔽剂量")
     eq(sent[-1]["ambient_broadband_dbfs"], -40.0, "eq 带 S3 宽带电平")
     check(sent[-1]["masking_enabled"] is True, "eq 显式打开逐段掩蔽矩阵")
     check(sent[-1]["base_gain"] == 0.0, "智能路径不再叠固定 demo 音色")
+    check(
+        service.apply_decision(
+            [0.0] * 24, 100.0, base_gain=0.0,
+            ambient_band_dbfs=ambient, ambient_broadband_dbfs=-40.0,
+            masking_enabled=True, masking_dose=1.4,
+        ),
+        "曲线/环境都不变、只切「激进」档时也必须立即下发",
+    )
+    eq(sent[-1]["masking_dose"], 1.4, "激进档的剂量随 eq 一起到执行端")
     changed = list(ambient)
     changed[12] += 3.0
     check(
@@ -2750,6 +2761,20 @@ def test_music_keepalive() -> None:
     eq(music_is_playing(None, _Side({"playing": True})), True, "本地播放器在播也算")
     eq(music_is_playing(None, _Side({"playing": False})), False, "播放器不在播不算")
     eq(music_is_playing(None, None), False, "没有执行端：不在放歌")
+
+
+def test_masking_dose_for_eq_mode() -> None:
+    """面板三档 → 掩蔽剂量（D56 补，2026-10-30 用户要求保留基础/激进）。
+
+    为什么改这个而不是加按钮：用户明确"激进一样要存在"。三档语义现在是
+    基础 1.0×（约 2.15 dB）、激进 1.4×（约 3 dB）、关闭EQ = 执行端 bypass 原声；
+    剂量只放大逐段目标与段别 budget，安全门（瞬态/段 budget/正增益总预算/输出余量）
+    一个都不绕过，所以"激进"不会变成不受约束的抬升。
+    """
+    eq(masking_dose_for("basic"), 1.0, "基础档 = 1.0×")
+    eq(masking_dose_for("aggressive"), 1.4, "激进档 = 1.4×")
+    eq(masking_dose_for(None), 1.0, "未知档位退回保守的 1.0×")
+    eq(masking_dose_for("loud"), 1.0, "非法档位也退回 1.0×（不猜）")
 
 
 def test_leak_residual_estimator() -> None:
@@ -4437,6 +4462,7 @@ def main() -> int:
         test_ambient_gate_llm_only_trigger,
         test_dialog_override_link,
         test_music_keepalive,
+        test_masking_dose_for_eq_mode,
         test_leak_residual_estimator,
         test_relay_ambient_gate,
         test_audio_relay_budget_caps_backlog,

@@ -995,12 +995,16 @@ final class EqState: @unchecked Sendable {
         var ambientBands = [Float](repeating: -120, count: 24)
         var ambientBroadbandDbfs: Float = -120
         var maskingEnabled = false
+        /// 掩蔽剂量倍数（面板「基础/激进」= 1.0/1.4）。只放大逐段掩蔽的目标与段别
+        /// budget，不绕过节别上限、内容瞬态门与输出余量。
+        var maskingDose: Float = 1.0
     }
     private let lock = OSAllocatedUnfairLock(initialState: State())
 
     func update(bands: [Float], depth: Float, mediaPercent: Float,
                 baseGain: Float = 1.0, ambientBands: [Float] = [],
-                ambientBroadbandDbfs: Float = -120, maskingEnabled: Bool = false) {
+                ambientBroadbandDbfs: Float = -120, maskingEnabled: Bool = false,
+                maskingDose: Float = 1.0) {
         lock.withLockUnchecked { state in
             for index in 0..<24 where index < bands.count {
                 state.sourceBands[index] = bands[index]
@@ -1013,6 +1017,7 @@ final class EqState: @unchecked Sendable {
             }
             state.ambientBroadbandDbfs = ambientBroadbandDbfs
             state.maskingEnabled = maskingEnabled && ambientBands.count == 24
+            state.maskingDose = clamp(maskingDose, 0.5, 2.0)
         }
     }
 
@@ -1037,11 +1042,11 @@ final class EqState: @unchecked Sendable {
         }
     }
 
-    func snapshot() -> (bands: [Float], depth: Float, bypass: Bool, mediaPercent: Float, mode: String, baseGain: Float, ambientBands: [Float], ambientBroadbandDbfs: Float, maskingEnabled: Bool) {
+    func snapshot() -> (bands: [Float], depth: Float, bypass: Bool, mediaPercent: Float, mode: String, baseGain: Float, ambientBands: [Float], ambientBroadbandDbfs: Float, maskingEnabled: Bool, maskingDose: Float) {
         lock.withLockUnchecked { state in
             return (state.sourceBands, state.depth, state.bypass, state.mediaPercent,
                     state.mode, state.baseGain, state.ambientBands,
-                    state.ambientBroadbandDbfs, state.maskingEnabled)
+                    state.ambientBroadbandDbfs, state.maskingEnabled, state.maskingDose)
         }
     }
 }
@@ -1378,6 +1383,9 @@ func applyEq(_ state: EqState) {
         : 0
     maskingExposure += (exposureTarget - maskingExposure)
         * (exposureTarget > maskingExposure ? 0.18 : 0.05)
+    // 面板「基础/激进」= 掩蔽剂量 1.0/1.4。它只把逐段目标与段别 budget 一起放大，
+    // 安全门（内容瞬态、段别 budget、正增益总预算、输出余量）一个都不绕过。
+    let maskingDose = max(0.5, min(2.0, snapshot.maskingDose))
     let noiseMax = snapshot.ambientBands.max() ?? -120
     maskingActiveBands = 0
     maskingPeakDb = 0
@@ -1396,14 +1404,14 @@ func applyEq(_ state: EqState) {
             // 只要遮蔽证据成立，都允许进入至少 2 dB 的可听调节。
             let overlap = min(noiseProminence, songPresence)
             let need = 0.45 + 0.55 * deficit
-            let budget: Float = index < 4 ? 2.35 : (index >= 19 ? 2.35 : 2.50)
+            let budget: Float = (index < 4 ? 2.35 : (index >= 19 ? 2.35 : 2.50)) * maskingDose
             // Demo 要让用户能在一次切换里确认方向：重叠证据成立后提高到可听区间，
             // 但仍由每段 budget 硬封顶。强重叠时反推瞬态安全门前的目标，让安全门后
             // 仍约为 2 dB；真正的强瞬态允许临时低于 2 dB，优先不打碎鼓点/钢琴起音。
             target = min(budget, maskingExposure * overlap * need * budget * 2.2)
             if maskingExposure >= 0.65 && overlap >= 0.25 {
                 let transientScale = max(0.25, 1.0 - 0.75 * content.transientRisk)
-                target = max(target, min(budget, 2.15 / transientScale))
+                target = max(target, min(budget, 2.15 * maskingDose / transientScale))
             }
         }
         let coefficient: Float = target > maskingBands[index] ? 0.18 : 0.05
@@ -1545,10 +1553,12 @@ Thread {
             let baseGain = Float((object["base_gain"] as? Double) ?? 1.0)
             let ambientBroadband = Float((object["ambient_broadband_dbfs"] as? Double) ?? -120)
             let maskingEnabled = (object["masking_enabled"] as? Bool) ?? false
+            let maskingDose = Float((object["masking_dose"] as? Double) ?? 1.0)
             state.update(bands: bands, depth: depth, mediaPercent: media,
                          baseGain: baseGain, ambientBands: ambientBands,
                          ambientBroadbandDbfs: ambientBroadband,
-                         maskingEnabled: maskingEnabled)
+                         maskingEnabled: maskingEnabled,
+                         maskingDose: maskingDose)
         case "flat":
             state.flat()
         case "bypass":
@@ -1669,6 +1679,7 @@ if options.reportSeconds > 0 {
             "masking_exposure": Double(maskingExposure),
             "masking_active_bands": maskingActiveBands,
             "masking_peak_db": Double(maskingPeakDb),
+            "masking_dose": Double(snapshot.maskingDose),
             "masking_bands": maskingBands.map { Double($0) },
             "out_peak": outMeter.totals().peak,
             "out_clip_frames": outMeter.totals().clipFrames,

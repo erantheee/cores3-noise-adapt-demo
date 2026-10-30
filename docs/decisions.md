@@ -1815,6 +1815,15 @@ songPresence × deficit）把目标压到了不可闻区间；旧口径还只加
 `applied_bands` 是 EQ 后、全局余量前的相对值；全局余量会整体压低，听感是"谱形变了"
 而不是"更响"。
 
+**面板三档语义（2026-10-30 用户拍板：不要新增按钮，激进档必须保留）**：
+`关闭EQ` = 执行端 bypass（原声直通，不经 EQ 链和输出余量）；`基础` = 掩蔽剂量 1.0×
+（可听档，逐段目标约 2.15 dB）；`激进` = 掩蔽剂量 1.4×（约 3 dB，更明显）。剂量只放大
+逐段目标与段别 budget——内容瞬态门、正增益总预算、输出余量一个都不绕过，所以"激进"
+不会变成不受约束的抬升；强瞬态时两档都允许临时低于目标。host 按执行端回报的 `mode`
+映射剂量随 `eq` 下发；快照里 `masking_dose`（执行端回报）与 `masking_dose_sent`
+（host 实发）分开报，避免"面板切了但没到执行端"这类静默故障。真机验证：
+basic→1.0 / aggressive→1.4，执行端回报与 host 实发一致。host 105 组 / 8056 断言。
+
 **文件**：`tools/systemeq/systemeq.swift`、`tools/host/systemeq.py`、
 `tools/host/__main__.py`、`tools/live_band_capture.py`（验收记录列）、`tools/systemeq/README.md`。
 

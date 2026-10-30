@@ -135,6 +135,19 @@ def low_latency_strategy_bands(frame) -> list[float]:
     return [round(value * exposure, 3) for value in profile]
 
 
+#: 面板「EQ 档位」到掩蔽剂量的映射（2026-10-30 用户要求保留三级档位）：
+#: 基础 1.0×（可听档，约 2.15 dB 目标），激进 1.4×（约 3 dB，更明显），
+#: 关闭EQ 走执行端 bypass（原声），不经过剂量。真正的上限仍由段别 budget、
+#: 内容瞬态门与输出余量兜住——剂量只是把目标调高，不是绕过安全门。
+MASKING_DOSE_BASIC = 1.0
+MASKING_DOSE_AGGRESSIVE = 1.4
+
+
+def masking_dose_for(mode: str | None) -> float:
+    """把面板的 EQ 档位映射成掩蔽剂量。未知档位退回 1.0（保守）。"""
+    return MASKING_DOSE_AGGRESSIVE if str(mode or "") == "aggressive" else MASKING_DOSE_BASIC
+
+
 def ambient_spectrum_for(frame) -> list[float]:
     """返回可供实时掩蔽矩阵使用的 S3 24 段环境谱；坏帧保守禁用。"""
     raw = getattr(frame, "ambient_band_dbfs", ())
@@ -1522,12 +1535,15 @@ def main(argv: list[str] | None = None) -> int:
                 # 低延迟智能路径不再叠“所有歌曲一个味道”的固定 demo 基线；
                 # 分轨实验保留旧行为，FLAT 始终完全原声。
                 base_gain = (0.0 if not args.stem_remix or latest.mode == "FLAT" else 1.0)
+                # 面板档位 → 掩蔽剂量：基础 1.0×、激进 1.4×（关闭EQ 走 bypass）。
+                systemeq_mode = (systemeq_service.snapshot() or {}).get("mode")
                 systemeq_service.apply_decision(bands, media_target,
                                                 depth_override=depth_override,
                                                 base_gain=base_gain,
                                                 ambient_band_dbfs=ambient_spectrum,
                                                 ambient_broadband_dbfs=latest.broadband_dbfs,
-                                                masking_enabled=masking_enabled)
+                                                masking_enabled=masking_enabled,
+                                                masking_dose=masking_dose_for(systemeq_mode))
             else:
                 player_service.apply_decision(bands, media_target)
         # A1/D50：把 LLM/本地的迟到否决回写 S3 快路径。**与执行端配置无关**——

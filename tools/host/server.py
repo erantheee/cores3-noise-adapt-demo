@@ -340,6 +340,7 @@ class Handler(BaseHTTPRequestHandler):
         player = getattr(self.server, "player", None)
         systemeq = getattr(self.server, "systemeq", None)
 
+
         if command == "depth":
             try:
                 if systemeq is not None:

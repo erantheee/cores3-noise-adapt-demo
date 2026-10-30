@@ -75,6 +75,7 @@ class SystemEqService:
         self._last_depth: float = 0.0
         self._last_base_gain: float = 1.0
         self._last_masking_context: tuple[bool, list[float], float] = (False, [], -120.0)
+        self._last_masking_dose: float = 1.0
         self._last_stem_environment: str | None = None
         self._last_attempt = 0.0
         self.reason = ""
@@ -270,7 +271,8 @@ class SystemEqService:
                        base_gain: float = 1.0,
                        ambient_band_dbfs: list[float] | None = None,
                        ambient_broadband_dbfs: float | None = None,
-                       masking_enabled: bool = False) -> bool:
+                       masking_enabled: bool = False,
+                       masking_dose: float = 1.0) -> bool:
         if self.stem_worker:
             # 分轨模式以原混音为底，只做负向对比；旧 24 段正增益再叠上去会把鼓、
             # 电吉他和大混响重新推毛。媒体让位仍沿用 S3 的决定。
@@ -307,6 +309,7 @@ class SystemEqService:
             and len(last_ambient) == len(ambient)
             and all(abs(a - b) < 0.5 for a, b in zip(last_ambient, ambient))
             and abs(last_ambient_broadband - ambient_broadband) < 0.5
+            and abs(self._last_masking_dose - float(masking_dose)) < 1e-3
         )
         same = (
             len(last_bands) == len(bands)
@@ -329,6 +332,7 @@ class SystemEqService:
                     "ambient_band_dbfs": ambient,
                     "ambient_broadband_dbfs": ambient_broadband,
                     "masking_enabled": bool(masking_enabled and len(ambient) == 24),
+                    "masking_dose": float(masking_dose),
                 }
             )
         except SystemEqError as exc:
@@ -340,6 +344,7 @@ class SystemEqService:
         self._last_base_gain = float(base_gain)
         self._last_masking_context = (
             bool(masking_enabled and len(ambient) == 24), ambient, ambient_broadband)
+        self._last_masking_dose = float(masking_dose)
         return True
 
     def snapshot(self) -> dict:
@@ -423,6 +428,11 @@ class SystemEqService:
             "masking_exposure": state.get("masking_exposure"),
             "masking_active_bands": state.get("masking_active_bands"),
             "masking_peak_db": state.get("masking_peak_db"),
+            #: 面板「基础/激进」对应的掩蔽剂量倍数（1.0/1.4）。它只放大逐段目标与
+            #: 段别 budget，安全门不绕过；面板要能看出当前档位到底在做什么。
+            "masking_dose": state.get("masking_dose"),
+            #: host 最近一次真正下发的剂量（对照 Swift 回报，排查"面板切了但没到执行端"）。
+            "masking_dose_sent": float(self._last_masking_dose),
             "masking_bands": state.get("masking_bands") or [],
             #: EQ **之后**的输出峰值与削波计数（2026-10-28）：判断"人声毛刺"是不是
             #: 削波造成的，只能量 EQ 之后的信号；tap 的 peak 在 EQ 之前。

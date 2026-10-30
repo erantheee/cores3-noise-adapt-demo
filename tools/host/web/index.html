@@ -848,8 +848,12 @@ function applyNote(s) {
     ? `绝对值最大 ${peakAbs.toFixed(2)} dB（其中最大削减 ${maxCut.toFixed(2)} dB，${cutBands} 段在削）`
     : `峰值 +${peakAbs.toFixed(2)} dB`;
   const owner = side.kind === "systemeq" ? "QQ音乐 tap" : "Mac";
-  const extra = side.kind === "systemeq" && exec.demo
-    ? "（含 demo 基线，S3 ×深度）"
+  // 2026-10-29 起低延迟主链不再叠固定 demo 基线（base_gain=0），绿色柱子是
+  // "S3 24 段 × 深度 + 逐段掩蔽"；只有分轨实验才还带 demo 基线。旧文案会误导。
+  const extra = side.kind === "systemeq"
+    ? (exec.stem_stream
+        ? "（分轨实验：含 demo 基线）"
+        : `（低延迟主链：S3 24 段 × 深度 ${(exec.depth || 0).toFixed(1)}× + 逐段掩蔽，不含固定 demo 基线）`)
     : `（形状来自 S3，深度 ${(exec.depth || 0).toFixed(1)}× 是本机为"听得出来"设的演示参数）`;
   return `绿柱＝${owner} 真正设进 EQ 的值${extra}（${shape}，向上=抬 / 向下=削）；蓝线＝S3 报的原始建议。`;
 }
@@ -871,8 +875,8 @@ function renderEqMode(se) {
     label.textContent = !se
       ? "未启用执行端"
       : bypass
-        ? "当前：EQ 全关（直通）"
-        : "当前：" + (mode === "basic" ? "基础" : "激进");
+        ? "当前：EQ 全关（原声直通）"
+        : "当前：" + (mode === "basic" ? "基础 · 掩蔽 1×（约 2 dB）" : "激进 · 掩蔽 1.4×（约 3 dB）");
   }
 }
 
@@ -912,8 +916,10 @@ function renderSystemEq(s) {
   const maskingOn = se.masking_matrix_enabled === true;
   const maskingPeak = Number(se.masking_peak_db);
   const maskingExposure = Number(se.masking_exposure);
+  const maskingDose = Number(se.masking_dose);
   const maskingNote = maskingOn
     ? ` · 逐段掩蔽 ${Number(se.masking_active_bands) || 0}/24 段 · 峰值 ${Number.isFinite(maskingPeak) ? maskingPeak.toFixed(2) : "?"} dB · 强度 ${Number.isFinite(maskingExposure) ? (maskingExposure * 100).toFixed(0) : "?"}%`
+      + (Number.isFinite(maskingDose) ? ` · 剂量 ${maskingDose.toFixed(1)}×（${maskingDose > 1.05 ? "激进" : "基础"}）` : "")
     : " · 逐段掩蔽待环境谱";
   const roles = se.stem_roles || {};
   const gains = se.stem_gains_db || {};
