@@ -751,6 +751,13 @@ sdkconfig.defaults:
 **S3 决策，Mac 执行。** 面板上的「播放（Mac · 原版）」播的是本地曲目**原文件**，不做任何
 预渲染；S3 每 100 ms 报一次环境与 24 段建议，Mac 把这些频段**实时**应用到正在播放的音频上。
 
+QQ 音乐实时主链走 **S3 环境判断 → 幅度受限的策略选择 → Mac 轻量 DSP**。执行端每隔
+100 ms 将 S3 的 24 段环境频谱与正在播放的 24 段内容频谱比较，只补“噪声占优且音乐不足”
+的重叠段；非分轨路径不再叠加固定 demo 基线。无有效环境频谱时回原音，旧类别曲线只用于兼容旧固件。
+Mac 同时用 FFT 检测高频密度和瞬态风险，强瞬态时收紧正增益，并用 EQ 链内实测余量防止输出削波。
+Demucs 六分轨只作为显式开启的离线实验：2 s 窗
+引入约 2.8 s 固定延迟，真机曾测到 RTF 1.368 导致严重断续，不能作为实时主链。
+
 ```bash
 sh tools/player/build.sh          # 用 swiftc 编出 tools/player/player（本机无 Xcode 全量，CLT 够）
 sh tools/relay/build.sh           # 用 swiftc 编出中继播放端 tools/relay/relaysink（--relay-audio 需要它）

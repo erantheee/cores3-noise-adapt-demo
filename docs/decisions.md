@@ -1774,3 +1774,102 @@ LLM 判 `dialogue=yes` **0 次**（no 44 / unclear 88），S3 只在 17:29:12 �
 耳机里听到中继声（Xiaomi 耳夹总时延约 385–405 ms）；独白/电视保持不开。
 
 **文件**：`tools/host/assistant.py`、`tools/host/tests/test_host.py`。
+
+## D56 · 2026-10-30 S3 24 段环境谱 × 歌曲 24 段内容谱的逐段掩蔽矩阵，与"可听调音档"
+
+**背景**：2026-10-29 的逐段掩蔽矩阵在真机 -28.3 dBFS 高噪声下实际只抬了 **+0.13 dB**，
+用户听感是"完全没感觉"。根因不是矩阵没跑，而是三层因子连乘（noiseProminence ×
+songPresence × deficit）把目标压到了不可闻区间；旧口径还只加强中频。
+
+**设计（当前实现，`tools/systemeq/systemeq.swift`）**：
+* 输入：S3 每 100 ms 报的 `ambient_band_dbfs`（24 段）+ Mac 侧 tap PCM 的 1024 点 FFT
+  生成的 24 段**相对谱形** `bandShapeDb`（对称比较，不做绝对 dBFS 换算）。
+* 逐段：`noiseRelative = ambient[i] − max(ambient)`、`songRelative = shape[i]`、
+  `deficit = clamp((noiseRelative − songRelative − 3) / 15)`、
+  `overlap = min(noiseProminence, songPresence)`、`need = 0.45 + 0.55·deficit`、
+  `budget = 2.35 dB（低频/高频）或 2.50 dB（中频）`；
+  `exposure = clamp((broadband_dbfs + 58) / 22, 0, 1)`，攻 0.18 / 放 0.05 每 50 ms。
+* **可听档**：`exposure ≥ 0.65 且 overlap ≥ 0.25` 时，反推瞬态安全门前的目标
+  `target = max(target, min(budget, 2.15 / transientScale))`，使安全门后约为 2.15 dB；
+  强瞬态下仍允许临时低于 2 dB（不打碎鼓点/钢琴起音）。
+* 后级：每段 `applied = clamp(base + extra + S3 段增益×深度 + masking, ±maxAppliedGainDb)`，
+  正增益总和封顶 `maxBoostDb`；正增益乘 `1 − 0.75·transientRisk`；EQ 后峰值反馈 +
+  预测峰值得到 `globalGain`（约 −2.9 dB @ 源峰值 1.0）。**不加大滤波器带宽**
+  （D52 实测 0.55 oct 会让并联段重叠、等效增益翻倍）。
+* 失败模式回原声：无有效 24 段谱 / FLAT / 1 s 无新控制帧 → `masking_enabled=false`、
+  非分轨路径 `base_gain=0`，旧类别处方只做旧固件兼容。
+
+**真机验证（2026-10-30 11:2x，`记录/eq验收/20261030-live-1.csv`，60 s / 563 帧）**：
+* `masking_matrix_enabled=true` 全程 100%；16–18 段参与（P50 17），`masking_peak_db`
+  P50 **2.22 dB**；**applied 正向峰值 P50 2.14 / P90 2.22 / max 2.29 dB，≥2 dB 占 85%**
+  ——用户"至少 2 dB"的验收线在真机上首次达成（改动前 1.61–1.95）。
+* `out_clip_frames` 窗口内增量 **0**（启动期累计 13 帧，源峰值 1.0033 已越过全量程；
+  之后不再增长）；输出余量中位 **−2.93 dB**；丢帧 0；执行错误 0。
+* 60 s 内模式切换 12 次（SONG_EQ↔EXTERNAL_VOICE_INTENT，键盘/近场人声触发），
+  `masking_exposure` P50 0.90；不是矩阵自身抖动。
+* **待办（本轮未做）**：用户听感确认；安静房间下 M4（只有歌、无外部噪声 → 矩阵应静默）
+  无法在当前有本底的房间验证，需要安静场景或 B2 的漏音残差估计。
+
+**界限**：矩阵只知道"当前环境遮住了歌里哪些频段"，不知道歌里唱的是人声/吉他/鼓
+（内容角色侧链见下一阶段）；也不知道音乐是 Mac 自己放的（漏音残差 B2）。
+`applied_bands` 是 EQ 后、全局余量前的相对值；全局余量会整体压低，听感是"谱形变了"
+而不是"更响"。
+
+**文件**：`tools/systemeq/systemeq.swift`、`tools/host/systemeq.py`、
+`tools/host/__main__.py`、`tools/live_band_capture.py`（验收记录列）、`tools/systemeq/README.md`。
+
+
+## D57 · 2026-10-30 「歌是 Mac 放的」：`music on|off` 控制行（阶段二/B1）
+
+**问题**：S3 听到的 24 段环境谱里混着 Mac 自己放的歌。设备分不清"环境里有音乐"和
+"我自己放出来的音乐"：肩上/近耳位置现场实测 25–33% 的帧被判成情境 music，漏音还会
+偶尔触发 1 s 事件层的 speech。后面的漏音残差（D58）与可能的内容侧链都需要这个信号。
+
+**实现**：host 在**执行端实测在放歌**时每 1 s 下发 `music on 3000`，停止时发一次
+`music off`；设备侧 TTL 3 s（上限 10 s）后自动回到"没在放歌"（fail-open）。证据只认
+回执：systemeq `execution == "applied"`（引擎在跑且实测有信号）或本地播放器 `playing`，
+不用"用户点了播放/曲目列表非空"。
+
+**v1 的边界（重要）**：设备侧 **只进遥测** `music_playing`，对话/背景人声判据一帧都没读它。
+没有真机数据就改阈值，最可能把真实对话一起压掉；等 B2/B3 的现场数据再决定门控。
+设备侧的对话态纠正仍由 D50 的 `dialog no` 负责。
+
+**验证（2026-10-30 真机，已刷机）**：
+* 协议/时序：`test/music_state_test.cpp` 15 条（TTL 到期、续期、off、缺省/上限）；
+  host `test_music_keepalive` + 帧解析断言；host 104 组 / 8049 断言；ctest 13/13。
+* 真机：本地播放器播放《渡口》→ 快照 `control.last=music on（S3 记录「歌是 Mac 放的」）`、
+  帧 `music_playing=true`；暂停 → `music off` → `music_playing=false`。固件版本依据：
+  命令帧出现 `music_playing` 键（B1 之前的固件没有）。
+
+**文件**：`main/music_state.hpp`（新）、`main/app_main.cpp`、`test/music_state_test.cpp`、
+`test/CMakeLists.txt`、`tools/host/{protocol,state,__main__}.py`、`tools/host/web/index.html`、
+`tools/host/tests/test_host.py`。
+
+## D58 · 2026-10-30 歌曲漏音残差：先估出来、只观测（阶段二/B2）
+
+**问题**：掩蔽矩阵（D56）比较"S3 报的环境谱"与"歌曲内容谱"。自己放的歌会进麦克风，
+矩阵把歌自己的频段当成"噪声占优"，一边补一边更明显——正反馈。且安静房间里
+"只有歌"时矩阵不该动（M4），这个口径当前无法验证。
+
+**实现（`tools/host/leak.py`，纯函数）**：
+* 只比较谱形：`ambient[i] − content[i]` 的中位数就是歌打到麦克风上的整体偏移，
+  残差在功率域相减；
+* 单段最多减 12 dB（宁可少减，不能把真实环境声一起减掉）；
+* 一致性门：离散度（中位绝对偏差）> 6 dB 或置信 < 0.6 → **原样放行**；
+  歌曲谱形自身动态范围 < 8 dB（近似平谱）→ 不估（平谱可以解释成任何歌的漏音）；
+* 歌没内容的频段不动；内容谱必须新鲜且 `execution=applied` 才用（本地播放器出声时
+  systemeq 是静音的，拿过期谱形做减法会把真实噪声当漏音）。
+
+**默认只观测**：`--leak-residual observe`（默认）只把 `leak_level_db/confidence/spread/reason`
+写进快照与面板；`apply` 才把残差谱送进矩阵。**没有真机 A/B 之前不改调音动作**——
+和九分类同一条纪律。`off` 完全不计算。
+
+**验证**：`test_leak_residual_estimator` 10 条断言（纯漏音、漏音+外部噪声、平谱歌、
+谱形不一致、关闭/坏输入/歌内容太少）；host 104 组 / 8049 断言。
+**未做**：真机 A/B（需要 QQ 音乐正在播放才能拿到实时内容谱；本轮 QQ 音乐处于静音，
+本地播放器出声时 systemeq 无内容谱，故只能验到"不播放时完全不介入"）。
+下一步：用户恢复播放后跑 `--leak-residual observe` vs `apply` 各 30 s，比较
+`masking_active_bands/masking_peak_db` 与听感，再决定是否改默认。
+
+**文件**：`tools/host/leak.py`（新）、`tools/host/__main__.py`、`tools/host/state.py`、
+`tools/host/web/index.html`、`tools/host/tests/test_host.py`。

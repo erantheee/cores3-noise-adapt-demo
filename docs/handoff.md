@@ -3,6 +3,78 @@
 > 每轮收尾更新本文件（≤2.5KB）。新会话顺序：`AGENTS.md` → 本文件 → `docs/INDEX.md` → 按需读。
 > 旧版交接已归档 `docs/handoff-archive-20261023.md`。
 
+## 最新（2026-10-30 11:3x · 可听调音档真机达标 + B1/B2 落地 + A-1 止损）
+- **阶段一（可听调音）**：真机 60 s / 563 帧（`记录/eq验收/20261030-live-1.csv`）：
+  掩蔽矩阵全程启用、P50 17/24 段；`masking_peak_db` P50 2.22 dB；**applied 正向峰值
+  P50 2.14 / P90 2.22 / max 2.29 dB，≥2 dB 占 85%**（改动前 1.61–1.95）→ 用户"至少 2 dB"
+  首次在真机达成；窗口内 `out_clip_frames` 增量 0（启动期累计 13 帧：源峰值 1.0033 已越界，
+  之后不增长）；余量中位 −2.93 dB；丢帧 0、执行错误 0。见 D56。
+  **听感待用户确认**；M4（只有歌→矩阵应静默）当前房间有本底，待 B2 的 observe/apply A/B。
+- **阶段二/B1 `music on|off`（已实现、已刷机、真机验证）**：host 在执行端实测在放歌时
+  每 1 s 续期，设备 TTL 3 s fail-open；帧键 `music_playing`。真机验证：播放器播放 →
+  快照 `control.last=music on（S3 记录「歌是 Mac 放的」）`、帧 true；暂停 → off、帧 false。
+  设备侧 **只遥测**，对话/掩蔽判据未改。见 D57。
+- **阶段二/B2 歌曲漏音残差（已实现、只观测）**：`tools/host/leak.py` 纯函数（谱形中位偏移、
+  功率域相减、单段 ≤12 dB、离散度/置信/平谱三道门），快照 `leak` + 面板显示；
+  `--leak-residual observe|apply|off`，**默认 observe 不改变调音**。真机 A/B 未做
+  （需要 QQ 音乐在播才有实时内容谱；本轮 QQ 音乐静音，本地播放器出声时 systemeq 无内容谱）。见 D58。
+- **A-1 止损**：面板情境卡逐字写「实验模型／未通过真机验收」，render_check 加断言；
+  九分类仍只遥测，采集/重训未开始。
+- 工具：`free_port.sh` 自动发现串口（不再写死 `usbmodem1101`）；`test_launcher.sh` 接入 CI；
+  `live_band_capture.py` 新增 systemeq 列与分阶段摘要。
+- 回归（实测）：host **104 组 / 8049 断言**、ctest **13/13**、render **68/68**、launcher 通过；
+  固件已刷（含 `music_playing` 键）。
+- 下一步：① 用户听感（阶段一 Gate）；② 恢复 QQ 音乐后做 B2 的 observe vs apply A/B；
+  ③ B3 内容角色侧链；④ C1 采集工具读真实 `broadband_dbfs`；⑤ C2 九分类真机采集（需用户素材/在场）。
+
+## 最新（2026-10-29 · S3 24 段实时掩蔽矩阵）
+- **2026-10-30 断流保护**：修复“串口打开但 S3 已无数据，页面仍写已连接且 Mac 无限沿用
+  最后一帧处方”。现在 1 s 无新控制帧即把 EQ 复位为平直、媒体 100%、关闭环境声；页面显示
+  「S3 暂无新数据 / 数据中断」「已旁路」。真机复现为残留 `/dev/cu.usbmodem101` 可打开但
+  10 s 零字节，host 安全退出；重新插入后真机恢复到 `control_data_live=true`、帧龄
+  13–106 ms、Xiaomi OWS 路由、masking matrix 生效，15 s 无丢帧/削波/执行错误。回归
+  **102 组 / 8004 断言**，断流渲染 **87/87**、恢复态渲染 **85/85**。
+- **2026-10-30 可听调音档**：用户确认原矩阵“完全没感觉”；真机证据是在 -28.3 dBFS 高噪声
+  下实际仅 +0.13 dB。现改为低/中/高任一频段只要遮蔽证据成立，都进入约 2 dB 目标，
+  不再只加强中频；后级峰值目标收紧到约 -0.9 dBFS。真机 18 s 观察最大实际
+  +1.61～1.95 dB、16～21 段参与、`out_clip_frames=0`、无执行错误，输出 Xiaomi OWS。
+- 用户现场确认 Demucs 2 s 窗造成歌词严重不同步；进一步测到单窗 **2.736 s**，
+  hop 1.5 s，RTF **1.368**，输出 ring 读空、输入 ring 塞满，严重断续。
+- 主链现在是 **S3 24 段环境频谱 × QQ 音乐 24 段内容频谱**：只对“噪声占优且音乐不足”
+  的重叠频段做有上限的补偿，不再将风噪/键盘分类直接映射成整首歌的固定 EQ；无有效
+  频谱时 fail-open 到原音，旧固定策略只作旧固件兼容兜底。非分轨路径 `base_gain=0`。
+- Mac 保留高频密度/瞬态风险门、段别增益上限和 EQ 后峰值余量；六分轨默认关闭，仅显式
+  `--stem-remix` 进实验路径。
+- 验证：host **101 组 / 7995 断言**，实时页面 **86/86**；真机 `masking_matrix_enabled=true`，
+  现场 24 s 内激活 0–4/24 段、峰值约 +0.05–0.08 dB，ring 稳定、无执行错误。启动初期累计
+  1 个削波采样，余量随后收紧且未继续增长。
+- 界限：已经会判断“当前环境遮住了歌里哪些频段”，但还不识别人声/吉他/鼓等语义角色；
+  下一层应是不进音频主链的轻量内容角色侧链，不能把 Demucs 延迟重新带回来。
+
+## 最新补充（2026-10-28 19:0x · 声纹原型漂移事故与修复，仅 host 侧）
+- 现象：用户报「自己说话被当成别人」。定位到在线自学习把原型学坏：`记录/声纹/self-device/
+  learned-prototype.npz` 与 10-26 注册原型的 cosine 从 0.9885（updates 56）/ 0.9368（156）
+  掉到 **0.3956**（updates 1120，18:46）；与 impostor-live 素材 mean 0.754 / max 0.927。
+  自己说话 score≈0.40 → 连续 2 窗 ≤0.50（0.80−0.30）判 other。**不是 WavLM 的问题**：
+  当前 3 段注册集止损门 12.63 / EER 0% 通过（`tools/voice_separability.py`）。
+- 根因：worker 的 8% EMA 无锚点（时间常数 ~12 窗）；学习门槛 0.80 与判定阈值同值；
+  host 侧透传不了 `--no-learn`；`host_up.sh` 默认自动加 `--voiceprint` → 一直开着学。
+- 修复（未刷机）：① worker 加注册锚点 `--anchor-min-cos 0.90`：加载时离锚点过远 →
+  拒绝 + rename 留档 + 冻结；线上更新越界 → 回退锚点并冻结；② learn_weight 0.08→0.01、
+  learn_min_score 0.80→0.90；③ host 新增 `--voiceprint-learn`，**默认不学**；
+  ④ 快照加 `learn_enabled/learn_frozen/learn_rejected/drift` 遥测。
+- 验证（实测）：host **99 组 / 7978 断言** exit 0；重启后 worker 自动 reject 坏原型
+  （`learn_reject drift=0.4768` → `learned-rejected-20261028-190049.npz`），ready
+  `drift=1.0 / updates=0 / clips=3`；真机现场连续判 self（score 0.79–0.97），frame
+  `mode=SONG_EQ / conversation=NONE / media=100`（不再因 other 触发对话）。
+  坏原型留档 `/tmp/learned-broken-20261028-1846.npz`。
+- 边界：`--ambient-gate voice` 下 self **故意不回传**设备（D42），所以设备
+  `voiceprint_decision.valid=false` 是设计不是故障；该模式下设备侧 self-veto 不生效，
+  自己说话仍可能被 D16 预判压 EQ（靠 D50 dialog veto 兜底），不是声纹能解决的。
+- 未做：重新注册声纹（当前 3 段单一条件，类内抖动 0.028 说明条件覆盖极窄，应按
+  `tools/record_voiceprints.py` 三档 + 分两天录）；`tools/free_port.sh` 串口编号匹配 bug
+  （找 `usbmodem1101`，实际 `usbmodem101`，本次用 lsof+kill 手动绕过）。
+
 ## 最新补充（2026-10-28 17:4x · 环境声不开：上下文被清 + unknown 被当 unclear，D55）
 - 用户报「环境声还是没有开啊」。查当天 17:07–17:36 的 132 段：LLM `dialogue=yes` **0 次**
   （no 44 / unclear 88），S3 只在 17:29:12 发过 35 帧 `ambient_open` 意图；且 host 是
