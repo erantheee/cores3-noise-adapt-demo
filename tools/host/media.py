@@ -133,8 +133,7 @@ def tuning_lines(systemeq: dict, frame: dict | None, leak: dict | None) -> list[
         return ["S3 报安静/对话：EQ 平直，掩蔽暂停（对话优先）。"]
 
     if not systemeq.get("masking_matrix_enabled"):
-        lines.append("掩蔽矩阵待环境谱：这一拍只有基础 EQ，没有逐段补偿。")
-        return lines
+        lines.append("舒适层：环境×内容矩阵已停用（回归 S3 处方 + 类型保护；开关预留）。")
 
     bands = systemeq.get("masking_bands") or []
     boosts = [i for i, value in enumerate(bands) if _num(value, 0.0) > 0.3]

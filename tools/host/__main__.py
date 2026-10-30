@@ -1528,42 +1528,23 @@ def main(argv: list[str] | None = None) -> int:
                     })
                     if leak.applied and len(leak.bands) == 24:
                         ambient_spectrum = leak.bands
-                masking_enabled = (
-                    not args.stem_remix
-                    and latest.mode != "FLAT"
-                    and len(ambient_spectrum) == 24
-                )
+                # 2026-10-30 用户："以前 QQ 音乐 100% 都能解决，现在又是毛又是变小"。
+                # 回归 D54（ed01782）链路：S3 处方 × 深度 + demo 基线 + 削波收缩 trim，
+                # **没有**全局余量压音量。环境×内容矩阵停用（代码与开关预留，B3 后再议）。
+                masking_enabled = False
                 if args.stem_remix:
                     systemeq_service.set_stem_environment(stem_environment_for(latest))
-                elif masking_enabled:
-                    # 2026-10-30 用户："旧版 S3 EQ 能明显听出修改，新版怎么做不到？"
-                    # 原因不是物理，是 2026-10-29 把 S3 的 24 段处方整条置零、只留矩阵
-                    # （1–3 dB）。旧版可听的那层正是 S3 曲线 × 深度（basic 1.3×/激进 2.5×，
-                    # 单段到 ±5–10 dB）。现在恢复它作为"可听基础层"，矩阵继续做内容感知的
-                    # 选择性补偿（两者相加，正增益总预算 5 dB 封顶，安全门不变）。
-                    # 量随噪声走：S3 曲线本身由环境谱生成，深度由面板档位决定。
+                else:
+                    # D54 行为：决策形状永远来自 S3 处方（含键盘/EVI 事件包络）。
+                    # 类型保护（Layer 1）只加 ±1～2 dB 段偏移，不替代基础 EQ。
                     bands = list(latest.tuning.band_gain_db) if latest.tuning else [0.0] * 24
-                    # Layer 1（类型保护）：按内容类型给 24 段做 ±1～2 dB 保护偏移，
-                    # 不替代基础 EQ（2026-10-30 用户口径"给轨道做保护，一样回归 EQ"）。
                     kind = estimate_content_kind(systemeq_service.snapshot() or {}).get("kind")
                     bands = protected_bands(bands, kind)
-                else:
-                    # 旧固件/坏帧才使用克制的类别处方作为兼容回退。
-                    bands = low_latency_strategy_bands(latest)
-                # 掩蔽时按噪声大小自动加深处方深度（安静 1.3× → 嘈杂 2.5×）；
-                # 非掩蔽模式不覆盖面板深度。
-                # 分轨路径按场景自动加深；低延迟路径 = 面板深度 × 噪声连续系数
-                # （Layer 0，安静 0.8× → 嘈杂 1.2×）。掩蔽矩阵在它之上再加选择性补偿。
-                depth_override = (
-                    masking_depth(latest.mode, latest.broadband_dbfs)
-                    if args.stem_remix
-                    else song_eq_depth(latest.broadband_dbfs, systemeq_service.depth)
-                )
-                # 安静/对话（S3 报 FLAT）时基线归零：EQ 完全平直，不留 demo 音染
-                # （2026-10-23 用户口径"安静时应该是完全没有"）。
-                # 低延迟智能路径不再叠“所有歌曲一个味道”的固定 demo 基线；
-                # 分轨实验保留旧行为，FLAT 始终完全原声。
-                base_gain = (0.0 if not args.stem_remix or latest.mode == "FLAT" else 1.0)
+                # D54 行为：EVI（背景人声掩蔽）按噪声连续加深 1.3→2.5×；其余用面板深度。
+                depth_override = masking_depth(latest.mode, latest.broadband_dbfs)
+                # D54 行为：demo 基线恢复（FLAT/安静时归零）——旧版"一耳朵能听出来"
+                # 的来源之一。类型保护与深度在它之上叠加。
+                base_gain = 0.0 if latest.mode == "FLAT" else 1.0
                 # 面板档位 → 掩蔽剂量：基础 1.0×、激进 1.4×（关闭EQ 走 bypass）。
                 systemeq_mode = (systemeq_service.snapshot() or {}).get("mode")
                 systemeq_service.apply_decision(bands, media_target,

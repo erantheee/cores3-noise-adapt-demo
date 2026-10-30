@@ -1371,90 +1371,6 @@ func applyEq(_ state: EqState) {
     // 基线平滑：S3 切 FLAT（安静/对话）时 baseGain 0↔1 平滑过渡，避免硬切。
     smoothedBaseGain += (snapshot.baseGain - smoothedBaseGain) * 0.15
     let baseGain = smoothedBaseGain
-
-    // 真正的逐段掩蔽矩阵。麦克风环境谱和数字歌曲谱不在同一绝对标尺上，
-    // 所以只比较各自的“谱形”；总动作量只由 S3 宽带电平控制。
-    // 失败模式是回到原声：缺 24 段、FLAT、低电平时所有目标都为 0。
-    let spectrumReady = snapshot.maskingEnabled
-        && snapshot.ambientBands.count == 24
-        && content.bandShapeDb.count == 24
-    let exposureTarget = spectrumReady
-        ? clamp((snapshot.ambientBroadbandDbfs + 58.0) / 22.0, 0, 1)
-        : 0
-    maskingExposure += (exposureTarget - maskingExposure)
-        * (exposureTarget > maskingExposure ? 0.18 : 0.05)
-    // 面板「基础/激进」= 掩蔽剂量 1.0/1.4。它只把逐段目标与段别 budget 一起放大，
-    // 安全门（内容瞬态、段别 budget、正增益总预算、输出余量）一个都不绕过。
-    let maskingDose = max(0.5, min(2.0, snapshot.maskingDose))
-    let noiseMax = snapshot.ambientBands.max() ?? -120
-    maskingActiveBands = 0
-    maskingPeakDb = 0
-    for index in 0..<24 {
-        var target: Float = 0
-        if spectrumReady && noiseMax > -119 {
-            let noiseRelative = snapshot.ambientBands[index] - noiseMax
-            let songRelative = content.bandShapeDb[index]
-            let noiseProminence = clamp((noiseRelative + 18.0) / 18.0, 0, 1)
-            let songPresence = clamp((songRelative + 24.0) / 24.0, 0, 1)
-            // 噪声在该段比歌曲更突出时，补偿才加深；歌曲完全没有内容时不抬残响/底噪。
-            let deficit = clamp((noiseRelative - songRelative - 3.0) / 15.0, 0, 1)
-            // 旧版把三个 0…1 因子直接相乘，真机在 -28 dBFS 高噪声下最大仍只有
-            // +0.13 dB，客观上不可闻。保留“噪声和歌曲都在该段才动”的选择性，但用
-            // 两者较小值表达重叠。用户明确要求不只中频：低频、乐器区、人声区和高频
-            // 只要遮蔽证据成立，都允许进入至少 2 dB 的可听调节。
-            let overlap = min(noiseProminence, songPresence)
-            let need = 0.45 + 0.55 * deficit
-            // 预算按频段分：存在感区（1–4 kHz）给最多，低频只给一半。
-            // 2026-10-30 真机："掩蔽完全没效果 + 声音还变小了"。根因是旧版把 15 段都抬
-            // ~2 dB（≈整条谱一起抬，听不出音色变化），而抬了低频峰值 → 输出余量把整条
-            // 链压低 4 dB。现在的分工：低频少抬（不推峰），存在感区多抬（听得见）。
-            let bandBudget: Float = (index >= 8 && index <= 16) ? 5.0
-                : (index <= 7 ? 2.4 : 3.0)
-            let budget: Float = bandBudget * maskingDose
-            // Demo 要让用户能在一次切换里确认方向：重叠证据成立后提高到可听区间，
-            // 但仍由每段 budget 硬封顶。强重叠时反推瞬态安全门前的目标，让安全门后
-            // 仍约为 2 dB；真正的强瞬态允许临时低于 2 dB，优先不打碎鼓点/钢琴起音。
-            // 只有"噪声在该段确实压过歌曲"（≥3 dB）才动——否则抬的是歌本来就强的段，
-            // 只会推高峰值、换来整条链被压低。
-            let masked = (noiseRelative - songRelative) >= 3.0
-            if masked {
-                let transientScale = max(0.35, 1.0 - 0.75 * content.transientRisk)
-                let exposureScale = clamp((maskingExposure - 0.35) / 0.45, 0, 1)
-                // 分段目标（× 剂量）：存在感区听得见，低频只做小幅（低频往往就是峰值所在）。
-                let floorDb: Float = (index >= 8 && index <= 16) ? 3.6
-                    : (index <= 7 ? 1.6 : 2.6)
-                let audible = floorDb * maskingDose * exposureScale / transientScale
-                let shaped = maskingExposure * max(0.25, overlap) * need * budget * 1.8
-                target = min(budget, max(shaped, audible))
-            } else {
-                target = 0
-            }
-            // 2026-10-30 用户两次反馈："掩蔽完全没效果" / "声音还变小了"。
-            // 根因：源（QQ 音乐输出）本身贴满量程（峰值 0.98–1.20），链路没有余量再抬总响度；
-            // 只抬不削时输出必然削波，防削波又会把整条链压低 → 听感"更小声且没变化"。
-            // 现在的做法是**清晰度倾斜**：环境够吵时，存在感区（1–4 kHz）抬、低频让位削，
-            // 峰值由低频的削减换出来，所以不削波、也不用压整条链的总音量。
-            if maskingExposure >= 0.50 {
-                let transientScale = max(0.35, 1.0 - 0.75 * content.transientRisk)
-                let exposureScale = clamp((maskingExposure - 0.45) / 0.35, 0, 1)
-                if index >= 8 && index <= 16 {
-                    let presenceFloor: Float = 3.2 * maskingDose * exposureScale / transientScale
-                    target = max(target, min(budget, presenceFloor))
-                } else if index <= 7 {
-                    // 低频只削不抬：既给峰值让余量，也避免"更闷"。
-                    let cut: Float = -2.5 * exposureScale * (index <= 3 ? 1.0 : 0.6)
-                    target = min(target, cut)
-                } else {
-                    // 高频别推太多：再往上推只会多出削波和嘶声。
-                    target = min(target, 1.5 * exposureScale)
-                }
-            }
-        }
-        let coefficient: Float = target > maskingBands[index] ? 0.18 : 0.05
-        maskingBands[index] += (target - maskingBands[index]) * coefficient
-        if maskingBands[index] > 0.05 { maskingActiveBands += 1 }
-        maskingPeakDb = max(maskingPeakDb, maskingBands[index])
-    }
     for index in 0..<24 {
         currentBands[index] += (snapshot.bands[index] - currentBands[index]) * 0.25
         let base: Float
@@ -1474,69 +1390,18 @@ func applyEq(_ state: EqState) {
             }
         }
         // 正增益的"动态部分"在输出削波时收缩（负增益不动：削减永远安全）。
-        var dynamic = currentBands[index] * snapshot.depth + maskingBands[index]
+        var dynamic = currentBands[index] * snapshot.depth
         if dynamic > 0 && outHeadroomTrimDb > 0 {
             dynamic = max(0, dynamic - outHeadroomTrimDb)
         }
         // 正增益总预算：base + extra + 动态 三者相加后封顶 maxBoostDb（负方向仍到
         // -maxAppliedGainDb）。这是"听清歌曲"的硬约束：掩蔽不许把静态抬升堆到 6 dB。
-        // 正增益总预算（2026-10-30 用户："基础整首歌已经有点毛 + 激进声音变小"）。
-        // 实测源峰值 1.03（QQ 音乐输出已满量程），旧预算 5/6 dB 推得越狠，输出实测
-        // 峰值越到 2.57、每秒上千个削波样本（毛），同时余量把整条链压 2~4 dB（变小）。
-        // 源满量程时正增益没有可用空间：把预算收到 基础 2.0 / 激进 2.5 dB，
-        // 声音对比主要交给负向去糊/让位（削低不推高，峰值不升）；音量最多被压
-        // 与抬升同量（≤2.5 dB），削波由反馈余量拦住。
-        // 激进不再靠"抬得更高"（源满量程，抬只会被余量压回来 → 变小），
-        // 而是"削得更深"：正增益比基础还少 0.5 dB，负向去糊/让位 ×1.3（夹到 -8 dB）。
-        let boostCap: Float = snapshot.mode == "aggressive" ? 1.5 : 2.0
-        var target = min(clamp(base + extra + dynamic,
-                               -maxAppliedGainDb, maxAppliedGainDb), boostCap)
-        if target < 0 && snapshot.mode == "aggressive" {
-            target = max(-8.0, target * 1.3)
-        }
-        // 强瞬态时不去抬鼓点/钢琴起音；只收缩正增益，负向去糊
-        // 保持不变。最强时收掉 75%，不会因为一个鼓点把音色硬切。
-        if target > 0 {
-            target *= 1.0 - 0.75 * content.transientRisk
-        }
+        let target = min(clamp(base + extra + dynamic,
+                               -maxAppliedGainDb, maxAppliedGainDb), maxBoostDb)
         eq.bands[index].gain = target
         appliedBands[index] = target
     }
     eq.bypass = snapshot.bypass
-    // 可听掩蔽档会把重点段推到 1–1.8 dB；后级峰值目标从 -0.5 dBFS
-    // 收紧到约 -0.9 dBFS，避免用零星削波换取“听起来有变化”。
-    // 2026-10-30 用户："声音还变小了"。旧策略用预测峰值把整条链压低 ~4 dB，而掩蔽
-    // 只抬了 ~2 dB、且抬得很宽 → 听感是"变小且没变化"。现在只在**实测输出超过满量程**
-    // 时才收，且最多 -1 dB；真正的防削波交给 50 ms 拍的正增益收缩（只削抬升，不降总音量）。
-    // 代价：源本身已到 1.15 峰值（QQ 音乐输出）时会有零星硬削波——用户口径允许削波、
-    // 不允许加限幅器/延迟；先保证"听得见"，毛刺再单独收。
-    let feedbackTarget = latestOutPeak > 0.95 ? min(1.0, 0.95 / latestOutPeak) : 1.0
-    let sourcePeak = Float(capture.meter.snapshot().peak)
-    // 旧实现对"预测峰值"的算法是 sourcePeak × max(段增益)——它默认被抬的频段就是峰值
-    // 所在的那一段。2026-10-30 真机：矩阵抬的是存在感区（比峰值低 10–30 dB），它却按
-    // +3 dB 把整条链压低，结果"没效果 + 变小"。改成按内容谱形加权：只有被抬的频段
-    // 本身接近峰值时，才需要压整条链。
-    let shape = content.bandShapeDb
-    let shapeMax = shape.max() ?? 0
-    var predictedRatio: Float = 1.0
-    if shape.count == 24 {
-        for index in 0..<24 {
-            let relativeDb = shape[index] - shapeMax
-            let boosted = relativeDb + appliedBands[index]
-            predictedRatio = max(predictedRatio, pow(10.0, boosted / 20.0))
-        }
-    }
-    let predictedPeak = max(sourcePeak, 0.001) * predictedRatio
-    let predictedTarget = predictedPeak > 1.0 ? min(1.0, 1.0 / predictedPeak) : 1.0
-    let peakTarget = min(feedbackTarget, predictedTarget)
-    let peakCoefficient: Float = peakTarget < outputHeadroomGain ? 0.60 : 0.015
-    outputHeadroomGain += (peakTarget - outputHeadroomGain) * peakCoefficient
-    // 必须放在 EQ 链里，不能只改 mainMixer.outputVolume：后者不一定被
-    // 下方的输出 tap 测到，上一版事实上就没有形成反馈回路。EQ 链里的
-    // globalGain 不增加算法延迟，且测到就能下一拍收紧。
-    // 允许压到 -6 dB：反馈在 0.95 目标下能真正拦住削波；压的幅度受正增益预算
-    // （≤2.5 dB）约束，不会再现"激进 -4 dB"。
-    eq.globalGain = 20.0 * log10(clamp(outputHeadroomGain, 0.5, 1.0))
     engine.mainMixerNode.outputVolume = clamp(snapshot.mediaPercent / 100.0, 0, 1)
 }
 
@@ -1671,9 +1536,9 @@ let controlTimer = Timer(timeInterval: 0.05, repeats: true) { _ in
     // 样本不是掩蔽造成的，冲正增益只会把"抬升"削掉一半——实测 out.peak 1.21 就把
     // 2 dB 的 trim 顶满，存在感区目标 4.3 dB 到耳朵只剩 2.2 dB。改成只有**明显削波**
     // （>1.05 或窗口内 ≥24 样本）才收缩，并且最多 1.5 dB。
-    if out.peak >= 1.05 || out.clipFrames >= 24 {
-        outHeadroomTrimDb = min(1.5, outHeadroomTrimDb + 0.10)
-    } else if out.peak < 0.95 {
+    if out.peak >= 1.0 || out.clipFrames > 0 {
+        outHeadroomTrimDb = min(2.0, outHeadroomTrimDb + 0.10)
+    } else if out.peak < 0.90 {
         outHeadroomTrimDb = max(0, outHeadroomTrimDb - 0.004)
     }
     applyEq(state)
