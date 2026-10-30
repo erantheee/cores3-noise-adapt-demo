@@ -2830,7 +2830,8 @@ def test_media_card() -> None:
     check("中频 1–2.2 kHz" in tuning, "并把动的频段翻成人话")
     check("剂量 1.4" in tuning, "写明当前剂量（基础/激进）")
     check("正增益被收缩" in tuning, "瞬态风险高时要说明安全门在收缩")
-    check("输出余量" in tuning and "-4.0" in tuning, "写明输出余量与削波计数")
+    check("防削波收缩" in tuning and "累计削波 3 帧" in tuning,
+          "写明防削波收缩与削波计数（D54 没有全局压音量）")
     check("漏音残差：未扣" in tuning, "漏音残差状态要一起说")
     check("环境自适应 EQ（S3 24 段 × 深度 1.3×" in tuning,
           "可听的环境自适应 EQ 要写出来（旧版能听见的就是这一层）")
@@ -2845,6 +2846,19 @@ def test_media_card() -> None:
     rhythmic["content_transient_risk"] = 0.6
     card = describe_media(systemeq=rhythmic, player=None, frame=None, leak=None)
     eq(card["content_kind"], "rhythmic", "低频+强瞬态 → 节奏/电子（估计）")
+
+    # 5b) 矩阵停用（现在的主路径）：只说停用，不编造补偿段
+    off = dict(systemeq)
+    off["masking_matrix_enabled"] = False
+    off["masking_bands"] = []
+    card = describe_media(systemeq=off, player=None,
+                          frame={"mode": "SONG_EQ", "tuning_bands": [0.5] * 24},
+                          leak=None)
+    tuning_off = "\n".join(card["tuning"])
+    check("已停用" in tuning_off, "矩阵停用时如实说明")
+    check("这一拍没有" not in tuning_off and "遮蔽强度" not in tuning_off,
+          "停用时不再输出矩阵的补偿/强度行")
+    check("环境自适应 EQ" in tuning_off, "环境自适应 EQ 行仍要显示")
 
     # 5) 直通：调音思路只有一句"原声"
     bypassed = dict(systemeq)
@@ -2864,10 +2878,10 @@ def test_eq_profile_and_noise_depth() -> None:
     # 1) 类型保护：各类型的段偏移与剂量系数
     offsets, scale, summary = profile_for("bass_heavy")
     eq(len(offsets), 24, "偏移必须覆盖 24 段")
-    eq(offsets[0], -1.5, "低频偏重：低频 0–4 段 −1.5 dB（防轰）")
+    eq(offsets[0], 0.0, "低频偏重：低频不再叠加削减（2026-10-30 用户：低频小声）")
     eq(offsets[8], 0.0, "低频偏重：presence 不动")
     eq(scale, 1.0, "低频偏重：剂量不变")
-    check("防轰" in summary, "面板说明写清保护意图")
+    check("不再叠加削减" in summary, "面板说明写清保护意图")
 
     offsets, scale, _ = profile_for("rhythmic")
     eq(offsets[0], 0.5, "节奏型：低频 +0.5 dB")
@@ -2882,7 +2896,7 @@ def test_eq_profile_and_noise_depth() -> None:
     # 2) protected_bands：偏移 + 剂量 + 夹回 ±4
     base = [4.0] * 5 + [0.0] * 19
     bands = protected_bands(base, "bass_heavy")
-    eq(bands[0], 2.5, "4 dB + (−1.5) = 2.5 dB，没有越界")
+    eq(bands[0], 4.0, "低频偏重不再叠加偏移：4 dB 原样")
     eq(bands[8], 0.0, "presence 原样")
     eq(protected_bands(base[:12], "bass_heavy"), base[:12], "段数不对不猜，原样返回")
     bands = protected_bands(base, "rhythmic")

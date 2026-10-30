@@ -134,6 +134,9 @@ def tuning_lines(systemeq: dict, frame: dict | None, leak: dict | None) -> list[
 
     if not systemeq.get("masking_matrix_enabled"):
         lines.append("舒适层：环境×内容矩阵已停用（回归 S3 处方 + 类型保护；开关预留）。")
+        matrix_off = True
+    else:
+        matrix_off = False
 
     bands = systemeq.get("masking_bands") or []
     boosts = [i for i, value in enumerate(bands) if _num(value, 0.0) > 0.3]
@@ -142,9 +145,9 @@ def tuning_lines(systemeq: dict, frame: dict | None, leak: dict | None) -> list[
     dose = _num(systemeq.get("masking_dose"), 1.0) or 1.0
     exposure = _num(systemeq.get("masking_exposure"), 0.0) or 0.0
     transient = _num(systemeq.get("content_transient_risk"), 0.0) or 0.0
-    headroom = _num(systemeq.get("output_headroom_gain"), 1.0) or 1.0
+    trim = _num(systemeq.get("headroom_trim_db"), 0.0) or 0.0
     clip = _num(systemeq.get("out_clip_frames"), 0) or 0
-    if boosts or cuts:
+    if not matrix_off and (boosts or cuts):
         parts = []
         if boosts:
             ranges = _band_ranges(boosts)
@@ -158,13 +161,13 @@ def tuning_lines(systemeq: dict, frame: dict | None, leak: dict | None) -> list[
         lines.append(
             "舒适层（内容 × 环境补偿）：" + "；".join(parts) + f"（剂量 {dose:.1f}×）。"
         )
-    else:
+    elif not matrix_off:
         lines.append("舒适层：这一拍没有「噪声压过歌曲」的频段，不做补偿。")
-    gate = "正增益被收缩" if transient >= 0.15 else "未触发收缩"
-    lines.append(f"遮蔽强度 {exposure:.0%}；内容瞬态 {transient:.0%} → {gate}。")
-    headroom_db = 20.0 * math.log10(headroom) if headroom > 0 else 0.0
+    if not matrix_off:
+        gate = "正增益被收缩" if transient >= 0.15 else "未触发收缩"
+        lines.append(f"遮蔽强度 {exposure:.0%}；内容瞬态 {transient:.0%} → {gate}。")
     lines.append(
-        f"输出余量 {headroom_db:+.1f} dB（防止抬完削波）；自启动累计削波 {int(clip)} 帧"
+        f"防削波收缩 {trim:.1f} dB（只砍抬升、不降总音量）；自启动累计削波 {int(clip)} 帧"
         "（不增长＝没在削）。"
     )
     # 2026-10-30 用户口径：S3 24 段处方 × 深度 = 环境自适应 EQ（舒适层 A）的可听主体，
