@@ -145,13 +145,21 @@ def main() -> int:
                         help="判 other 需连续几个窗都低于阈值（滞后防抖，默认 2）")
     # 持续积累（2026-10-23 用户要求）：高置信 self 窗口在线更新声纹原型。
     # 只学"干净的高分样本"，混合说话（两人同时）分数在中间区，不会污染原型。
+    #
+    # 2026-10-28 事故：8% EMA 学了 1120 个窗后，积累原型与注册锚点的 cosine 只剩
+    # 0.396（自己说话 score≈0.40 → 连续 2 窗判 other），self-veto 名存实亡。
+    # 在线学习现在有三道约束：锚点上界（--anchor-min-cos）、更小的权重、更高的
+    # 样本门槛；host 侧默认也关（--voiceprint-learn 才开）。
     parser.add_argument("--no-learn", action="store_true",
                         help="关闭在线声纹积累（默认开）")
-    parser.add_argument("--learn-weight", type=float, default=0.08,
-                        help="原型向新样本靠拢的权重（默认 0.08）")
-    parser.add_argument("--learn-min-score", type=float, default=0.80,
-                        help="只有 score ≥ 该值才学习（默认等于 self 阈值；"
-                             "混合/中间区样本仍不会学）")
+    parser.add_argument("--learn-weight", type=float, default=0.01,
+                        help="原型向新样本靠拢的权重（默认 0.01；旧默认 0.08 会在"
+                             "十几分钟有效语音内把原型带离注册锚点）")
+    parser.add_argument("--learn-min-score", type=float, default=0.90,
+                        help="只有 score ≥ 该值才学习（默认 0.90，不再与 self 阈值同级）")
+    parser.add_argument("--anchor-min-cos", type=float, default=0.90,
+                        help="积累原型与注册锚点的 cosine 下限；学习越过该线就回退"
+                             "到锚点并冻结学习（默认 0.90）")
     parser.add_argument("--learn-min-dbfs", type=float, default=-40.0,
                         help="只有窗口 dBFS ≥ 该值才学习（太弱/远场不学）")
     parser.add_argument("--learn-min-speech-ratio", type=float, default=0.5,
@@ -161,15 +169,39 @@ def main() -> int:
     emit({"type": "loading"})
     embedder = WavLMEmbedder()
     prototype, clip_count = enrollment_prototype(args.enroll_dir, embedder)
+    # 注册锚点：从注册录音算出的原始原型，本次进程内不可变。在线学习只允许在它
+    # 附近微调；越过 --anchor-min-cos 就冻结并回退（2026-10-28 事故的防线）。
+    anchor = prototype.copy()
     learn_path = args.enroll_dir / "learned-prototype.npz"
     learn_updates = 0
     learned: np.ndarray | None = None
+    learn_frozen = False
+    anchor_drift = 1.0
     if not args.no_learn:
         learned, learn_updates = load_learned(learn_path, int(prototype.shape[0]))
         if learned is not None:
-            prototype = learned
+            loaded_drift = float(learned @ anchor)
+            if loaded_drift >= args.anchor_min_cos:
+                prototype = learned
+                anchor_drift = loaded_drift
+            else:
+                # 已积累的原型离锚点太远：拒绝加载并留档。继续用它只会让
+                # "自己说话被判 other" 固化，所以回退到锚点并冻结学习。
+                rejected = learn_path.with_name(
+                    f"learned-rejected-{time.strftime('%Y%m%d-%H%M%S')}.npz")
+                try:
+                    learn_path.replace(rejected)
+                except OSError:
+                    pass
+                learned = None
+                learn_frozen = True
+                learn_updates = 0
+                emit({"type": "learn_reject", "drift": round(loaded_drift, 4),
+                      "min_cos": args.anchor_min_cos,
+                      "rejected_to": rejected.name})
     emit({"type": "ready", "clips": clip_count, "dim": int(prototype.shape[0]),
           "threshold": args.threshold, "learn_updates": learn_updates,
+          "learn_frozen": learn_frozen, "drift": round(anchor_drift, 4),
           "learned_from": str(learn_path.name) if learned is not None else ""})
 
     window = int(args.window_s * 16000)
@@ -263,17 +295,32 @@ def main() -> int:
                 verdict = confirmed_speaker or "unknown"
             # 在线积累：只学"稳定 self"的干净高分窗（verdict=self 且 score 达标），
             # 混合/中间区/边界窗不学，避免原型漂向对方或抖动窗。
+            # 每次更新都受锚点上界约束：候选原型离注册锚点 < anchor_min_cos 就
+            # 回退并冻结——宁可不再自适应，也不能让"自己"的原型漂成别人。
             if (not args.no_learn
+                    and not learn_frozen
                     and verdict == "self"
                     and score >= learn_threshold
                     and speech_ratio >= args.learn_min_speech_ratio
                     and dbfs >= args.learn_min_dbfs):
-                prototype = normalize(
+                candidate = normalize(
                     prototype * (1.0 - args.learn_weight) + vector * args.learn_weight)
-                learn_updates += 1
-                if learn_updates == 1 or learn_updates % 4 == 0 or now - last_save >= 30.0:
-                    save_learned(learn_path, prototype, learn_updates)
-                    last_save = now
+                candidate_drift = float(candidate @ anchor)
+                if candidate_drift < args.anchor_min_cos:
+                    prototype = anchor.copy()
+                    anchor_drift = 1.0
+                    learn_frozen = True
+                    emit({"type": "learn_frozen", "drift": round(candidate_drift, 4),
+                          "min_cos": args.anchor_min_cos,
+                          "learn_updates": learn_updates})
+                else:
+                    prototype = candidate
+                    anchor_drift = candidate_drift
+                    learn_updates += 1
+                    if (learn_updates == 1 or learn_updates % 4 == 0
+                            or now - last_save >= 30.0):
+                        save_learned(learn_path, prototype, learn_updates)
+                        last_save = now
             if windows == 1 or now - last_emit >= 0.25:
                 last_emit = now
                 emit({"type": "verdict", "verdict": verdict,
@@ -283,6 +330,8 @@ def main() -> int:
                       "speech_ratio": round(speech_ratio, 3),
                       "windows": windows,
                       "learn_updates": learn_updates,
+                      "drift": round(anchor_drift, 4),
+                      "learn_frozen": learn_frozen,
                       "start_sample": start_sample,
                       "end_sample": end_sample,
                       "latency_ms": round((now - started) * 1000.0, 1)})

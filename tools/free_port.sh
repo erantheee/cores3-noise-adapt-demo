@@ -8,13 +8,34 @@
 #   sh tools/free_port.sh          # 只看谁占着，不做任何事
 #   sh tools/free_port.sh --kill   # 真的停掉
 set -eu
-PORT="${CORES3_PORT:-/dev/cu.usbmodem1101}"
 KILL=0
 [ "${1:-}" = "--kill" ] && KILL=1
 
-if [ ! -e "$PORT" ]; then
+# 端口不能写死：CoreS3 在不同机器/不同插拔顺序下会在 usbmodem101 与 usbmodem1101
+# 之间变号。2026-10-30 真机是 usbmodem101，而旧默认值 1101 让这个脚本一路报
+# 「端口不存在」然后 exit 0 —— 刷机/录音前"释放串口"这件事事实上没发生。
+# 现在：显式 CORES3_PORT 优先；否则自动找，恰好一个就用它，多个就报错要求指定。
+if [ -n "${CORES3_PORT:-}" ]; then
+    PORT="$CORES3_PORT"
+else
+    PORT=""
+    CANDIDATES=""
+    for candidate in /dev/cu.usbmodem*; do
+        [ -e "$candidate" ] || continue
+        CANDIDATES="$CANDIDATES $candidate"
+        [ -z "$PORT" ] && PORT="$candidate"
+    done
+    FOUND=0
+    for candidate in $CANDIDATES; do FOUND=$((FOUND + 1)); done
+    if [ "$FOUND" -gt 1 ]; then
+        echo "找到多个串口设备，请用 CORES3_PORT 指定：$CANDIDATES"
+        exit 1
+    fi
+fi
+
+if [ -z "$PORT" ] || [ ! -e "$PORT" ]; then
     echo "端口不存在（设备没插，或编号变了：ls /dev/cu.usb*）"
-    echo "  找过的路径：$PORT"
+    [ -z "$PORT" ] || echo "  找过的路径：$PORT"
     exit 0
 fi
 

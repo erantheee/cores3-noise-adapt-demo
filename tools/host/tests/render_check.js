@@ -138,6 +138,7 @@ check(text("age") !== "", "顶部显示数据年龄");
 
 if (frame) {
   check(text("env") === frame.environment_text, `环境显示为 ${frame.environment_text}`);
+  check(text("env-note").includes("参与"), "环境卡必须说明固件四分类会参与动作决策");
   // D47 双麦遥测：设备报 mic2_valid=true 时，环境卡的原始行必须带双麦差/相关。
   if (frame.mic2_valid === true && typeof frame.mic_diff_db === "number") {
     check(text("env-raw").includes("双麦"),
@@ -177,6 +178,10 @@ if (frame) {
     }
     check(text("ctx-note").includes("不参与决策"),
           "必须写明模型现在不参与决策——否则这一格会被读成产品行为");
+    // TODOS A-1 止损（2026-10-30）：九分类真机复测在街道噪声/手机外放音乐/真实说话上
+    // 长时间判 other，还没通过真机验收。面板必须逐字写出来，不能让它看起来像可信能力。
+    check(text("ctx-note").includes("未通过真机验收"),
+          "情境卡必须写明是实验模型、未通过真机验收（TODOS A-1）");
   }
   check(text("state") === frame.state_text, `动作显示为 ${frame.state_text}`);
   // 「现实人声增益意图」这一格显示的是 external_voice_gain_db。旧断言比的是
@@ -199,8 +204,15 @@ if (frame) {
 // 演示控制（2026-10-26）：暂停状态必须从快照读，按钮状态不能和状态打架。
 {
   const paused = snapshot.execution_paused === true;
-  check(["运行中", "已暂停"].includes(text("exec-status")), "演示控制显示运行/暂停状态");
-  check(text("exec-note").includes("采集与 AI 继续"), "暂停说明里写明采集与 AI 继续");
+  const controlLive = snapshot.control_data_live === true;
+  check(["运行中", "已暂停", "已旁路"].includes(text("exec-status")),
+        "演示控制显示运行/暂停/断流旁路状态");
+  if (!paused && !controlLive) {
+    check(text("exec-status") === "已旁路", "控制数据不新鲜时显示已旁路");
+    check(text("exec-note").includes("不会沿用旧调音处方"), "断流旁路说明不沿用旧处方");
+  } else if (paused) {
+    check(text("exec-note").includes("采集与 AI 继续"), "暂停说明里写明采集与 AI 继续");
+  }
   check(elements.get("btn-pause").disabled === paused, "暂停按钮的可用状态与快照一致");
   check(elements.get("btn-resume").disabled === !paused, "继续按钮的可用状态与快照一致");
   // 关闭按钮只在点击时被引用，render() 不碰它；这里直接对 HTML 的 id 集合断言。
@@ -244,6 +256,9 @@ if (snapshot.relay) {
 // 而且第三件（耳机是否已播放）本链路无法验证，不得写成已验证。
 if (snapshot.player) {
   const player = snapshot.player;
+  const executor = snapshot.systemeq && snapshot.systemeq.available !== false
+    ? snapshot.systemeq
+    : player;
   check(text("track").length > 0, "播放卡片显示曲目");
   check(["▶ 播放", "⏸ 暂停"].includes(text("btn-play")), "播放按钮按播放状态切换文案");
   const disabled = (elements.get("btn-play") || {}).disabled;
@@ -261,10 +276,10 @@ if (snapshot.player) {
     check(text("apply-note").includes("深度"),
           "面板必须写明放大倍率是本机演示参数，不是设备的建议");
   }
-  if (player.execution === "applied") {
+  if (executor.execution === "applied") {
     check(receipt.includes("已执行"), "回执为 applied 时必须写明已执行");
   }
-  if (player.execution === "idle") {
+  if (executor.execution === "idle") {
     check(receipt.includes("未执行"), "没在播放时必须写明决策没有被执行");
   }
   // 进度条：位置时刻要显示，滑块要跟着 position/duration 走。用户明确要过这个控件。
@@ -278,6 +293,36 @@ if (snapshot.player) {
   }
 } else {
   console.log("  （提示：这份快照没有 player 段，已跳过播放与回执断言）");
+}
+
+if (snapshot.systemeq && snapshot.systemeq.stem_stream) {
+  const stemText = text("stem-action");
+  check(stemText.startsWith("分轨："), "分轨运行时动作卡必须显示当前分轨策略");
+  check(stemText.includes("风险门"), "分轨策略必须显示风险门，避免把回退当成已处理");
+  if (snapshot.frame) {
+    const windSnapshot = Object.assign({}, snapshot, {
+      frame: Object.assign({}, snapshot.frame, { event: "wind", event_valid: true, event_text: "吹风" }),
+      systemeq: Object.assign({}, snapshot.systemeq, {
+        stem_environment: "wind",
+        stem_gains_db: { vocals: 0, bass: -2.0, drums: -1.0 },
+      }),
+    });
+    render(windSnapshot);
+    check(text("stem-action").includes("防风"), "风声必须映射到分轨防风策略");
+    check(text("stem-action").includes("低频 -2.0 dB"), "防风策略必须显示实际低频让位量");
+    check(text("stem-action").includes("不消耳外风声"), "防风策略必须说明它不能消除耳外真实风声");
+    check(text("evt-note").includes("防风"), "事件卡必须说明风声正在驱动分轨策略");
+    render(snapshot);
+  }
+} else if (snapshot.systemeq) {
+  const lowLatency = text("stem-action");
+  check(lowLatency.startsWith("低延迟调音师："), "未开分轨时动作卡必须显示低延迟调音师路径");
+  check(lowLatency.includes("逐段掩蔽"), "低延迟动作卡必须显示24段掩蔽矩阵状态");
+  check(lowLatency.includes("瞬态"), "低延迟动作卡必须显示瞬态风险");
+  const contentLine = text("systemeq-note");
+  check(contentLine.includes("高频风险"), "QQ 音乐回执必须显示内容高频风险");
+  check(contentLine.includes("逐段掩蔽"), "QQ 音乐回执必须显示逐段掩蔽强度");
+  check(contentLine.includes("输出余量"), "QQ 音乐回执必须显示实测输出余量");
 }
 
 // 延迟表：逐行核对"零"的解释。两种零必须分开——本地阶段为 0 是未实现（声纹推理），

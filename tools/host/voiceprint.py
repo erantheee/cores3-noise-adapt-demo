@@ -40,6 +40,7 @@ class VoiceprintService:
         enroll_dir: str | Path = ROOT / "记录" / "声纹" / "self-device",
         threshold: float = 0.80,
         enabled: bool = True,
+        learn: bool = False,
         on_verdict=None,
         activity_provider=None,
     ) -> None:
@@ -48,6 +49,9 @@ class VoiceprintService:
         self.enroll_dir = str(enroll_dir)
         self.threshold = float(threshold)
         self.enabled = enabled
+        #: 在线原型积累（2026-10-28 事故后默认关）：worker 侧还有锚点上界兜底，
+        #: 但默认不学才是安全状态；要自适应必须显式 --voiceprint-learn。
+        self.learn = bool(learn)
         #: 判定回调：host 用它把 self/other 回传 S3。
         self.on_verdict = on_verdict
         self.activity_provider = activity_provider
@@ -71,6 +75,11 @@ class VoiceprintService:
         #: 在线积累（2026-10-23）：高置信 self 窗口更新原型后的累计次数 / 来源文件。
         self._learn_updates = 0
         self._learned_from = ""
+        #: 2026-10-28：积累原型与注册锚点的 cosine（drift）。低于 worker 的
+        #: anchor_min_cos 时 worker 会回退并冻结学习；这里只做展示与告警。
+        self._drift: float | None = None
+        self._learn_frozen = False
+        self._learn_rejected = ""
         self._updated_at: float | None = None
         self._fed_chunks = 0
         self._dropped_chunks = 0
@@ -102,14 +111,25 @@ class VoiceprintService:
         with self._lock:
             return self._available
 
-    def start(self) -> None:
-        if not self._available:
-            return
+    def _worker_argv(self) -> list[str]:
+        """worker 启动参数。learn=False（默认）时必须显式传 --no-learn。
+
+        2026-10-28 事故：host 原先不传任何学习开关，worker 就按默认开着 8% EMA，
+        故这条开关必须可测，而不是埋在 start() 里。
+        """
         argv = [
             self.python, self.worker,
             "--enroll-dir", self.enroll_dir,
             "--threshold", str(self.threshold),
         ]
+        if not self.learn:
+            argv.append("--no-learn")
+        return argv
+
+    def start(self) -> None:
+        if not self._available:
+            return
+        argv = self._worker_argv()
         try:
             self._process = subprocess.Popen(
                 argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -262,7 +282,23 @@ class VoiceprintService:
                 self._dim = int(message.get("dim", 0))
                 self._learn_updates = int(message.get("learn_updates", 0))
                 self._learned_from = str(message.get("learned_from") or "")
+                drift = message.get("drift")
+                if drift is not None:
+                    self._drift = float(drift)
+                self._learn_frozen = bool(message.get("learn_frozen", False))
                 self._error = ""
+            elif kind == "learn_reject":
+                # worker 发现已积累原型离注册锚点太远（2026-10-28 事故）：
+                # 拒绝加载、留档旧文件、冻结学习。必须让面板一眼看见。
+                drift = message.get("drift")
+                self._drift = float(drift) if drift is not None else None
+                self._learn_frozen = True
+                self._learn_rejected = str(message.get("rejected_to") or "")
+            elif kind == "learn_frozen":
+                drift = message.get("drift")
+                if drift is not None:
+                    self._drift = float(drift)
+                self._learn_frozen = True
             elif kind == "verdict":
                 self._verdict = str(message.get("verdict"))
                 self._score = message.get("score")
@@ -272,6 +308,11 @@ class VoiceprintService:
                 self._windows = int(message.get("windows", self._windows))
                 self._learn_updates = int(
                     message.get("learn_updates", self._learn_updates))
+                drift = message.get("drift")
+                if drift is not None:
+                    self._drift = float(drift)
+                if "learn_frozen" in message:
+                    self._learn_frozen = bool(message.get("learn_frozen"))
                 self._latency_ms = message.get("latency_ms")
                 self._last_sent_verdict = self._verdict
                 start_sample = message.get("start_sample")
@@ -321,6 +362,12 @@ class VoiceprintService:
                 "dim": self._dim,
                 "learn_updates": self._learn_updates,
                 "learned_from": self._learned_from,
+                # 2026-10-28：在线积累的安全性遥测。drift = 积累原型与注册锚点的
+                # cosine，正常应接近 1.0；低于 worker 的 anchor_min_cos 就冻结。
+                "learn_enabled": self.learn,
+                "learn_frozen": self._learn_frozen,
+                "learn_rejected": self._learn_rejected,
+                "drift": self._drift,
                 "latency_ms": self._latency_ms,
                 "fed_chunks": self._fed_chunks,
                 "dropped_windows": self._dropped_chunks,

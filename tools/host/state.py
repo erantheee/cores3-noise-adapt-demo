@@ -379,6 +379,11 @@ class HostState:
         with self.lock:
             self.player = player
 
+    def set_leak(self, leak: dict | None) -> None:
+        """B2：歌曲漏音残差的一次估计结果（只读遥测，不参与判定）。"""
+        with self.lock:
+            self.leak = dict(leak) if leak else None
+
     def attach_systemeq(self, systemeq: object | None) -> None:
         """挂上第三方播放器 system EQ 执行端（tools/host/systemeq.py）。鸭子类型同上。"""
         with self.lock:
@@ -702,6 +707,10 @@ class HostState:
         value = self.silence_ms(now)
         return bool(self.connected and value is not None and value >= SILENCE_THRESHOLD_MS)
 
+    def has_live_control_data(self, now: float | None = None) -> bool:
+        """只有串口已开、至少收到一帧且数据未静默时，才允许执行调音。"""
+        return bool(self.connected and self.latest is not None and not self.is_silent(now))
+
     def age_ms(self, now: float | None = None) -> float | None:
         value = self.silence_ms(now)
         return None if value is None else round(value, 1)
@@ -730,6 +739,8 @@ class HostState:
             "stale": self.is_stale(now),
             # 静默与断流分开报：前者常见于上位机自己跟丢了，后者才指向设备。
             "silent": self.is_silent(now),
+            # 串口打开不等于设备仍在工作；执行端只认新鲜控制帧。
+            "control_data_live": self.has_live_control_data(now),
             "silence_threshold_ms": SILENCE_THRESHOLD_MS,
             "recording": self.recording,
             #: 演示控制（2026-10-26）：暂停时执行端已复位，采集与 AI 仍在跑。
@@ -738,6 +749,8 @@ class HostState:
             "player": self.player.snapshot() if self.player is not None else None,
             #: 第三方播放器 system EQ 执行端。为 None = 本次运行没启用。
             "systemeq": self.systemeq.snapshot() if self.systemeq is not None else None,
+            #: B2：歌曲漏音残差估计（off/observe/apply + 电平/置信度/原因）。
+            "leak": getattr(self, "leak", None),
             #: 中继的实时读数。measurable=False 表示这个播放端不报告排队深度——
             #: 界面必须把"测不到"和"延迟为零"分开显示。
             "relay": self.relay.live() if self.relay is not None else None,
@@ -850,6 +863,8 @@ class HostState:
                 "dialog_veto": frame.dialog_veto,
                 #: D53：设备是否判为"正在打字"（帧内瞬态）。None = 旧固件没报。
                 "typing_active": frame.typing_active,
+                #: B1：设备是否收到新鲜的 `music on`（Mac 正在放歌）。None = 旧固件没报。
+                "music_playing": frame.music_playing,
                 "context": frame.context,
                 "context_text": context_text(frame.context),
                 "context_score": frame.context_score,

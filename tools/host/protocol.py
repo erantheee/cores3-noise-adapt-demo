@@ -251,6 +251,10 @@ class CommandFrame:
     dialog_veto: bool | None = None
     #: D53：这一拍是否判为"正在打字"（帧内键盘瞬态 + 1 s 窗口）。None = 旧固件没报。
     typing_active: bool | None = None
+    #: B1（2026-10-30）：设备是否处于 host `music on` 的 TTL 内，即"Mac 正在放歌、
+    #: S3 听到的歌可能是自己放的"。None = 这一帧没报（B1 之前的固件）。
+    #: v1 只做遥测：设备侧对话/背景人声判据没有读它（见 docs/decisions.md D57）。
+    music_playing: bool | None = None
     schema_version: int = SCHEMA_VERSION
     #: 越界或无法解释的字段说明。空表示这一帧通过了全部校验。
     problems: tuple[str, ...] = ()
@@ -458,6 +462,9 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
     # D53：帧内瞬态判"正在打字"。缺字段 = 旧固件（没报）。
     raw_typing_active = payload.get("typing_active")
     typing_active = raw_typing_active if isinstance(raw_typing_active, bool) else None
+    # B1：设备是否处于 host `music on` 的 TTL 内。缺字段 = B1 之前的固件（没报）。
+    raw_music_playing = payload.get("music_playing")
+    music_playing = raw_music_playing if isinstance(raw_music_playing, bool) else None
 
     missing = [
         name
@@ -697,6 +704,7 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
             voiceprint_age_ms=voiceprint_age_ms,
             dialog_veto=dialog_veto,
             typing_active=typing_active,
+            music_playing=music_playing,
             schema_version=schema,
         ),
         json_line=True,

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import signal
 import sys
 import threading
@@ -52,6 +53,7 @@ from .sources import (
     SourceError,
     build_source,
 )
+from .leak import estimate_leak
 from .memo import MemoStore
 from .state import CONTEXT_TEXT, HostState, environment_text
 
@@ -76,6 +78,80 @@ def masking_depth(mode: str | None, broadband_dbfs: float | None,
     return base + (peak - base) * t
 
 
+def stem_environment_for(frame) -> str:
+    """把 S3 已确认的环境/事件映射成分轨策略；未知值保守回到宽带噪声。"""
+    event = getattr(frame, "event", None) if getattr(frame, "event_valid", False) else None
+    if event == "wind":
+        return "wind"
+    if event == "keyboard":
+        return "keyboard"
+    if event == "speech" or getattr(frame, "environment", None) == "VOICE":
+        return "babble"
+    if getattr(frame, "environment", None) == "QUIET":
+        return "quiet"
+    return "broadband"
+
+
+# 低延迟实时主链的环境处方。这些值是“策略上限”，不是把
+# S3 旧的 24 段建议照搬进歌曲。幅度刻意收在 ±0.8 dB 内：Mac 还会
+# 根据高频密度、瞬态和输出峰值继续收缩；证据不足就接近原声。
+_LOW_LATENCY_PROFILES: dict[str, tuple[float, ...]] = {
+    "quiet": (0.0,) * 24,
+    "keyboard": (
+        -0.2, -0.2, -0.1, -0.1, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1,
+        0.0, 0.0, -0.1, -0.1, -0.2, -0.2, -0.2, -0.2,
+    ),
+    "wind": (
+        -0.8, -0.7, -0.6, -0.5, -0.3, -0.2, -0.1, 0.0,
+        0.1, 0.2, 0.3, 0.4, 0.5, 0.5, 0.5, 0.4,
+        0.3, 0.2, 0.1, 0.0, -0.1, -0.2, -0.3, -0.3,
+    ),
+    "babble": (
+        -0.5, -0.5, -0.4, -0.3, -0.2, -0.1, 0.0, 0.1,
+        0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.8,
+        0.7, 0.5, 0.3, 0.1, 0.0, -0.1, -0.2, -0.2,
+    ),
+    "broadband": (
+        -0.3, -0.3, -0.2, -0.2, -0.1, 0.0, 0.0, 0.1,
+        0.2, 0.3, 0.4, 0.5, 0.5, 0.6, 0.6, 0.6,
+        0.5, 0.3, 0.1, 0.0, -0.1, -0.2, -0.3, -0.4,
+    ),
+}
+
+
+def low_latency_strategy_bands(frame) -> list[float]:
+    """S3 环境→克制的实时 DSP 处方；不依赖分轨，不增加窗等待。"""
+    if getattr(frame, "mode", None) == "FLAT":
+        return [0.0] * 24
+    environment = stem_environment_for(frame)
+    profile = _LOW_LATENCY_PROFILES[environment]
+    level = getattr(frame, "broadband_dbfs", None)
+    if not isinstance(level, (int, float)):
+        exposure = 0.5
+    else:
+        # -58 dBFS 以下基本不动，-36 dBFS 到达处方上限。
+        exposure = max(0.0, min(1.0, (float(level) + 58.0) / 22.0))
+    return [round(value * exposure, 3) for value in profile]
+
+
+def ambient_spectrum_for(frame) -> list[float]:
+    """返回可供实时掩蔽矩阵使用的 S3 24 段环境谱；坏帧保守禁用。"""
+    raw = getattr(frame, "ambient_band_dbfs", ())
+    if len(raw) != 24:
+        return []
+    values: list[float] = []
+    for value in raw:
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return []
+        value = float(value)
+        if not math.isfinite(value):
+            return []
+        values.append(value)
+    # 固件用 -120 dBFS 表示没有有效能量；整条地板不能驱动调音。
+    return values if max(values) > -119.0 else []
+
+
 def apply_neutral_execution(player_service, systemeq_service) -> bool:
     """暂停时把执行端复位到"什么都不做"：EQ 全平直、媒体 100%。
 
@@ -88,6 +164,21 @@ def apply_neutral_execution(player_service, systemeq_service) -> bool:
     if player_service is not None:
         return bool(player_service.apply_decision(flat, 100.0))
     return False
+
+
+def execution_block_reason(state, latest, execution_paused: bool) -> str | None:
+    """返回不能执行 S3 处方的原因；None 表示控制数据新鲜。"""
+    if execution_paused:
+        return "manual_pause"
+    if not state.connected:
+        return "disconnected"
+    if latest is None:
+        return "no_frame"
+    if state.is_stale():
+        return "stale"
+    if state.is_silent():
+        return "silent"
+    return None
 
 
 def voiceprint_allows_ambient(snapshot: dict, max_age_s: float = 3.0) -> bool:
@@ -232,6 +323,62 @@ class DialogOverrideLink:
             return None
         self._sent = False
         return b"dialog yes\r\n"
+
+
+#: 阶段二/B1（2026-10-30）：host→S3 「歌是我放的」保活。
+#: 设备侧 v1 只落遥测（帧键 `music_playing`），不改对话/掩蔽判据；TTL 失效自动
+#: fail-open 回"没在放歌"，host 崩了/串口断了不会把设备状态永久写错。
+MUSIC_KEEPALIVE_TTL_MS = 3000
+MUSIC_KEEPALIVE_REFRESH_S = 1.0
+
+
+class MusicKeepalive:
+    """把"Mac 正在放歌"用 `music on|off` 控制行续期给 S3。
+
+    证据只认**执行端回执**：systemeq 报 `execution == "applied"`（引擎在跑、实测有
+    信号）或本地播放器报 `playing`。不用"用户点了播放""曲目列表非空"当证据——
+    设备侧拿这个旗标解释"我听到的歌可能是自己放的"，猜错比没有更糟。
+    """
+
+    def __init__(self, ttl_ms: int = MUSIC_KEEPALIVE_TTL_MS,
+                 refresh_s: float = MUSIC_KEEPALIVE_REFRESH_S) -> None:
+        self.ttl_ms = int(ttl_ms)
+        self.refresh_s = float(refresh_s)
+        self._sent_on = False
+        self._sent_at = 0.0
+
+    def update(self, playing: bool, now: float) -> bytes | None:
+        """返回这一拍该发的控制行（bytes）；没有变化时返回 None。"""
+        if playing:
+            if not self._sent_on or now - self._sent_at >= self.refresh_s:
+                self._sent_on = True
+                self._sent_at = now
+                return f"music on {self.ttl_ms}\r\n".encode("ascii")
+            return None
+        if self._sent_on:
+            self._sent_on = False
+            return b"music off\r\n"
+        return None
+
+    def release(self) -> bytes | None:
+        """退出/串口断开时告诉 S3 歌不再由本机播放（没发过则返回 None）。"""
+        if not self._sent_on:
+            return None
+        self._sent_on = False
+        return b"music off\r\n"
+
+
+def music_is_playing(systemeq_service, player_service) -> bool:
+    """执行端实测在放歌吗？只认回执，不认意图。"""
+    if systemeq_service is not None:
+        snapshot = systemeq_service.snapshot() or {}
+        if snapshot.get("available") is not False and snapshot.get("execution") == "applied":
+            return True
+    if player_service is not None:
+        snapshot = player_service.snapshot() or {}
+        if snapshot.get("playing") is True:
+            return True
+    return False
 
 
 class DialogueTurnGate:
@@ -439,6 +586,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"播放增益百分比（100%% 为原始电平），默认 {DEFAULT_VOLUME_PERCENT:.0f}，可在面板上调节",
     )
     parser.add_argument(
+        "--leak-residual",
+        choices=("off", "observe", "apply"),
+        default="observe",
+        help="歌曲漏音残差（B2）：off=不算；observe=只报遥测（默认）；apply=扣掉后再进掩蔽矩阵",
+    )
+    parser.add_argument(
         "--system-eq-app",
         default=None,
         help=(
@@ -456,6 +609,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "aggressive＝\"demo 要明显\"×2 版（默认）。面板可实时切换；"
             "完全关闭 EQ 用面板「关闭EQ」（bypass 直通）。"
         ),
+    )
+    parser.add_argument(
+        "--stem-remix",
+        action="store_true",
+        help="对 QQ 音乐启用六分轨实时重混；S3 环境决定策略，旧 24 段 EQ 自动归零",
     )
     parser.add_argument(
         "--relay-audio",
@@ -540,6 +698,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--voiceprint-python",
         default=None,
         help="跑 voiceprint_worker.py 的解释器（默认仓库 .venv/bin/python）",
+    )
+    parser.add_argument(
+        "--voiceprint-learn",
+        action="store_true",
+        help=(
+            "实验性：开启声纹原型在线积累（默认关）。2026-10-28 事故后默认不学——"
+            "旧默认权重 0.08 的 EMA 会在十几分钟内把原型带离注册锚点，导致自己说话被判 other；"
+            "worker 侧仍有 anchor_min_cos 兜底，冻结时快照会有 learn_frozen/drift"
+        ),
     )
     parser.add_argument(
         "--ambient-gate",
@@ -683,7 +850,11 @@ def main(argv: list[str] | None = None) -> int:
 
     voiceprint = None
     if args.voiceprint:
-        voiceprint_kwargs = {"threshold": args.voiceprint_threshold}
+        voiceprint_kwargs = {
+            "threshold": args.voiceprint_threshold,
+            # 2026-10-28：默认不学（事故后）。要在线积累必须显式 --voiceprint-learn。
+            "learn": bool(args.voiceprint_learn),
+        }
         if args.voiceprint_python:
             voiceprint_kwargs["python"] = args.voiceprint_python
         if args.voiceprint_enroll_dir:
@@ -807,6 +978,8 @@ def main(argv: list[str] | None = None) -> int:
     #: A1/D50：LLM/本地迟到否决 → S3 快路径的回写通道（`dialog no|yes`）。定义在
     #: writer 旁边，下面的 on_close/cleanup 才能安全地撤销否决。
     dialog_link = DialogOverrideLink()
+    #: 阶段二/B1：`music on|off` 保活（设备侧 v1 只遥测）。
+    music_link = MusicKeepalive()
 
     def send_voiceprint_off() -> None:
         """尽力告诉设备「声纹判定已失效」，避免它沿用上一轮判定。
@@ -865,6 +1038,11 @@ def main(argv: list[str] | None = None) -> int:
                 line = dialog_link.release()
                 if line is not None:
                     writer(line)
+                # B1：退出时也要告诉设备"歌不再由本机播放"；否则 TTL 到期前设备
+                # 一直以为漏音是自己的歌。
+                line = music_link.release()
+                if line is not None:
+                    writer(line)
             except (RuntimeError, OSError):
                 pass
             writer.detach()
@@ -908,8 +1086,12 @@ def main(argv: list[str] | None = None) -> int:
         # 否则 ×2.5 会把 S3 的 presence 建议放大到 +4~5，电吉他/MIDI 这类中高频
         # 密集素材会听出"裂开"（2026-10-22 用户听感）。面板仍可实时拉深度。
         eq_depth = 1.3 if args.eq_mode == "basic" else 2.5
+        stem_worker = None
+        if args.stem_remix:
+            stem_worker = str(Path(__file__).resolve().parents[1] / "stem_remix" / "stream_worker.py")
         systemeq_service = SystemEqService(
-            app=args.system_eq_app, mode=args.eq_mode, depth=eq_depth
+            app=args.system_eq_app, mode=args.eq_mode, depth=eq_depth,
+            demo=not args.stem_remix, stem_worker=stem_worker,
         )
         state.attach_systemeq(systemeq_service)
 
@@ -1148,6 +1330,9 @@ def main(argv: list[str] | None = None) -> int:
     # 没有新帧时也发快照，界面才能区分"设备停了"与"浏览器和主机之间的连接断了"——
     # 这两种情况的处置完全不同。
     execution_paused_last = False
+    # 初始按“尚未证明数据新鲜”处理；第一次循环必须主动复位执行端，不能让
+    # systemeq 的默认 demo 曲线在等待首帧的几秒里短暂生效。
+    execution_blocked_last = False
     while not stop.is_set():
         broadcaster.publish()
         latest = state.latest
@@ -1170,6 +1355,23 @@ def main(argv: list[str] | None = None) -> int:
         elif not execution_paused and execution_paused_last:
             state.note("演示已继续：执行端恢复跟随 S3 决策")
         execution_paused_last = execution_paused
+        block_reason = execution_block_reason(state, latest, execution_paused)
+        execution_blocked = block_reason is not None
+        # 1 秒无帧就像手动暂停一样复位一次，不能无限沿用最后一帧处方。
+        if execution_blocked and not execution_blocked_last and not execution_paused:
+            neutral_ok = apply_neutral_execution(player_service, systemeq_service)
+            if ambient is not None:
+                ambient.set_open(False)
+                last_ambient_open = False
+            state.note(
+                "S3 控制数据中断：调音已旁路为原声、媒体 100%"
+                + ("、环境声已关闭" if ambient is not None else "")
+                + ("" if neutral_ok or (player_service is None and systemeq_service is None)
+                   else "（执行端复位未确认）")
+            )
+        elif not execution_blocked and execution_blocked_last:
+            state.note("S3 控制数据恢复：调音重新跟随实时决策")
+        execution_blocked_last = execution_blocked
         if memo is not None and latest is not None:
             # 每 10 秒采一次环境统计（memo 内部节流）；只进长期 profile，不参与决策。
             memo.sample_frame(
@@ -1247,10 +1449,9 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 + "\n"
             )
-        if not execution_paused and latest is not None and (player_service is not None or systemeq_service is not None):
-            # 决策的形状永远来自 S3，这里只是把它搬到音频上；apply_decision 内部有节流。
-            # 旧固件不发 eq_gain_db（tuning 为 None）时下发全平直：**没有建议就该什么都不做**，
-            # 而不是把上一次的形状留在曲子上。
+        if not execution_blocked and latest is not None and (player_service is not None or systemeq_service is not None):
+            # 本地播放器仍保留 S3 旧 24 段通路；QQ 音乐实时主链则只读 S3
+            # 的环境意图，转成小幅低延迟处方，不再照搬粗暴 EQ 形状。
             bands = list(latest.tuning.band_gain_db) if latest.tuning else [0.0] * 24
             media_target = float(latest.media_percent)
             if effective_gate != "off" and not engagement_latch:
@@ -1263,15 +1464,70 @@ def main(argv: list[str] | None = None) -> int:
                 # 媒体也要让位到确认地板，否则音乐会盖住对方的话。
                 media_target = 60.0
             if systemeq_service is not None:
+                ambient_spectrum = ambient_spectrum_for(latest)
+                # B2：扣掉 Mac 自己放的歌。默认 observe 只报遥测——没有真机 A/B 之前
+                # 不动调音动作；apply 才把残差谱送进矩阵。
+                if (
+                    ambient_spectrum
+                    and args.leak_residual != "off"
+                    and music_is_playing(systemeq_service, player_service)
+                ):
+                    # 内容谱必须新鲜：歌停了之后 systemeq 的状态还留着上一次的谱形，
+                    # 拿过期谱形去"解释"当前环境会把真实噪声当成漏音减掉。
+                    side = systemeq_service.snapshot() if systemeq_service is not None else {}
+                    age = (side or {}).get("state_age_s")
+                    # 内容谱只来自 systemeq 的 tap：本地播放器出声时那条链是静音的，
+                    # 拿它的谱形去解释环境等于用过期数据做减法——必须要求 execution=applied。
+                    fresh = (
+                        (side or {}).get("execution") == "applied"
+                        and isinstance(age, (int, float))
+                        and 0.0 <= float(age) <= 2.0
+                    )
+                    content_shape = (side or {}).get("content_band_shape_db") if fresh else None
+                    leak = estimate_leak(
+                        ambient_spectrum,
+                        content_shape or [],
+                        enabled=args.leak_residual == "apply",
+                    )
+                    state.set_leak({
+                        "mode": args.leak_residual,
+                        "applied": leak.applied,
+                        "reason": leak.reason or "ok",
+                        "leak_level_db": leak.leak_level_db,
+                        "confidence": leak.confidence,
+                        "spread_db": leak.spread_db,
+                    })
+                    if leak.applied and len(leak.bands) == 24:
+                        ambient_spectrum = leak.bands
+                masking_enabled = (
+                    not args.stem_remix
+                    and latest.mode != "FLAT"
+                    and len(ambient_spectrum) == 24
+                )
+                if args.stem_remix:
+                    systemeq_service.set_stem_environment(stem_environment_for(latest))
+                elif masking_enabled:
+                    # S3 已经提供真实 24 段环境谱时，不再套固定“风/键盘/人声”音色。
+                    # 逐段动作由 systemeq 内的环境谱 × 歌曲谱矩阵实时生成。
+                    bands = [0.0] * 24
+                else:
+                    # 旧固件/坏帧才使用克制的类别处方作为兼容回退。
+                    bands = low_latency_strategy_bands(latest)
                 # 掩蔽时按噪声大小自动加深处方深度（安静 1.3× → 嘈杂 2.5×）；
                 # 非掩蔽模式不覆盖面板深度。
-                depth_override = masking_depth(latest.mode, latest.broadband_dbfs)
+                depth_override = (masking_depth(latest.mode, latest.broadband_dbfs)
+                                  if args.stem_remix else 1.0)
                 # 安静/对话（S3 报 FLAT）时基线归零：EQ 完全平直，不留 demo 音染
                 # （2026-10-23 用户口径"安静时应该是完全没有"）。
-                base_gain = 0.0 if latest.mode == "FLAT" else 1.0
+                # 低延迟智能路径不再叠“所有歌曲一个味道”的固定 demo 基线；
+                # 分轨实验保留旧行为，FLAT 始终完全原声。
+                base_gain = (0.0 if not args.stem_remix or latest.mode == "FLAT" else 1.0)
                 systemeq_service.apply_decision(bands, media_target,
                                                 depth_override=depth_override,
-                                                base_gain=base_gain)
+                                                base_gain=base_gain,
+                                                ambient_band_dbfs=ambient_spectrum,
+                                                ambient_broadband_dbfs=latest.broadband_dbfs,
+                                                masking_enabled=masking_enabled)
             else:
                 player_service.apply_decision(bands, media_target)
         # A1/D50：把 LLM/本地的迟到否决回写 S3 快路径。**与执行端配置无关**——
@@ -1296,6 +1552,24 @@ def main(argv: list[str] | None = None) -> int:
                     )
             except (RuntimeError, OSError):
                 # 串口刚断开：回写不是关键路径，下一拍重试，不阻断主循环。
+                pass
+        # 阶段二/B1：把"Mac 正在放歌"续期给 S3（默认每 1 s）；停止时发一次 off。
+        # 它与执行门无关——暂停执行时歌其实还在放，所以只在暂停时停止续期，
+        # 让设备 TTL 自己失效，不硬发 off（暂停仍可能在放歌给用户听）。
+        if not execution_paused and can_control and writer.available:
+            try:
+                line = music_link.update(
+                    music_is_playing(systemeq_service, player_service),
+                    time.monotonic(),
+                )
+                if line is not None:
+                    writer(line)
+                    state.note_control_sent(
+                        "music on（S3 记录「歌是 Mac 放的」）"
+                        if line.startswith(b"music on")
+                        else "music off（歌已停 / 执行端关闭）"
+                    )
+            except (RuntimeError, OSError):
                 pass
         if ambient is not None and not execution_paused:
             # S3 的 ambient_open 意图 → 执行端（relay 门控 / AirPods 聆听模式）。安全规则：

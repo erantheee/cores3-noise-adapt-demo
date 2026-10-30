@@ -82,9 +82,12 @@ case " $* " in
     *" --ambient-executor "*|*" --mock "*|*" --replay "*) : ;;
     *) set -- --ambient-executor off "$@" ;;
 esac
-# 演示默认三件套（2026-10-23 用户口径，固化防丢）：EQ 三档 + voice 门 + 声纹。
+# 演示默认三件套：低延迟 EQ 执行端 + voice 门 + 声纹。
 # 2026-10-23 上午连续两次"host 被不带参数重启 → systemeq 静默消失"，根因是这些参数
 # 只存在于口头命令里。现在写进 host_up.sh 默认值：任何会话/脚本起 host 都带上。
+# 2026-10-29 真机实测 Demucs 2 s 窗一次耗时 2.736 s，而输出 hop
+# 只有 1.5 s；输出 ring 读空、输入 ring 塞满，造成歌词不同步和严重
+# 断续。因此实时六分轨改为显式实验开关，只有手动传 --stem-remix 才开启。
 # 显式传参或 mock/replay 时不覆盖。
 case " $* " in
     *" --system-eq-app "*|*" --mock "*|*" --replay "*) : ;;

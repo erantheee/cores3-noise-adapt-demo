@@ -13,17 +13,24 @@ URL="http://127.0.0.1:8787/"
 
 echo "== CoreS3 演示启动 =="
 
-# 已经在跑：不重复启动（重复启动会互相抢串口），直接开面板。
+# 已经在跑且是低延迟版：不重复启动（重复启动会互相抢串口）。
+# 若检测到高延迟六分轨链，主动切回低延迟模式。
 if curl -s --max-time 2 "${URL}api/health" >/dev/null 2>&1; then
-    echo "上位机已经在运行，直接打开面板。"
-    open "$URL" >/dev/null 2>&1 || true
-    exit 0
+    SNAPSHOT=$(curl -s --max-time 3 "${URL}api/snapshot" 2>/dev/null || true)
+    if ! printf '%s' "$SNAPSHOT" | grep -Eq '"stem_stream"[[:space:]]*:[[:space:]]*true'; then
+        echo "当前低延迟上位机已经在运行，直接打开面板。"
+        open "$URL" >/dev/null 2>&1 || true
+        exit 0
+    fi
+    echo "检测到高延迟六分轨链，正在关闭并切换到低延迟版…"
+    curl -s --max-time 4 "${URL}api/stop" >/dev/null 2>&1 || true
+    sleep 2
 fi
 
 echo "1/2 释放串口（可能在跑的上位机 / 录音工具）…"
 sh tools/free_port.sh --kill >/dev/null 2>&1 || true
 
-echo "2/2 启动上位机（默认三件套 + 训练数据）…"
+echo "2/2 启动上位机（低延迟 EQ + 对话门 + 声纹 + 训练数据）…"
 if ! sh tools/host_up.sh --detach; then
     echo
     echo "启动失败。完整输出：sh tools/host_up.sh"

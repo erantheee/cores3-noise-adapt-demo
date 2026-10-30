@@ -144,21 +144,24 @@
 
   <div class="grid cards">
     <div class="card">
-      <h2>环境</h2>
+      <h2>环境（固件四分类）</h2>
       <div class="value" id="env">—</div>
       <div class="sub" id="env-raw">—</div>
+      <div class="sub" id="env-note">参与 S3 动作与分轨环境选择</div>
     </div>
     <!--
       情境 = 端侧小模型（v0.2-s3，92 维窗）的判断。它与左边「环境」**不是一回事**：
       环境是固件自己的四分类，情境是模型的九分类。并排放就是为了看清两者的分歧——
-      这个模型现在还没有被信任到能参与决策（integration-plan.md 第二轮）。
+      这个模型现在还没有被信任到能参与决策（integration-plan.md 第二轮），而且
+      2026-10-29/30 真机复测（TODOS A-1）表明它还没通过真机验收：街道、外放音乐、
+      真实说话长时间判 other。**面板必须写明是实验模型**，不能让它看起来像产品能力。
     -->
     <div class="card" id="ctx-card">
-      <h2>情境（端侧模型）</h2>
+      <h2>情境（端侧九分类）</h2>
       <div class="value" id="ctx">—</div>
       <div class="meter"><span id="ctx-bar"></span></div>
       <div class="sub" id="ctx-raw">—</div>
-      <div class="sub" id="ctx-note">9 分类 · 只显示，不参与决策</div>
+      <div class="sub" id="ctx-note">2 秒窗 · 实验模型／未通过真机验收 · 仅观察，不参与决策</div>
       <div class="sub" id="vp">声纹 · 未启用</div>
     </div>
     <!--
@@ -171,7 +174,7 @@
       <h2>事件（端侧规则）</h2>
       <div class="value small" id="evt">—</div>
       <div class="sub" id="evt-raw">—</div>
-      <div class="sub" id="evt-note">键盘 / 风 / 撞击 · 作为对话/环境声的否决条件</div>
+      <div class="sub" id="evt-note">键盘 / 风会驱动分轨策略，也作为对话/环境声的否决条件</div>
     </div>
     <!--
       自身语音证据 = 这一拍"谁在说话"的依据。source 必须显示出来：
@@ -186,9 +189,10 @@
       <div class="sub" id="ov-note">骨传导优先 · 无 IMU 时退回近场代理</div>
     </div>
     <div class="card">
-      <h2>当前动作</h2>
+      <h2>当前动作（S3 环境 → 实时 DSP）</h2>
       <div class="value small" id="state">—</div>
       <div class="sub" id="state-raw">—</div>
+      <div class="sub" id="stem-action">低延迟：等待环境判断</div>
     </div>
     <div class="card">
       <h2>掩蔽推量（背景人声）</h2>
@@ -373,6 +377,10 @@
 <script>
 const $ = (id) => document.getElementById(id);
 let lastSnapshot = null;
+//: 情境卡（九分类）的固定说明。TODOS A-1（2026-10-30 止损）：真机现场复测里街道噪声、
+//: 手机外放音乐、真实说话长时间都落在 other，模型还没通过真机验收。**必须逐字写明
+//: "实验模型／未通过真机验收"**，否则这一格会被当成一个可信能力去解释调音动作。
+const CTX_NOTE = "2 秒窗 · 实验模型／未通过真机验收 · 仅观察，不参与决策";
 //: 用户正在拖进度条。拖动期间不接受状态回写，否则滑块会被每秒 10 次刷新拽回去。
 let playerSeeking = false;
 
@@ -397,12 +405,12 @@ function renderAlerts(s) {
   if (!s.connected) {
     items.push(["bad", s.connected_detail || "上位机与设备未连接"]);
   } else if (s.stale) {
-    items.push(["bad", `已连接但 ${s.age_ms ?? "?"} ms 没有收到任何帧——设备可能停了，或者这个端口对应的是一个已经不存在的设备（项目文档记过这一条）。`]);
+    items.push(["bad", `S3 数据已中断 ${s.age_ms ?? "?"} ms：调音已旁路为原声。串口仍打开不代表设备仍在工作；设备可能停了，或者该端口已失效。`]);
   } else if (s.silent) {
     // 与"设备可能停了"分开报：几秒静默最常见的原因是上位机自己这一侧（读法/调度/批量到达），
     // 直接说成设备停了会把排查引到错误方向。阈值与判据都在后端，界面只负责如实转述。
     items.push(["bad",
-      `已连接，但已经 ${s.age_ms} ms 没有新帧（阈值 ${s.silence_threshold_ms} ms，` +
+      `S3 暂无新数据，调音已旁路。已经 ${s.age_ms} ms 没有新帧（阈值 ${s.silence_threshold_ms} ms，` +
       `设备节拍 100 ms，等于连续丢了 ${Math.round((s.age_ms || 0) / 100)} 帧）。` +
       `<b>先查上位机这一侧</b>：读取粒度、调度抖动、批量到达都会造成这种静默；` +
       `项目文档记过一次同类事故——pyserial 的 read 粒度把主机侧间隔读成了 202 ms。`]);
@@ -539,7 +547,7 @@ function renderContext(f) {
     $("ctx").textContent = "感知中…";
     bar.style.width = "0%";
     $("ctx-raw").textContent = "窗口未满 2 秒";
-    $("ctx-note").textContent = "9 分类 · 只显示，不参与决策";
+    $("ctx-note").textContent = CTX_NOTE;
     return;
   }
   const pct = Math.max(0, Math.min(100, (f.context_score || 0) * 100));
@@ -551,9 +559,10 @@ function renderContext(f) {
     raw += ` ＋ ${f.context_top2} ${pct2.toFixed(0)}%（混合）`;
   }
   $("ctx-raw").textContent = raw;
+  const suffix = "实验模型／未通过真机验收 · 仅观察，不参与决策";
   let note = f.context_us === null || f.context_us === undefined
-    ? "9 分类 · 只显示，不参与决策"
-    : `前向 ${f.context_us} µs · 只显示，不参与决策`;
+    ? `2 秒窗 · ${suffix}`
+    : `前向 ${f.context_us} µs · ${suffix}`;
   if (f.context_mixed === true) note = "混合环境 · " + note;
   if (f.speech_gate_valid === true && typeof f.speech_gate === "number") {
     note += ` · 说话 gate ${f.speech_gate.toFixed(2)}（${f.speech_gate_us ?? 0} µs，只做遥测）`;
@@ -582,7 +591,7 @@ function renderVoiceprint(s) {
   el.textContent = `声纹 · ${vp.verdict || "—"} ${scoreText}${latency} · self veto（实验）`;
 }
 
-function renderEvent(f) {
+function renderEvent(f, s) {
   const missing = f.event_valid === null || f.event_valid === undefined;
   if (missing) {
     $("evt").textContent = "—";
@@ -599,17 +608,22 @@ function renderEvent(f) {
     } else {
       $("evt").textContent = "攒窗中…";
       $("evt-raw").textContent = "窗口未满 1 秒";
-      $("evt-note").textContent = "键盘 / 风 / 撞击 · 作为对话/环境声的否决条件";
+      $("evt-note").textContent = "键盘 / 风会驱动分轨策略，也作为对话/环境声的否决条件";
     }
     return;
   }
   $("evt").textContent = f.event_text;
   $("evt-raw").textContent = f.event;
-  $("evt-note").textContent = "1 s 窗规则 · 作为对话/环境声的否决条件";
+  const stemOn = s.systemeq && s.systemeq.stem_stream;
+  const policy = { keyboard: "键盘", wind: "防风（低频避让）", speech: "背景人声" }[f.event];
+  $("evt-note").textContent = stemOn && policy
+    ? `1 s 窗规则 · 正在驱动分轨${policy}策略`
+    : "1 s 窗规则 · 也作为对话/环境声的否决条件";
 }
 
 function render(s) {
   lastSnapshot = s;
+  $("env-note").textContent = "固件四分类 · 参与 S3 动作与分轨环境选择";
   $("source-text").textContent = s.source_text + (s.source_detail ? " · " + s.source_detail : "");
   $("uptime").textContent = s.uptime_s + " s";
   $("frames").textContent = s.stats.commands;
@@ -617,18 +631,27 @@ function render(s) {
   $("age").textContent = s.age_ms === null ? "—" : s.age_ms + " ms";
   $("port").textContent = s.connected ? "已打开" : "未打开";
 
+  const controlLive = s.control_data_live === true;
   const dot = $("conn-dot");
-  dot.className = "dot " + (!s.connected ? "bad" : s.stale ? "warn" : "ok");
-  $("conn-text").textContent = !s.connected ? "上位机未连接设备" : s.stale ? "已连接（无数据）" : "已连接";
+  dot.className = "dot " + (!s.connected || s.stale ? "bad" : !controlLive ? "warn" : "ok");
+  $("conn-text").textContent = !s.connected
+    ? "上位机未连接设备"
+    : s.stale
+      ? "S3 数据中断"
+      : !controlLive
+        ? "S3 暂无新数据"
+        : "已连接";
 
   // 演示控制：暂停状态只认快照，按钮 disabled 与状态必须一致（快照缺字段时按运行中处理）。
   const paused = s.execution_paused === true;
-  $("exec-status").textContent = paused ? "已暂停" : "运行中";
-  $("exec-status").className = "value small" + (paused ? " warn" : "");
+  $("exec-status").textContent = paused ? "已暂停" : !controlLive ? "已旁路" : "运行中";
+  $("exec-status").className = "value small" + (paused || !controlLive ? " warn" : "");
   $("btn-pause").disabled = paused;
   $("btn-resume").disabled = !paused;
   $("exec-note").textContent = paused
     ? "执行端已复位（EQ 平直 / 媒体 100% / 环境声关闭）；采集与 AI 继续。继续请点「继续执行」。"
+    : !controlLive
+      ? "S3 没有新控制帧：执行端已复位为原声 / 媒体 100%，不会沿用旧调音处方。"
     : "暂停 = 停执行端（EQ/媒体/环境声复位），采集与 AI 继续；启动请双击 Mac 上的「启动演示.command」";
 
   const f = s.frame;
@@ -637,7 +660,7 @@ function render(s) {
     $("amb").textContent = "—";
     $("amb-raw").textContent = "还没有设备帧";
     $("ctx-bar").style.width = "0%";
-    $("ctx-note").textContent = "9 分类 · 只显示，不参与决策";
+    $("ctx-note").textContent = CTX_NOTE;
     $("vp").textContent = "声纹 · 还没有设备帧";
     $("evt").textContent = "—";
     $("evt-raw").textContent = "还没有设备帧";
@@ -656,9 +679,14 @@ function render(s) {
     renderAmbient(s, f);
     renderContext(f);
     renderVoiceprint(s);
-    renderEvent(f);
+    renderEvent(f, s);
     $("state").textContent = f.state_text;
-    $("state-raw").textContent = `${f.state} · ${f.conversation || "NONE"}`;
+    // B1：设备是否收到新鲜的 `music on`。None = B1 之前的固件，不显示这一项——
+    // "没报"不是"没在放歌"。
+    const musicNote = f.music_playing === true
+      ? " · 音乐：本机在放（S3 已收到）"
+      : f.music_playing === false ? " · 音乐：本机没在放" : "";
+    $("state-raw").textContent = `${f.state} · ${f.conversation || "NONE"}${musicNote}`;
     $("gain").textContent = fmt(f.external_voice_gain_db, 2, " dB");
     $("gain-bar").style.width = Math.max(0, Math.min(100, (f.external_voice_gain_db / s.caps.speech_gain_db) * 100)) + "%";
     // 两个上限要写在界面上，不靠人记：实发值（增益条按它画）+ 产品策略值（出处）。
@@ -690,6 +718,7 @@ function render(s) {
   $("control-warn").style.display = s.control && s.control.unresponsive ? "block" : "none";
   renderPlayer(s);
   renderSystemEq(s);
+  renderStemAction(s);
   drawApplied(s);
   $("apply-note").textContent = applyNote(s);
   $("receipt").textContent = receiptText(s);
@@ -867,16 +896,122 @@ function renderSystemEq(s) {
     unavailable: "不可用",
   }[se.execution] || se.execution;
   const harsh = Number(se.content_harshness);
+  const transient = Number(se.content_transient_risk);
   const env = Number(se.content_env_exposure);
   const trim = Number(se.content_trim);
+  const headroomGain = Number(se.output_headroom_gain);
+  const headroomDb = Number.isFinite(headroomGain) && headroomGain > 0
+    ? 20 * Math.log10(headroomGain)
+    : null;
   const contentNote = Number.isFinite(harsh)
-    ? ` · 内容 ${(harsh * 100).toFixed(0)}% · 环境 ${Number.isFinite(env) ? (env * 100).toFixed(0) : "?"}% · 高频压 ${Number.isFinite(trim) ? (trim * 100).toFixed(0) : "?"}%`
+    ? ` · 高频风险 ${(harsh * 100).toFixed(0)}% · 瞬态风险 ${Number.isFinite(transient) ? (transient * 100).toFixed(0) : "?"}% · 环境 ${Number.isFinite(env) ? (env * 100).toFixed(0) : "?"}% · 高频压 ${Number.isFinite(trim) ? (trim * 100).toFixed(0) : "?"}%`
     : "";
-  el.textContent = `QQ 音乐 tap：${exec}${se.demo ? " · demo基线" : ""} · RMS ${fmt(se.rms, 4)} · 峰值 ${fmt(se.peak, 2)} · `
+  const headroomNote = headroomDb === null
+    ? ""
+    : ` · 输出余量 ${headroomDb >= 0 ? "+" : ""}${headroomDb.toFixed(1)} dB`;
+  const maskingOn = se.masking_matrix_enabled === true;
+  const maskingPeak = Number(se.masking_peak_db);
+  const maskingExposure = Number(se.masking_exposure);
+  const maskingNote = maskingOn
+    ? ` · 逐段掩蔽 ${Number(se.masking_active_bands) || 0}/24 段 · 峰值 ${Number.isFinite(maskingPeak) ? maskingPeak.toFixed(2) : "?"} dB · 强度 ${Number.isFinite(maskingExposure) ? (maskingExposure * 100).toFixed(0) : "?"}%`
+    : " · 逐段掩蔽待环境谱";
+  const roles = se.stem_roles || {};
+  const gains = se.stem_gains_db || {};
+  const roleText = Object.keys(roles).length
+    ? ` · 分轨 ${se.stem_environment || "?"}：主角 ${roles.lead || "?"} / 节奏 ${roles.rhythm || "?"} / 低频 ${roles.low || "?"} / 底色 ${roles.bed || "?"}`
+    : "";
+  const cutText = Object.keys(gains).length
+    ? " · 实际削减 " + Object.entries(gains)
+        .filter(([, value]) => Number(value) < -0.05)
+        .map(([name, value]) => `${name} ${Number(value).toFixed(1)}dB`).join("、")
+    : "";
+  const risk = Number(se.stem_risk);
+  const stemSafety = se.stem_stream
+    ? ` · 风险 ${Number.isFinite(risk) ? (risk * 100).toFixed(0) : "?"}% · 限幅 ${fmt(se.stem_limiter_gain, 3)}`
+    : "";
+  const baseGain = Number(se.base_gain);
+  const baseLabel = se.demo && Number.isFinite(baseGain) && baseGain > 0.05 ? " · demo基线" : "";
+  // B2：歌曲漏音残差。default observe = 只报告不应用；reason 用中文写清为什么没扣。
+  const leak = s.leak;
+  const LEAK_REASON = {
+    ok: "估计成立",
+    disabled: "仅观测",
+    low_confidence: "环境谱不像漏音",
+    few_bands: "歌的频段太少",
+    flat_content: "歌频谱太平",
+    invalid: "缺谱",
+  };
+  const leakLevel = Number(leak && leak.leak_level_db);
+  const leakNote = leak && leak.mode && leak.mode !== "off"
+    ? ` · 漏音残差 ${leak.applied ? "已扣" : "未扣"}（${LEAK_REASON[leak.reason] || leak.reason || "?"}`
+      + (Number.isFinite(leakLevel) ? ` · 漏音 ${leakLevel.toFixed(1)} dB` : "")
+      + ` · 置信 ${Math.round((Number(leak.confidence) || 0) * 100)}%）`
+    : "";
+  el.textContent = `QQ 音乐 tap：${exec}${baseLabel} · RMS ${fmt(se.rms, 4)} · 峰值 ${fmt(se.peak, 2)} · `
     + `深度 ${(Number(se.depth) || 0).toFixed(1)}× · ${se.sample_rate || "?"} Hz · `
-    + `状态 ${se.state_age_s ?? "?"} s 前${contentNote}${se.last_error ? ` · ${se.last_error}` : ""}`;
+    + `状态 ${se.state_age_s ?? "?"} s 前${contentNote}${maskingNote}${headroomNote}${leakNote}${roleText}${cutText}${stemSafety}${se.last_error ? ` · ${se.last_error}` : ""}`;
   // 深度滑块现在是 systemeq 的处方深度（1…4 倍）。
   $("depth-text").textContent = (Number(se.depth) || 0).toFixed(1) + "×";
+}
+
+// S3 固件的 HOLDING 是旧环境策略，不等于“没有调声音”。分轨有独立的环境策略，
+// 必须把正在执行的策略和实际削减量显示在动作卡里，否则“保持当前设置”会被误读成
+// “风噪不处理”。策略决定的是音乐如何让位，不能消除开放式耳机外真实存在的风声。
+function renderStemAction(s) {
+  const el = $("stem-action");
+  const se = s.systemeq;
+  if (!se) {
+    el.textContent = "低延迟：未启用执行端";
+    return;
+  }
+  if (se.available === false) {
+    el.textContent = "低延迟：等待 QQ 音乐开始播放";
+    return;
+  }
+  if (!se.stem_stream) {
+    const frame = s.frame || {};
+    const policy = !frame.mode || frame.mode === "FLAT"
+      ? "安静 / 对话（原声）"
+      : frame.event === "wind" ? "防风"
+        : frame.event === "keyboard" ? "键盘避让"
+          : frame.event === "speech" ? "人声保护"
+            : frame.environment === "QUIET" ? "安静" : "带宽噪声避让";
+    const transient = Number(se.content_transient_risk);
+    const harsh = Number(se.content_harshness);
+    const peak = Number(se.applied_peak_abs_db);
+    const maskingPeak = Number(se.masking_peak_db);
+    const maskingActive = Number(se.masking_active_bands);
+    const details = [
+      se.masking_matrix_enabled
+        ? `逐段掩蔽 ${Number.isFinite(maskingActive) ? maskingActive : 0}/24（峰值 ${Number.isFinite(maskingPeak) ? maskingPeak.toFixed(2) : "?"} dB）`
+        : "逐段掩蔽待环境谱",
+      `瞬态 ${Number.isFinite(transient) ? (transient * 100).toFixed(0) : "?"}%`,
+      `高频 ${Number.isFinite(harsh) ? (harsh * 100).toFixed(0) : "?"}%`,
+      `实际峰值 ${Number.isFinite(peak) ? `${peak >= 0 ? "+" : ""}${peak.toFixed(1)} dB` : "?"}`,
+    ].join(" · ");
+    el.textContent = `低延迟调音师：${policy} · ${details}`;
+    return;
+  }
+  if (se.stem_ready === false) {
+    el.textContent = "分轨：模型正在加载";
+    return;
+  }
+  const policies = {
+    quiet: "安静", broadband: "一般噪声", keyboard: "键盘", wind: "防风", babble: "背景人声",
+  };
+  const stems = { vocals: "人声", drums: "鼓", bass: "低频", guitar: "吉他", piano: "钢琴", other: "其他" };
+  const policy = policies[se.stem_environment] || se.stem_environment || "等待判断";
+  const gains = se.stem_gains_db || {};
+  const cuts = Object.entries(gains)
+    .filter(([, value]) => Number(value) < -0.05)
+    .sort((a, b) => Number(a[1]) - Number(b[1]))
+    .slice(0, 3)
+    .map(([stem, value]) => `${stems[stem] || stem} ${Number(value).toFixed(1)} dB`);
+  const risk = Number(se.stem_risk);
+  const riskText = Number.isFinite(risk) ? ` · 风险门 ${(risk * 100).toFixed(0)}%` : "";
+  const action = cuts.length ? `让位 ${cuts.join(" / ")}` : "不改变原混音";
+  const caveat = se.stem_environment === "wind" ? " · 防风=避让低频，不消耳外风声" : "";
+  el.textContent = `分轨：${policy} · ${action}${riskText}${caveat}`;
 }
 
 function renderPlayer(s) {

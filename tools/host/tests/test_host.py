@@ -53,6 +53,7 @@ from host.mac_audio import (  # noqa: E402
     parse_default_output,
     route_command,
 )
+from host.leak import estimate_leak  # noqa: E402
 from host.voiceprint import VoiceprintService  # noqa: E402
 from host.server import (  # noqa: E402
     Broadcaster,
@@ -79,10 +80,14 @@ from host.training import TrainingWriter  # noqa: E402
 from host.continuous_audio import ContinuousAudioWriter  # noqa: E402
 from host.__main__ import (  # noqa: E402
     DialogOverrideLink,
+    MusicKeepalive,
+    music_is_playing,
     DialogueTurnGate,
+    ambient_spectrum_for,
     ambient_gate_allows,
     fresh_self_veto,
     llm_ambient_authorization,
+    low_latency_strategy_bands,
     parse_args,
     parse_earphone,
     relay_reports_audio,
@@ -119,6 +124,45 @@ def wait_for(predicate, timeout_s: float = 2.0) -> bool:
             return True
         time.sleep(0.01)
     return bool(predicate())
+
+
+def test_low_latency_strategy_is_bounded_and_fail_closed() -> None:
+    """QQ 音乐主链只吃克制环境处方，不再照搬 S3 旧粗暴 EQ。"""
+
+    class Frame:
+        mode = "SONG_EQ"
+        environment = "NOISY"
+        event_valid = True
+        event = "wind"
+        broadband_dbfs = -36.0
+
+    wind = low_latency_strategy_bands(Frame())
+    eq(len(wind), 24, "低延迟环境处方仍与 24 段 DSP 对齐")
+    check(max(abs(value) for value in wind) <= 0.8, "环境处方幅度必须限在 ±0.8 dB")
+    check(wind[0] < 0 < wind[13], "风噪策略削低频、仅轻抬中高频")
+
+    Frame.broadband_dbfs = -58.0
+    eq(low_latency_strategy_bands(Frame()), [0.0] * 24, "弱环境证据不得改歌曲")
+    Frame.broadband_dbfs = -36.0
+    Frame.mode = "FLAT"
+    eq(low_latency_strategy_bands(Frame()), [0.0] * 24, "S3 FLAT 必须 fail-closed 为原声")
+
+
+def test_ambient_spectrum_requires_real_24_band_evidence() -> None:
+    """智能掩蔽只吃 S3 真谱；缺段、NaN、全地板都必须回退。"""
+
+    class Frame:
+        ambient_band_dbfs = tuple(-70.0 + index for index in range(24))
+
+    spectrum = ambient_spectrum_for(Frame())
+    eq(len(spectrum), 24, "有效 S3 环境谱完整进入掩蔽矩阵")
+    close(spectrum[7], -63.0, "环境谱数值不被上位机改形")
+    Frame.ambient_band_dbfs = tuple([-120.0] * 24)
+    eq(ambient_spectrum_for(Frame()), [], "全地板不是有效环境证据")
+    Frame.ambient_band_dbfs = tuple([-60.0] * 23)
+    eq(ambient_spectrum_for(Frame()), [], "缺一段就禁用矩阵")
+    Frame.ambient_band_dbfs = tuple([-60.0] * 23 + [float("nan")])
+    eq(ambient_spectrum_for(Frame()), [], "非有限值不能进入音频执行端")
 
 
 # --------------------------------------------------------------------------- 解析
@@ -1067,6 +1111,7 @@ def test_staleness_distinguishes_quiet_from_dead() -> None:
     # 只能显示 "?"）——两个字段的判据互相矛盾。2026-10-14 用户实测撞到。
     check(not state.is_stale(), "刚连上还没有任何帧，不得立刻报陈旧")
     check(not state.is_silent(), "刚连上不算静默")
+    check(not state.has_live_control_data(), "端口刚打开但没有帧，不能执行旧处方")
     check(state.age_ms() is not None, "没有帧时年龄必须从连接那一刻算起，不能是 None")
     check(state.is_stale(time.monotonic() + 11.0), "连接后持续 10 秒以上没帧才判为陈旧")
     check(state.age_ms(time.monotonic() + 11.0) > 10_000, "陈旧时年龄要是个数字，界面才有得显示")
@@ -1076,10 +1121,13 @@ def test_staleness_distinguishes_quiet_from_dead() -> None:
                     '"environment":"QUIET","confidence":0.5,"link":"simulated"}')
     check(not state.is_stale(), "刚收到帧就不该判为陈旧")
     check(not state.is_silent(), "刚收到帧不算静默")
+    check(state.has_live_control_data(), "收到新帧后才允许执行调音")
     # 5.9 秒静默：够不到"设备可能停了"，但绝不能写成"数据在流"。旧实现的告警区在这种
     # 空档里写的就是「数据在流，未发现异常。」——那句话正是用户报的 bug。
     check(not state.is_stale(time.monotonic() + 5.0), "短暂 5 秒停顿不误报设备死亡")
     check(state.is_silent(time.monotonic() + 5.0), "静默超过阈值必须报静默，不能说数据在流")
+    check(not state.has_live_control_data(time.monotonic() + 5.0),
+          "静默虽未到 stale，也必须先旁路旧调音处方")
     check(state.is_stale(time.monotonic() + 11.0), "持续 10 秒以上没帧才判为陈旧")
 
     # 静默要单独记账。旧实现只在 0 < 间隔 < 5000 ms 时取样，≥5 秒的空档被直接丢掉，
@@ -2281,6 +2329,51 @@ def test_eq_mode_and_bypass_control() -> None:
     except SystemEqError as exc:
         check("没有在运行" in str(exc), "合法档位也会因进程不在而如实报错")
 
+    # S3 24 段环境谱必须随 eq 一起到 Swift，且环境变化不能被旧的“曲线相同”节流吞掉。
+    sent: list[dict] = []
+    service._process = _FakePlayerProcess()  # type: ignore[assignment]
+    service._send = lambda payload: sent.append(payload)  # type: ignore[assignment]
+    ambient = [-70.0 + index for index in range(24)]
+    check(
+        service.apply_decision(
+            [0.0] * 24, 100.0, base_gain=0.0,
+            ambient_band_dbfs=ambient, ambient_broadband_dbfs=-40.0,
+            masking_enabled=True,
+        ),
+        "智能掩蔽上下文能下发",
+    )
+    eq(sent[-1]["ambient_band_dbfs"], ambient, "eq 带完整 S3 24 段环境谱")
+    eq(sent[-1]["ambient_broadband_dbfs"], -40.0, "eq 带 S3 宽带电平")
+    check(sent[-1]["masking_enabled"] is True, "eq 显式打开逐段掩蔽矩阵")
+    check(sent[-1]["base_gain"] == 0.0, "智能路径不再叠固定 demo 音色")
+    changed = list(ambient)
+    changed[12] += 3.0
+    check(
+        service.apply_decision(
+            [0.0] * 24, 100.0, base_gain=0.0,
+            ambient_band_dbfs=changed, ambient_broadband_dbfs=-40.0,
+            masking_enabled=True,
+        ),
+        "曲线不变但环境谱变化时仍必须立即下发",
+    )
+
+    # Demucs 分轨已经把 ring 塞满时，重启不会恢复实时性，
+    # 只会重复“断流→积压→重启”。必须本次 host 直接熔断。
+    stem_service = SystemEqService(autostart=False, stem_worker="/tmp/stem-worker")
+
+    class QuittingProcess:
+        stdout = iter([
+            json.dumps({"event": "quitting", "reason": "ring 持续积压，退出重建"})
+            + "\n"
+        ])
+
+    stem_service._process = QuittingProcess()  # type: ignore[assignment]
+    stem_service._read_stdout()
+    check(
+        stem_service._no_auto_restart == "ring 持续积压，退出重建",
+        "分轨 ring 积压必须熔断，不得自动重启后继续断续",
+    )
+
 
 def test_voiceprint_shadow_snapshot_is_harmless() -> None:
     """self/other 对话门控：未启用/缺依赖时必须安全，不得影响主链路。"""
@@ -2336,6 +2429,51 @@ def test_voiceprint_energy_activity_fallback() -> None:
     check(VoiceprintService._chunk_dbfs(synth(-40.0)) >= floor + 6.0,
           "比本底高 10 dB 的块应能作为语音活动证据")
     check(VoiceprintService._chunk_dbfs(_Chunk(b"")) is None, "空块不得报活动")
+
+
+def test_voiceprint_learning_off_by_default_and_drift_visible() -> None:
+    """2026-10-28 声纹事故：在线积累必须默认关，漂移/冻结必须可见。
+
+    背景：worker 的 8% EMA 在 ~1120 个窗后把积累原型带离注册锚点（cosine 0.396），
+    自己说话被判 other（连续 2 窗低于 threshold-margin）。修复三件事：
+    ① host 默认给 worker 传 --no-learn；② worker 报的 drift/learn_frozen 进快照；
+    ③ worker 拒绝加载离锚点太远的旧原型（learn_reject）时面板能看见。
+    """
+    # ① 默认关学习，argv 必须显式带 --no-learn；显式开启时才不带。
+    default_service = VoiceprintService(enabled=False)
+    check(default_service.learn is False, "在线积累默认必须关闭（2026-10-28 事故）")
+    check("--no-learn" in default_service._worker_argv(),  # type: ignore[attr-defined]
+          "默认启动 worker 必须传 --no-learn")
+    learning_service = VoiceprintService(enabled=False, learn=True)
+    check(learning_service.learn is True, "显式 learn=True 应生效")
+    check("--no-learn" not in learning_service._worker_argv(),  # type: ignore[attr-defined]
+          "显式开学习时不得再传 --no-learn")
+
+    # ② 快照暴露漂移遥测：初始无数据，ready 后带 drift 和冻结标记。
+    snap = default_service.snapshot()
+    check(snap["learn_enabled"] is False, "快照要暴露 learn_enabled")
+    check(snap["drift"] is None and snap["learn_frozen"] is False,
+          "没有学习结果时不能编造 drift/frozen")
+
+    # ③ worker 事件：learn_reject（拒绝坏原型）和 learn_frozen（越界冻结）要能进快照。
+    default_service._apply({  # type: ignore[attr-defined]
+        "type": "ready", "clips": 3, "dim": 512,
+        "learn_updates": 0, "learn_frozen": True, "drift": 1.0,
+    })
+    check(default_service.snapshot()["drift"] == 1.0, "ready 的 drift 要进快照")
+    default_service._apply({  # type: ignore[attr-defined]
+        "type": "learn_reject", "drift": 0.396, "rejected_to": "learned-rejected-x.npz",
+    })
+    snap = default_service.snapshot()
+    check(snap["learn_frozen"] is True, "拒绝坏原型后必须标记冻结")
+    check(snap["learn_rejected"] == "learned-rejected-x.npz", "留档文件名要可见")
+    check(abs(snap["drift"] - 0.396) < 1e-9, "拒绝时的 drift 要可见（事故指标）")
+    default_service._apply({  # type: ignore[attr-defined]
+        "type": "learn_frozen", "drift": 0.897, "min_cos": 0.90,
+    })
+    snap = default_service.snapshot()
+    check(snap["learn_frozen"] is True and abs(snap["drift"] - 0.897) < 1e-9,
+          "越界冻结的 drift 要进快照")
 
 
 def test_ambient_executor_and_intent_parsing() -> None:
@@ -2564,6 +2702,112 @@ def test_dialog_override_link() -> None:
     state2 = HostState(source="mock")
     state2.feed_line(json.dumps(dict(base, typing_active=True)))
     eq(state2.snapshot()["frame"]["typing_active"], True, "快照要带 typing_active")
+
+    # B1：music_playing 也是追加可选键；缺键必须是 None（"没报"≠"没在放歌"）。
+    music_frame = parse_line(json.dumps(dict(base, music_playing=True))).value
+    check(music_frame is not None and music_frame.music_playing is True,
+          "music_playing=true 要解析进帧")
+    no_music = parse_line(json.dumps(base)).value
+    check(no_music is not None and no_music.music_playing is None,
+          "旧固件没有 music_playing：必须是 None")
+    state3 = HostState(source="mock")
+    state3.feed_line(json.dumps(dict(base, music_playing=True)))
+    eq(state3.snapshot()["frame"]["music_playing"], True, "快照要带 music_playing")
+
+
+def test_music_keepalive() -> None:
+    """阶段二/B1：`music on|off` 保活（S3 侧 v1 只落遥测 `music_playing`）。
+
+    这个旗标的失败模式不是崩溃，而是**悄悄永远为真**：host 崩了、串口断了，设备还一直
+    以为歌在放，后面所有基于它的门控都会错。所以这里钉三件事：
+      * 证据只认执行端回执（systemeq `applied` / 播放器 `playing`），不认意图；
+      * 每 1 s 续期一次，S3 的 3 s TTL 不会在歌还在播时过期；
+      * 停止/退出时发一次 off，不留下过期前的错误状态。
+    """
+    link = MusicKeepalive()
+    eq(link.update(True, 0.0), b"music on 3000\r\n", "在放歌 → music on，TTL 3 s")
+    eq(link.update(True, 0.5), None, "续期窗口内不重复发（每拍都发会刷串口）")
+    eq(link.update(True, 1.0), b"music on 3000\r\n", "每 1 s 续期一次")
+    eq(link.update(False, 1.5), b"music off\r\n", "停止 → off")
+    eq(link.update(False, 2.0), None, "off 只发一次")
+    eq(link.update(True, 3.0), b"music on 3000\r\n", "重新播放 → 再续期")
+    eq(link.release(), b"music off\r\n", "退出时要撤销")
+    eq(link.release(), None, "释放只发一次")
+
+    class _Side:
+        def __init__(self, payload: dict) -> None:
+            self.payload = payload
+
+        def snapshot(self) -> dict:
+            return self.payload
+
+    eq(music_is_playing(_Side({"available": True, "execution": "applied"}), None), True,
+       "systemeq 报 applied 才算在放歌")
+    eq(music_is_playing(_Side({"available": True, "execution": "silent"}), None), False,
+       "在播但实测无信号：不算在放歌")
+    eq(music_is_playing(_Side({"available": False, "execution": "applied"}), None), False,
+       "执行端不可用：不算在放歌")
+    eq(music_is_playing(None, _Side({"playing": True})), True, "本地播放器在播也算")
+    eq(music_is_playing(None, _Side({"playing": False})), False, "播放器不在播不算")
+    eq(music_is_playing(None, None), False, "没有执行端：不在放歌")
+
+
+def test_leak_residual_estimator() -> None:
+    """阶段二/B2：把"Mac 自己放的歌"从 24 段环境谱里估出来。
+
+    为什么值得单独测：这个估计一旦减过头，掩蔽会变小（用户听得见的退化），而且不会
+    报错。这里用可控的合成谱把四条纪律钉住：
+      * 只比较谱形：环境 ≈ 歌曲谱形 + 一个整体偏移；
+      * 最多减 12 dB，宁可少减；
+      * 环境谱不像这首歌（离散度大）就**原样放行**；
+      * 歌没内容的频段不动（那里可能是真实环境声）。
+    """
+    shape = [-60.0] * 24
+    for index in range(4, 17):
+        shape[index] = -2.0 * abs(index - 10)  # 最强段 0 dB，两边到 -12 dB
+    active = [index for index in range(24) if shape[index] > -24.0]
+
+    # 1) 纯漏音：环境 = 歌曲谱形 + 40 dB，其余段是 -80 dB 房间底噪。
+    ambient = [-80.0] * 24
+    for index in active:
+        ambient[index] = shape[index] + 40.0
+    result = estimate_leak(ambient, shape, enabled=True)
+    eq(result.applied, True, "谱形一致时判定为漏音并应用")
+    eq(round(result.confidence, 3), 1.0, "完全一致时置信度为 1")
+    eq(round(result.leak_level_db, 3), 40.0, "整体偏移 = ambient − content 的中位数")
+    for index in active:
+        eq(round(result.bands[index], 3), round(ambient[index] - 12.0, 3),
+           "残差最多减 12 dB（宁可少减）")
+    eq(result.bands[0], ambient[0], "歌没内容的频段原样保留（可能是真实环境声）")
+
+    # 2) 漏音 + 真实外部噪声：噪声段在残差里要保留下来，不被一起减掉。
+    noisy = list(ambient)
+    noisy[7] += 10.0
+    result = estimate_leak(noisy, shape, enabled=True)
+    eq(result.applied, True, "多了一个噪声段仍应判为漏音")
+    check(result.bands[7] > result.bands[6] + 1.0,
+          "外部噪声（+10 dB）要在残差里保留，不能被一起减掉")
+
+    # 3) 歌曲谱形几乎是平的：平谱可以解释成任何歌的漏音，无法判断，不应用。
+    narrow = [max(-24.0, -0.5 * abs(index - 10)) for index in range(24)]
+    flat = [40.0] * 24
+    result = estimate_leak(flat, narrow, enabled=True)
+    eq(result.applied, False, "平谱环境 + 平谱歌曲：不应用")
+    eq(result.reason, "flat_content", "原因要写明歌曲谱形太平")
+    eq(result.bands, flat, "不应用时必须原样返回，不能偷偷改")
+
+    # 4) 歌曲谱形够宽、但环境谱与它无关（平谱）：置信度不足，原样放行。
+    wide = [max(-24.0, -2.0 * abs(index - 10)) for index in range(24)]
+    result = estimate_leak(flat, wide, enabled=True)
+    eq(result.applied, False, "谱形不一致时不应用")
+    eq(result.reason, "low_confidence", "原因要写明是置信度不足")
+    eq(result.bands, flat, "不应用时必须原样返回")
+
+    # 5) 关闭 / 输入坏掉 / 歌的频段太少：都原样放行。
+    eq(estimate_leak(ambient, shape, enabled=False).reason, "disabled", "关闭时不算")
+    eq(estimate_leak(ambient[:12], shape, enabled=True).reason, "invalid", "段数不对不猜")
+    eq(estimate_leak(ambient, [-60.0] * 24, enabled=True).reason, "few_bands",
+       "歌几乎没有内容时不估漏音")
 
 
 def test_relay_ambient_gate() -> None:
@@ -4112,8 +4356,31 @@ def test_pause_resets_execution_side() -> None:
     check(apply_neutral_execution(None, None) is False, "没有执行端时返回 False，不伪报成功")
 
 
+def test_execution_requires_fresh_control_data() -> None:
+    """串口打开不等于处方可执行；无帧、静默、断流都必须 fail-open。"""
+    from host.__main__ import execution_block_reason
+
+    state = HostState(source="serial")
+    state.set_connection(True, "/dev/cu.usbmodem101")
+    eq(execution_block_reason(state, None, False), "no_frame", "没有首帧时禁止执行")
+    state.feed_line('{"type":"earbud_command","sequence":1,"timestamp_ms":1,'
+                    '"speech_gain_db":0,"noise_reduction_db":0,"media_percent":100,'
+                    '"state":"OBSERVING","environment":"QUIET","confidence":0.5,'
+                    '"link":"simulated"}')
+    check(execution_block_reason(state, state.latest, False) is None, "新鲜帧允许执行")
+    state.last_frame_at = time.monotonic() - 2.0
+    eq(execution_block_reason(state, state.latest, False), "silent", "静默 1 秒即旁路")
+    state.last_frame_at = time.monotonic() - 11.0
+    eq(execution_block_reason(state, state.latest, False), "stale", "断流保持旁路")
+    eq(execution_block_reason(state, state.latest, True), "manual_pause", "手动暂停优先")
+    state.set_connection(False, "拔出")
+    eq(execution_block_reason(state, state.latest, False), "disconnected", "断开必须旁路")
+
+
 def main() -> int:
     tests = [
+        test_low_latency_strategy_is_bounded_and_fail_closed,
+        test_ambient_spectrum_requires_real_24_band_evidence,
         test_d2_matches_c_printf,
         test_mac_default_output_route,
         test_earphone_cli_parsing,
@@ -4159,14 +4426,18 @@ def main() -> int:
         test_server_endpoints,
         test_execution_pause_endpoint_and_snapshot,
         test_pause_resets_execution_side,
+        test_execution_requires_fresh_control_data,
         test_interval_stats_and_percentile,
         test_player_decision_path_is_not_silently_dropped,
         test_eq_mode_and_bypass_control,
         test_voiceprint_shadow_snapshot_is_harmless,
         test_voiceprint_energy_activity_fallback,
+        test_voiceprint_learning_off_by_default_and_drift_visible,
         test_ambient_executor_and_intent_parsing,
         test_ambient_gate_llm_only_trigger,
         test_dialog_override_link,
+        test_music_keepalive,
+        test_leak_residual_estimator,
         test_relay_ambient_gate,
         test_audio_relay_budget_caps_backlog,
         test_relay_measures_real_queue_depth_not_our_writes,
