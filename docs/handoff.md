@@ -40,6 +40,11 @@
   类型保护 ±1.5 dB）+ 掩蔽层 B（S3 侧事件包络，键盘/EVI）+ 内容×环境补偿。正增益预算
   基础 5/激进 6 dB。面板「当前媒体」卡按层写明。下一步 B3（声部依据）未做。
   真机：applied 存在感 +4.9 dB、去糊 −2～−5.3 dB；**待用户听感定深度/预算**。
+- **2026-10-30 15:5x 收尾**：听感基本确认（回归 D54 链路后：低频恢复、无全局压音量、
+  毛明显减少）。已 `git push` 到 origin（分支 `feature/apple-conversation-awareness`，
+  之前远端停在 66cdbd9，本次推 37 个提交）。未完成：激进档响段的少量削波
+  （trim 2 dB 顶满时的硬削波，听感可接受则不动；否则降正增益封顶 5→4）、
+  B3 声部依据、九分类 A-1 采集。
 - 工具：`free_port.sh` 自动发现串口（不再写死 `usbmodem1101`）；`test_launcher.sh` 接入 CI；
   `live_band_capture.py` 新增 systemeq 列与分阶段摘要。
 - 回归（实测）：host **104 组 / 8049 断言**、ctest **13/13**、render **68/68**、launcher 通过；
