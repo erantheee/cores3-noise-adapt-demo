@@ -23,9 +23,14 @@
     python3 tools/live_band_capture.py --out 记录/键盘风声/run.csv \
         --script quiet:10,keyboard:15,pause:6,wind:15,pause:6 --cue say
 
+    # 掩蔽矩阵的可听性验收（2026-10-30）：看 applied_* / masking_* / out_clip_frames
+    python3 tools/live_band_capture.py --out 记录/eq验收/20261030-a.csv \
+        --script song_only:30,song_noise:45,song_talk:30 --cue say
+
 输出 CSV 列：wall_iso, elapsed_s, phase, cue, seq, device_ts_ms, bands 00..23,
-context, context_score, context_valid, environment, state, mode, conversation,
-speech_gain_db, media_percent, own_voice_confidence, imu_motion, ambient_open。
+context, context_score, context_valid, event, event_valid, environment, state, mode,
+conversation, speech_gain_db, media_percent, own_voice_confidence, imu_motion,
+ambient_open, execution_se（system EQ 侧：available/execution/applied/masking/削波/余量）。
 
 退出码：0 正常；1 上位机不可达/帧里没有频谱字段（这条必须报错，不能写出空数据当成功）。
 """
@@ -35,6 +40,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import shutil
 import subprocess
 import sys
@@ -65,6 +71,22 @@ CSV_FIELDS = (
         "own_voice_confidence",
         "imu_motion",
         "ambient_open",
+        # system EQ 执行端（2026-10-30 掩蔽矩阵验收）：决策在 S3、动作在 Mac，
+        # 所以"设备说了什么"与"歌被改成了什么"必须同帧落盘，否则事后对不上。
+        "se_available",
+        "se_execution",
+        "applied_max_db",
+        "applied_peak_abs_db",
+        "applied_bands_active",
+        "masking_matrix_enabled",
+        "masking_peak_db",
+        "masking_active_bands",
+        "masking_exposure",
+        "content_transient_risk",
+        "content_harshness",
+        "out_peak",
+        "out_clip_frames",
+        "headroom_gain",
     ]
 )
 
@@ -95,6 +117,93 @@ def total_seconds(phases: list[tuple[str, float]], fallback: float) -> float:
     return sum(length for _, length in phases)
 
 
+def _num(value) -> float | None:
+    """CSV/快照里的数是字符串或 None，统一成 float 或 None（不把 0 当缺失）。"""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt(value, digits: int = 2) -> str:
+    number = _num(value)
+    return "" if number is None else f"{number:.{digits}f}"
+
+
+def percentile(values: list[float | None], fraction: float) -> float | None:
+    """线性插值分位数。不引 numpy：与 host 自测同一纪律（纯标准库、可离线复算）。"""
+    data = sorted(value for value in values if value is not None)
+    if not data:
+        return None
+    if len(data) == 1:
+        return data[0]
+    position = (len(data) - 1) * fraction
+    low = int(position)
+    high = min(low + 1, len(data) - 1)
+    weight = position - low
+    return data[low] * (1 - weight) + data[high] * weight
+
+
+def systemeq_columns(snapshot: dict) -> dict:
+    """system EQ 执行端的实测列。缺字段一律留空，不写 0——"没测到"不是"测到 0"。"""
+    side = snapshot.get("systemeq") or {}
+    applied = side.get("applied_bands")
+    values = [float(value) for value in applied] if isinstance(applied, list) else []
+    positive = [value for value in values if value > 0]
+    return {
+        "se_available": side.get("available"),
+        "se_execution": side.get("execution"),
+        "applied_max_db": f"{max(positive):.2f}" if positive else "",
+        "applied_peak_abs_db": f"{max(abs(value) for value in values):.2f}" if values else "",
+        "applied_bands_active": sum(1 for value in values if value > 0.05) if values else "",
+        "masking_matrix_enabled": side.get("masking_matrix_enabled"),
+        "masking_peak_db": _fmt(side.get("masking_peak_db")),
+        "masking_active_bands": side.get("masking_active_bands"),
+        "masking_exposure": _fmt(side.get("masking_exposure"), 3),
+        "content_transient_risk": _fmt(side.get("content_transient_risk"), 3),
+        "content_harshness": _fmt(side.get("content_harshness"), 3),
+        "out_peak": _fmt(side.get("out_peak"), 4),
+        "out_clip_frames": side.get("out_clip_frames"),
+        "headroom_gain": _fmt(side.get("output_headroom_gain"), 4),
+    }
+
+
+def print_summary(rows: list[dict], gaps: int, threshold_db: float = 2.0) -> None:
+    """分阶段摘要。验收判据就写在这里，避免事后从 CSV 里挑好看的帧。"""
+    groups: dict[str, list[dict]] = {}
+    for row in rows:
+        if str(row.get("cue")) == "1":
+            continue
+        groups.setdefault(str(row.get("phase")), []).append(row)
+    if not groups:
+        return
+    print("\n分阶段摘要（剔除 cue 段；applied_max = systemeq.applied_bands 的正向峰值）", flush=True)
+    for phase, items in groups.items():
+        applied = [_num(item.get("applied_max_db")) for item in items]
+        applied = [value for value in applied if value is not None]
+        peak = [_num(item.get("masking_peak_db")) for item in items]
+        clip = [_num(item.get("out_clip_frames")) for item in items]
+        clip = [value for value in clip if value is not None]
+        headroom = [_num(item.get("headroom_gain")) for item in items]
+        headroom_db = [20 * math.log10(value) for value in headroom if value and value > 0]
+        active = [_num(item.get("applied_bands_active")) for item in items]
+        active = [value for value in active if value is not None]
+        share = (sum(1 for value in applied if value >= threshold_db) / len(applied)) if applied else 0.0
+        clip_delta = (max(clip) - min(clip)) if clip else None
+        print(
+            f"  {phase:10s} n={len(items):4d}"
+            f"  applied P50/P90/max={_fmt(percentile(applied, 0.5))}/"
+            f"{_fmt(percentile(applied, 0.9))}/{_fmt(max(applied) if applied else None)} dB"
+            f"  ≥{threshold_db:g}dB 占比 {share:.0%}"
+            f"  段数P50={_fmt(percentile(active, 0.5), 0)}"
+            f"  masking_peak P50={_fmt(percentile(peak, 0.5))}"
+            f"  clip增量={clip_delta if clip_delta is not None else '?'}"
+            f"  余量中位={_fmt(percentile(headroom_db, 0.5))} dB",
+            flush=True,
+        )
+    print(f"  丢帧跳变 {gaps} 次", flush=True)
+
+
 #: 中文提示语。段名保持 ASCII（CSV 好 grep），提示人话可以另写。
 CUE_TEXT = {
     "ready": "准备，请听提示",
@@ -104,6 +213,10 @@ CUE_TEXT = {
     "speech": "请开始说话",
     "knock": "请轻敲桌面",
     "wind": "请对着设备持续吹气",
+    # 掩蔽矩阵验收段（2026-10-30）：
+    "song_only": "只放歌，不要制造其它声音",
+    "song_noise": "继续放歌，同时制造环境噪声",
+    "song_talk": "继续放歌，请正常说话",
     "done": "采集结束",
 }
 
@@ -242,6 +355,7 @@ def main() -> int:
                 "imu_motion": frame.get("imu_motion"),
                 "ambient_open": frame.get("ambient_open"),
             }
+            row.update(systemeq_columns(snapshot))
             for index in range(BAND_COUNT):
                 row[f"band_{index:02d}"] = (
                     f"{float(bands[index]):.2f}" if index < len(bands) else ""
@@ -278,6 +392,7 @@ def main() -> int:
         f"丢帧跳变 {gaps} 次，模型输出集合 {contexts}",
         flush=True,
     )
+    print_summary(rows, gaps)
     return 0
 
 

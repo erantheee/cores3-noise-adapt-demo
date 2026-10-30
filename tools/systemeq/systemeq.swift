@@ -215,6 +215,233 @@ final class AudioRingBuffer: @unchecked Sendable {
     }
 }
 
+// MARK: - Optional rolling stem-separation bridge
+
+/// Background IPC bridge.  Core Audio callbacks never block on the model:
+/// capture.ring -> worker stdin, worker stdout -> outputRing.  The source node
+/// reads outputRing and emits silence while the first 2 s window is processed.
+final class StemBridge: @unchecked Sendable {
+    struct Snapshot {
+        var ready = false
+        var windows = 0
+        var processMs = 0.0
+        var rtf = 0.0
+        var inputFrames = 0
+        var outputFrames = 0
+        var lastError = ""
+        var environment = "broadband"
+        var roles: [String: String] = [:]
+        var gainsDb: [String: Double] = [:]
+        var strength = 0.0
+        var risk = 0.0
+        var crestDb = 0.0
+        var activeStems = 0
+        var vocalSideRatio = 0.0
+        var limiterGain = 1.0
+    }
+
+    let outputRing: AudioRingBuffer
+    private let inputRing: AudioRingBuffer
+    private let sampleRate: Int
+    private let channels: Int
+    private let workerPath: String
+    private let initialEnvironment: String
+    private let controlURL: URL
+    private let device: String
+    private let process = Process()
+    private let stdinPipe = Pipe()
+    private let stdoutPipe = Pipe()
+    private let stderrPipe = Pipe()
+    private let stateLock = OSAllocatedUnfairLock(initialState: Snapshot())
+    private let lifecycleLock = OSAllocatedUnfairLock(initialState: true)
+    private let stderrLock = NSLock()
+    private var stderrBuffer = Data()
+
+    init(inputRing: AudioRingBuffer, sampleRate: Int, channels: Int,
+         workerPath: String, environment: String, device: String) {
+        self.inputRing = inputRing
+        self.sampleRate = sampleRate
+        self.channels = channels
+        self.workerPath = workerPath
+        self.initialEnvironment = environment
+        self.controlURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("systemeq-stem-\(UUID().uuidString).json")
+        self.device = device
+        // Holds >10 seconds so 2 s model bursts do not underrun the source node.
+        self.outputRing = AudioRingBuffer(channelCount: channels,
+                                          capacity: max(48_000, sampleRate * 12))
+    }
+
+    func start() throws {
+        try setEnvironment(initialEnvironment)
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = [
+            "uv", "run", "--python", "3.11", "--with", "demucs", "--with", "numpy",
+            "--with", "soundfile", "python", workerPath,
+            "--sample-rate", String(sampleRate), "--channels", String(channels),
+            "--window", "2", "--overlap", "0.5", "--environment", initialEnvironment,
+            "--control-file", controlURL.path,
+            "--device", device,
+        ]
+        process.standardInput = stdinPipe
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+        process.terminationHandler = { [weak self] process in
+            guard let self else { return }
+            self.stateLock.withLockUnchecked { state in
+                if process.terminationStatus != 0 && state.lastError.isEmpty {
+                    state.lastError = "stem worker 退出：\(process.terminationStatus)"
+                }
+            }
+        }
+        installStatusReader()
+        try process.run()
+        startInputPump()
+        startOutputPump()
+    }
+
+    private func installStatusReader() {
+        stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            guard let self else { return }
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            var lines: [String] = []
+            self.stderrLock.lock()
+            self.stderrBuffer.append(data)
+            while let newline = self.stderrBuffer.firstIndex(of: 0x0A) {
+                let lineData = self.stderrBuffer.prefix(upTo: newline)
+                self.stderrBuffer.removeSubrange(...newline)
+                if let line = String(data: lineData, encoding: .utf8) { lines.append(line) }
+            }
+            self.stderrLock.unlock()
+            for line in lines { self.consumeStatus(line) }
+        }
+    }
+
+    private func consumeStatus(_ line: String) {
+        guard line.hasPrefix("STEMSTATUS "),
+              let data = String(line.dropFirst("STEMSTATUS ".count)).data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            if line.lowercased().contains("error") || line.contains("Traceback") {
+                stateLock.withLockUnchecked { $0.lastError = line }
+            }
+            return
+        }
+        stateLock.withLockUnchecked { state in
+            if object["event"] as? String == "ready" { state.ready = true }
+            if object["event"] as? String == "window" {
+                state.windows = ((object["index"] as? Int) ?? state.windows) + 1
+                state.processMs = (object["process_ms"] as? Double) ?? state.processMs
+                state.rtf = (object["rtf"] as? Double) ?? state.rtf
+                state.environment = (object["environment"] as? String) ?? state.environment
+                state.roles = (object["roles"] as? [String: String]) ?? state.roles
+                state.gainsDb = (object["gains_db"] as? [String: Double]) ?? state.gainsDb
+                state.strength = (object["strength"] as? Double) ?? state.strength
+                state.risk = (object["risk"] as? Double) ?? state.risk
+                state.crestDb = (object["crest_db"] as? Double) ?? state.crestDb
+                state.activeStems = (object["active_stems"] as? Int) ?? state.activeStems
+                state.vocalSideRatio = (object["vocal_side_ratio"] as? Double) ?? state.vocalSideRatio
+                state.limiterGain = (object["limiter_gain"] as? Double) ?? state.limiterGain
+            }
+        }
+    }
+
+    func setEnvironment(_ value: String) throws {
+        let valid = ["quiet", "broadband", "keyboard", "wind", "babble"]
+        guard valid.contains(value) else {
+            throw NSError(domain: "StemBridge", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "未知分轨环境：\(value)"])
+        }
+        let data = try JSONSerialization.data(withJSONObject: ["environment": value])
+        try data.write(to: controlURL, options: .atomic)
+        stateLock.withLockUnchecked { $0.environment = value }
+    }
+
+    private func startInputPump() {
+        Thread { [weak self] in
+            guard let self else { return }
+            let framesPerChunk = 2048
+            let planes = (0..<self.channels).map { _ in
+                UnsafeMutableBufferPointer<Float>.allocate(capacity: framesPerChunk)
+            }
+            defer { for plane in planes { plane.deallocate() } }
+            var interleaved = [Float](repeating: 0,
+                                      count: framesPerChunk * self.channels)
+            while self.lifecycleLock.withLockUnchecked({ $0 }) && self.process.isRunning {
+                let read = withUnsafeTemporaryAllocation(
+                    of: UnsafeMutablePointer<Float>.self, capacity: self.channels
+                ) { pointers -> Int in
+                    for channel in 0..<self.channels {
+                        pointers[channel] = planes[channel].baseAddress!
+                    }
+                    return self.inputRing.read(into: pointers.baseAddress!,
+                                               channelCount: self.channels,
+                                               frames: framesPerChunk)
+                }
+                if read == 0 {
+                    usleep(2_000)
+                    continue
+                }
+                for frame in 0..<read {
+                    for channel in 0..<self.channels {
+                        interleaved[frame * self.channels + channel] = planes[channel][frame]
+                    }
+                }
+                let bytes = read * self.channels * MemoryLayout<Float>.size
+                interleaved.withUnsafeBytes { raw in
+                    self.stdinPipe.fileHandleForWriting.write(Data(raw.prefix(bytes)))
+                }
+                self.stateLock.withLockUnchecked { $0.inputFrames += read }
+            }
+        }.start()
+    }
+
+    private func startOutputPump() {
+        Thread { [weak self] in
+            guard let self else { return }
+            let handle = self.stdoutPipe.fileHandleForReading
+            var pending = Data()
+            let bytesPerFrame = self.channels * MemoryLayout<Float>.size
+            while self.lifecycleLock.withLockUnchecked({ $0 }) && self.process.isRunning {
+                let data = handle.availableData
+                if data.isEmpty { break }
+                pending.append(data)
+                let completeBytes = pending.count - (pending.count % bytesPerFrame)
+                if completeBytes == 0 { continue }
+                let frames = completeBytes / bytesPerFrame
+                pending.withUnsafeBytes { raw in
+                    guard let base = raw.baseAddress?.assumingMemoryBound(to: Float.self) else { return }
+                    _ = self.outputRing.writeInterleaved(base, frames: frames)
+                }
+                pending.removeFirst(completeBytes)
+                self.stateLock.withLockUnchecked { $0.outputFrames += frames }
+            }
+        }.start()
+    }
+
+    func waitUntilReady(timeoutSeconds: Double) -> Bool {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            let snapshot = self.snapshot()
+            if snapshot.ready { return true }
+            if !process.isRunning || !snapshot.lastError.isEmpty { return false }
+            usleep(10_000)
+        }
+        return false
+    }
+
+    func snapshot() -> Snapshot { stateLock.withLockUnchecked { $0 } }
+
+    func stop() {
+        lifecycleLock.withLockUnchecked { $0 = false }
+        stderrPipe.fileHandleForReading.readabilityHandler = nil
+        try? stdinPipe.fileHandleForWriting.close()
+        if process.isRunning { process.terminate() }
+        try? FileManager.default.removeItem(at: controlURL)
+    }
+}
+
 // MARK: - Meter
 
 final class Meter: @unchecked Sendable {
@@ -318,8 +545,12 @@ final class ContentMeter: @unchecked Sendable {
 
     private struct State {
         var harshness: Float = 0
+        var transientRisk: Float = 0
         var highRatio: Float = 0
         var midRatio: Float = 0
+        // 24 段歌曲相对谱：最强段为 0 dB，其余为负值。这里只表达
+        // “歌曲此刻在哪些频段有内容”，不冒充校准后的声压/dBFS。
+        var bandShapeDb = [Float](repeating: -60, count: 24)
         var fedFrames = 0
         var analyses = 0
         var windowRms: Float = 0
@@ -339,6 +570,9 @@ final class ContentMeter: @unchecked Sendable {
     private var imagOut: [Float]
     private var mags: [Float]
     private var smoothed: Float = 0
+    private var smoothedTransient: Float = 0
+    private var smoothedBandShapeDb = [Float](repeating: -60, count: 24)
+    private var previousRms: Float = 0
 
     init() {
         let size = ContentMeter.fftSize
@@ -397,7 +631,11 @@ final class ContentMeter: @unchecked Sendable {
         }
 
         var windowEnergy: Float = 0
-        for sample in window { windowEnergy += sample * sample }
+        var windowPeak: Float = 0
+        for sample in window {
+            windowEnergy += sample * sample
+            windowPeak = max(windowPeak, abs(sample))
+        }
         let windowRms = sqrt(windowEnergy / Float(ContentMeter.fftSize))
 
         let bin1k = max(1, Int(Double(ContentMeter.fftSize) * 1000 / sampleRate))
@@ -418,6 +656,28 @@ final class ContentMeter: @unchecked Sendable {
         let highRatio = high / total
         let midRatio = mid / total
 
+        // 把 QQ 音乐当前 1024 点窗压成与 S3 完全同中心频率的 24 段相对谱。
+        // 环境麦与数字歌曲没有共同 SPL 标定，绝不能直接相减绝对 dB；两边都先
+        // 归一到各自最强段，再由 S3 宽带电平单独决定掩蔽强度。
+        var bandPower = [Float](repeating: 0, count: bandCenters.count)
+        var bandIndex = 0
+        for bin in 1..<bins {
+            let frequency = Float(Double(bin) * sampleRate / Double(ContentMeter.fftSize))
+            while bandIndex + 1 < bandCenters.count {
+                let boundary = sqrt(bandCenters[bandIndex] * bandCenters[bandIndex + 1])
+                if frequency <= boundary { break }
+                bandIndex += 1
+            }
+            bandPower[bandIndex] += mags[bin]
+        }
+        let maxBandPower = max(bandPower.max() ?? 0, 1e-12)
+        for index in 0..<bandPower.count {
+            let relativeDb = max(-60, 10 * log10(max(bandPower[index], 1e-12) / maxBandPower))
+            let coefficient: Float = relativeDb > smoothedBandShapeDb[index] ? 0.35 : 0.12
+            smoothedBandShapeDb[index] +=
+                (relativeDb - smoothedBandShapeDb[index]) * coefficient
+        }
+
         // 亮度项：高频能量占比越高越该收；人声项：1–4 kHz 占比高（稀疏人声）时少收。
         let bright = min(max((highRatio - 0.10) / 0.30, 0), 1)
         let voiced = min(max(midRatio / 0.45, 0), 1)
@@ -427,17 +687,34 @@ final class ContentMeter: @unchecked Sendable {
         let alpha: Float = target > smoothed ? 0.30 : 0.10
         smoothed += (target - smoothed) * alpha
 
+        // 瞬态风险：鼓点、钢琴起音、拨弦会同时表现为高 crest
+        // factor 或窗能量突增。这里只用它收缩正增益，不做压缩或
+        // 切断瞬态，因此判高的失败模式是“更接近原声”。
+        let crest = windowRms > 1e-6 ? windowPeak / windowRms : 0
+        let crestRisk = min(max((crest - 3.0) / 7.0, 0), 1)
+        let riseRatio = previousRms > 1e-6 ? windowRms / previousRms : 1
+        let riseRisk = min(max((riseRatio - 1.4) / 2.6, 0), 1)
+        let transientTarget = max(crestRisk, riseRisk)
+        let transientAlpha: Float = transientTarget > smoothedTransient ? 0.55 : 0.08
+        smoothedTransient += (transientTarget - smoothedTransient) * transientAlpha
+        previousRms = windowRms
+
         lock.withLockUnchecked { state in
             state.harshness = smoothed
+            state.transientRisk = smoothedTransient
             state.highRatio = highRatio
             state.midRatio = midRatio
+            state.bandShapeDb = smoothedBandShapeDb
             state.windowRms = windowRms
             state.fill = windowFill
         }
     }
 
-    func snapshot() -> (harshness: Float, highRatio: Float, midRatio: Float, fedFrames: Int, analyses: Int, windowRms: Float, fill: Int) {
-        lock.withLockUnchecked { ($0.harshness, $0.highRatio, $0.midRatio, $0.fedFrames, $0.analyses, $0.windowRms, $0.fill) }
+    func snapshot() -> (harshness: Float, transientRisk: Float, highRatio: Float, midRatio: Float, bandShapeDb: [Float], fedFrames: Int, analyses: Int, windowRms: Float, fill: Int) {
+        lock.withLockUnchecked {
+            ($0.harshness, $0.transientRisk, $0.highRatio, $0.midRatio,
+             $0.bandShapeDb, $0.fedFrames, $0.analyses, $0.windowRms, $0.fill)
+        }
     }
 }
 
@@ -715,10 +992,15 @@ final class EqState: @unchecked Sendable {
         //: 基线缩放系数（0 = 完全平直）。S3 报 FLAT（安静/对话）时 host 下发 0，
         //: 保证"安静时完全没有 EQ 动作"（2026-10-23 用户口径）。
         var baseGain: Float = 1.0
+        var ambientBands = [Float](repeating: -120, count: 24)
+        var ambientBroadbandDbfs: Float = -120
+        var maskingEnabled = false
     }
     private let lock = OSAllocatedUnfairLock(initialState: State())
 
-    func update(bands: [Float], depth: Float, mediaPercent: Float, baseGain: Float = 1.0) {
+    func update(bands: [Float], depth: Float, mediaPercent: Float,
+                baseGain: Float = 1.0, ambientBands: [Float] = [],
+                ambientBroadbandDbfs: Float = -120, maskingEnabled: Bool = false) {
         lock.withLockUnchecked { state in
             for index in 0..<24 where index < bands.count {
                 state.sourceBands[index] = bands[index]
@@ -726,6 +1008,11 @@ final class EqState: @unchecked Sendable {
             state.depth = clamp(depth, 0, 4)
             state.mediaPercent = clamp(mediaPercent, 0, 100)
             state.baseGain = clamp(baseGain, 0, 1)
+            if ambientBands.count == 24 {
+                state.ambientBands = ambientBands
+            }
+            state.ambientBroadbandDbfs = ambientBroadbandDbfs
+            state.maskingEnabled = maskingEnabled && ambientBands.count == 24
         }
     }
 
@@ -750,10 +1037,11 @@ final class EqState: @unchecked Sendable {
         }
     }
 
-    func snapshot() -> (bands: [Float], depth: Float, bypass: Bool, mediaPercent: Float, mode: String, baseGain: Float) {
+    func snapshot() -> (bands: [Float], depth: Float, bypass: Bool, mediaPercent: Float, mode: String, baseGain: Float, ambientBands: [Float], ambientBroadbandDbfs: Float, maskingEnabled: Bool) {
         lock.withLockUnchecked { state in
             return (state.sourceBands, state.depth, state.bypass, state.mediaPercent,
-                    state.mode, state.baseGain)
+                    state.mode, state.baseGain, state.ambientBands,
+                    state.ambientBroadbandDbfs, state.maskingEnabled)
         }
     }
 }
@@ -768,6 +1056,9 @@ struct Options {
     var abSeconds: Double = 0
     var reportSeconds: Double = 1
     var demo = false
+    var stemWorker = ""
+    var stemEnvironment = "broadband"
+    var stemDevice = "mps"
 }
 
 func parseOptions() -> Options {
@@ -782,6 +1073,15 @@ func parseOptions() -> Options {
             if index < arguments.count { options.app = arguments[index] }
         case "--demo":
             options.demo = true
+        case "--stem-worker":
+            index += 1
+            if index < arguments.count { options.stemWorker = arguments[index] }
+        case "--stem-environment":
+            index += 1
+            if index < arguments.count { options.stemEnvironment = arguments[index] }
+        case "--stem-device":
+            index += 1
+            if index < arguments.count { options.stemDevice = arguments[index] }
         case "--bands":
             index += 1
             if index < arguments.count {
@@ -823,6 +1123,29 @@ do {
     exit(2)
 }
 
+var stemBridge: StemBridge? = nil
+if !options.stemWorker.isEmpty {
+    let bridge = StemBridge(
+        inputRing: capture.ring,
+        sampleRate: Int(capture.sampleRate.rounded()),
+        channels: capture.channels,
+        workerPath: options.stemWorker,
+        environment: options.stemEnvironment,
+        device: options.stemDevice)
+    do {
+        try bridge.start()
+    } catch {
+        emitError("stem worker 启动失败：\(error.localizedDescription)")
+        exit(2)
+    }
+    guard bridge.waitUntilReady(timeoutSeconds: 20) else {
+        emitError("stem worker 20 秒内未就绪：\(bridge.snapshot().lastError)")
+        bridge.stop()
+        exit(2)
+    }
+    stemBridge = bridge
+}
+
 // 先启动 tap，再创建 AVAudioEngine。实测：如果先建/准备 engine，
 // 聚合设备的 AudioDeviceStart 会返回 1852797029 ('nope')、coreaudiod 报
 // "no master engine info"；先起 tap 再起 engine 则正常。
@@ -834,6 +1157,7 @@ do {
 }
 
 let sourceFormat = capture.format
+let playbackRing = stemBridge?.outputRing ?? capture.ring
 let engine = AVAudioEngine()
 let outputFormat = engine.outputNode.outputFormat(forBus: 0)
 // 采样率不匹配（tap 48 kHz vs 蓝牙设备 44.1 kHz 等）：消费端重采样。
@@ -891,7 +1215,7 @@ let sourceNode = AVAudioSourceNode(format: nodeFormat) { _, _, frameCount, audio
                 for channel in 0..<inChannels {
                     pointers[channel] = inBuffer.floatChannelData![channel]
                 }
-                return capture.ring.read(into: pointers.baseAddress!,
+                return playbackRing.read(into: pointers.baseAddress!,
                                          channelCount: inChannels, frames: needIn)
             }
             resampleInputAccum -= Double(read)
@@ -964,7 +1288,7 @@ let sourceNode = AVAudioSourceNode(format: nodeFormat) { _, _, frameCount, audio
             count += 1
         }
         guard count > 0, let base = pointers.baseAddress else { return 0 }
-        return capture.ring.read(into: base, channelCount: count, frames: frames)
+        return playbackRing.read(into: base, channelCount: count, frames: frames)
     }
     consumed.add(frames: read)
     if read < frames {
@@ -1010,8 +1334,19 @@ var cleanedUp = false
 var trimmedHarshness: Float = 0
 //: 输出削波时对**正增益动态部分**的收缩量（0…2 dB，50 ms 一拍调整）。
 var outHeadroomTrimDb: Float = 0
+//: EQ 之后峰值超过 0 dBFS 时的输出余量。这是一个零延迟的
+//: 后级增益，比“猜哪个步进逐能少抬多少”可靠；高峰过了快降，
+//: 下降后慢慢恢复，避免音量抽动。
+var outputHeadroomGain: Float = 0.80
+var latestOutPeak: Float = 0
 var smoothedBaseGain: Float = 1.0
 var lastEnvExposure: Float = 0
+// S3 24 段环境谱 × QQ 音乐 24 段内容谱。它只产生小幅、逐段的掩蔽补偿；
+// 不等待分轨、不改时间轴。攻快放慢，避免环境分类/麦克风谱抖成“颤音 EQ”。
+var maskingBands = [Float](repeating: 0, count: 24)
+var maskingExposure: Float = 0
+var maskingActiveBands = 0
+var maskingPeakDb: Float = 0
 
 func applyEq(_ state: EqState) {
     let snapshot = state.snapshot()
@@ -1031,6 +1366,51 @@ func applyEq(_ state: EqState) {
     // 基线平滑：S3 切 FLAT（安静/对话）时 baseGain 0↔1 平滑过渡，避免硬切。
     smoothedBaseGain += (snapshot.baseGain - smoothedBaseGain) * 0.15
     let baseGain = smoothedBaseGain
+
+    // 真正的逐段掩蔽矩阵。麦克风环境谱和数字歌曲谱不在同一绝对标尺上，
+    // 所以只比较各自的“谱形”；总动作量只由 S3 宽带电平控制。
+    // 失败模式是回到原声：缺 24 段、FLAT、低电平时所有目标都为 0。
+    let spectrumReady = snapshot.maskingEnabled
+        && snapshot.ambientBands.count == 24
+        && content.bandShapeDb.count == 24
+    let exposureTarget = spectrumReady
+        ? clamp((snapshot.ambientBroadbandDbfs + 58.0) / 22.0, 0, 1)
+        : 0
+    maskingExposure += (exposureTarget - maskingExposure)
+        * (exposureTarget > maskingExposure ? 0.18 : 0.05)
+    let noiseMax = snapshot.ambientBands.max() ?? -120
+    maskingActiveBands = 0
+    maskingPeakDb = 0
+    for index in 0..<24 {
+        var target: Float = 0
+        if spectrumReady && noiseMax > -119 {
+            let noiseRelative = snapshot.ambientBands[index] - noiseMax
+            let songRelative = content.bandShapeDb[index]
+            let noiseProminence = clamp((noiseRelative + 18.0) / 18.0, 0, 1)
+            let songPresence = clamp((songRelative + 24.0) / 24.0, 0, 1)
+            // 噪声在该段比歌曲更突出时，补偿才加深；歌曲完全没有内容时不抬残响/底噪。
+            let deficit = clamp((noiseRelative - songRelative - 3.0) / 15.0, 0, 1)
+            // 旧版把三个 0…1 因子直接相乘，真机在 -28 dBFS 高噪声下最大仍只有
+            // +0.13 dB，客观上不可闻。保留“噪声和歌曲都在该段才动”的选择性，但用
+            // 两者较小值表达重叠。用户明确要求不只中频：低频、乐器区、人声区和高频
+            // 只要遮蔽证据成立，都允许进入至少 2 dB 的可听调节。
+            let overlap = min(noiseProminence, songPresence)
+            let need = 0.45 + 0.55 * deficit
+            let budget: Float = index < 4 ? 2.35 : (index >= 19 ? 2.35 : 2.50)
+            // Demo 要让用户能在一次切换里确认方向：重叠证据成立后提高到可听区间，
+            // 但仍由每段 budget 硬封顶。强重叠时反推瞬态安全门前的目标，让安全门后
+            // 仍约为 2 dB；真正的强瞬态允许临时低于 2 dB，优先不打碎鼓点/钢琴起音。
+            target = min(budget, maskingExposure * overlap * need * budget * 2.2)
+            if maskingExposure >= 0.65 && overlap >= 0.25 {
+                let transientScale = max(0.25, 1.0 - 0.75 * content.transientRisk)
+                target = max(target, min(budget, 2.15 / transientScale))
+            }
+        }
+        let coefficient: Float = target > maskingBands[index] ? 0.18 : 0.05
+        maskingBands[index] += (target - maskingBands[index]) * coefficient
+        if maskingBands[index] > 0.05 { maskingActiveBands += 1 }
+        maskingPeakDb = max(maskingPeakDb, maskingBands[index])
+    }
     for index in 0..<24 {
         currentBands[index] += (snapshot.bands[index] - currentBands[index]) * 0.25
         let base: Float
@@ -1050,18 +1430,37 @@ func applyEq(_ state: EqState) {
             }
         }
         // 正增益的"动态部分"在输出削波时收缩（负增益不动：削减永远安全）。
-        var dynamic = currentBands[index] * snapshot.depth
+        var dynamic = currentBands[index] * snapshot.depth + maskingBands[index]
         if dynamic > 0 && outHeadroomTrimDb > 0 {
             dynamic = max(0, dynamic - outHeadroomTrimDb)
         }
         // 正增益总预算：base + extra + 动态 三者相加后封顶 maxBoostDb（负方向仍到
         // -maxAppliedGainDb）。这是"听清歌曲"的硬约束：掩蔽不许把静态抬升堆到 6 dB。
-        let target = min(clamp(base + extra + dynamic,
+        var target = min(clamp(base + extra + dynamic,
                                -maxAppliedGainDb, maxAppliedGainDb), maxBoostDb)
+        // 强瞬态时不去抬鼓点/钢琴起音；只收缩正增益，负向去糊
+        // 保持不变。最强时收掉 75%，不会因为一个鼓点把音色硬切。
+        if target > 0 {
+            target *= 1.0 - 0.75 * content.transientRisk
+        }
         eq.bands[index].gain = target
         appliedBands[index] = target
     }
     eq.bypass = snapshot.bypass
+    // 可听掩蔽档会把重点段推到 1–1.8 dB；后级峰值目标从 -0.5 dBFS
+    // 收紧到约 -0.9 dBFS，避免用零星削波换取“听起来有变化”。
+    let feedbackTarget = latestOutPeak > 0.001 ? min(1.0, 0.90 / latestOutPeak) : 1.0
+    let sourcePeak = Float(capture.meter.snapshot().peak)
+    let maxPositive = appliedBands.reduce(Float(0)) { max($0, $1) }
+    let predictedPeak = max(sourcePeak, 0.001) * pow(10.0, maxPositive / 20.0)
+    let predictedTarget = min(1.0, 0.94 / predictedPeak)
+    let peakTarget = min(feedbackTarget, predictedTarget)
+    let peakCoefficient: Float = peakTarget < outputHeadroomGain ? 0.60 : 0.015
+    outputHeadroomGain += (peakTarget - outputHeadroomGain) * peakCoefficient
+    // 必须放在 EQ 链里，不能只改 mainMixer.outputVolume：后者不一定被
+    // 下方的输出 tap 测到，上一版事实上就没有形成反馈回路。EQ 链里的
+    // globalGain 不增加算法延迟，且测到就能下一拍收紧。
+    eq.globalGain = 20.0 * log10(clamp(outputHeadroomGain, 0.5, 1.0))
     engine.mainMixerNode.outputVolume = clamp(snapshot.mediaPercent / 100.0, 0, 1)
 }
 
@@ -1070,6 +1469,7 @@ func cleanup() {
     cleanedUp = true
     engine.stop()
     capture.stop()
+    stemBridge?.stop()
 }
 
 func quit(_ reason: String) {
@@ -1083,7 +1483,8 @@ func quit(_ reason: String) {
 // 首次 render 回调只能拿到几百帧 -> AVAudioConverter 输出不足 -> 静音填充造成
 // 周期性"刷"声。等 ring 积累 ≥ 0.5 s（24000 帧 @48k）再起引擎；上限 3 s 防挂死。
 var prerollWaitedMs = 0
-while capture.ring.fillCount < 24000 && prerollWaitedMs < 3000 {
+let prerollLimitMs = stemBridge == nil ? 3000 : 8000
+while playbackRing.fillCount < 24000 && prerollWaitedMs < prerollLimitMs {
     usleep(10_000)
     prerollWaitedMs += 10
 }
@@ -1118,6 +1519,9 @@ emit([
     "mode": state.snapshot().mode,
     "resampling": needResample,
     "engine_rate": Double(nodeFormat.sampleRate),
+    "stem_stream": stemBridge != nil,
+    "stem_environment": options.stemEnvironment,
+    "stem_preroll_ms": prerollWaitedMs,
 ])
 
 // stdin：和 player 一样按行 JSON。读不到 stdin（EOF）不退出，方便用 --seconds 做试听。
@@ -1132,10 +1536,19 @@ Thread {
         case "eq":
             let rawBands = (object["bands"] as? [Double]) ?? []
             let bands = (0..<24).map { $0 < rawBands.count ? Float(rawBands[$0]) : 0 }
+            let rawAmbient = (object["ambient_band_dbfs"] as? [Double]) ?? []
+            let ambientBands = (0..<24).map {
+                $0 < rawAmbient.count ? Float(rawAmbient[$0]) : -120
+            }
             let depth = Float((object["depth"] as? Double) ?? 2.5)
             let media = Float((object["media_percent"] as? Double) ?? 100)
             let baseGain = Float((object["base_gain"] as? Double) ?? 1.0)
-            state.update(bands: bands, depth: depth, mediaPercent: media, baseGain: baseGain)
+            let ambientBroadband = Float((object["ambient_broadband_dbfs"] as? Double) ?? -120)
+            let maskingEnabled = (object["masking_enabled"] as? Bool) ?? false
+            state.update(bands: bands, depth: depth, mediaPercent: media,
+                         baseGain: baseGain, ambientBands: ambientBands,
+                         ambientBroadbandDbfs: ambientBroadband,
+                         maskingEnabled: maskingEnabled)
         case "flat":
             state.flat()
         case "bypass":
@@ -1145,6 +1558,13 @@ Thread {
                 state.setMode(value)
             } else {
                 emitError("mode 只接受 basic 或 aggressive")
+            }
+        case "stem_environment":
+            if let value = object["value"] as? String, let bridge = stemBridge {
+                do { try bridge.setEnvironment(value) }
+                catch { emitError(error.localizedDescription) }
+            } else {
+                emitError("分轨未启用或缺少环境值")
             }
         case "status":
             let snapshot = state.snapshot()
@@ -1165,6 +1585,7 @@ var stallStreak = 0
 let controlTimer = Timer(timeInterval: 0.05, repeats: true) { _ in
     // 先看上一拍 EQ 之后有没有削波：有就收缩正增益预算（最快 1.4 dB/s），输出干净则慢回。
     let out = outMeter.take()
+    latestOutPeak = Float(out.peak)
     // D54（2026-10-28 现场"歌曲声音忽大忽小"）：headroom 的回落要**很慢**。原来 0.02/50ms
     // （≈0.4 dB/s）会在响/静交替的段落里来回收缩又放开，听成音量抽动；改成 0.004/50ms
     // （≈0.08 dB/s，20 s 才回 1 dB），收紧仍然快（秒级），避免削波。
@@ -1178,7 +1599,9 @@ let controlTimer = Timer(timeInterval: 0.05, repeats: true) { _ in
     // 设备 44.1 kHz），消费端永远比生产端慢，ring 持续积满 → 丢帧 = 用户听到的抖动。
     // 连续 3 秒 fill > 80% 就判定不匹配：退出并销毁 tap，让 QQ 音乐原声恢复（fail-open）。
     // 治本（消费端重采样）单独做；这里保证 44.1 kHz 设备上至少能正常听歌、不抖。
-    if capture.ring.fillCount > capture.ring.capacity * 8 / 10 {
+    let inputBacklog = capture.ring.fillCount > capture.ring.capacity * 8 / 10
+    let outputBacklog = playbackRing.fillCount > playbackRing.capacity * 8 / 10
+    if inputBacklog || outputBacklog {
         stallStreak += 1
         if stallStreak >= 60 {
             quit("ring 持续积压（多为输出设备配置变化），退出重建")
@@ -1195,6 +1618,7 @@ if options.reportSeconds > 0 {
         let meter = capture.meter.snapshot()
         let snapshot = state.snapshot()
         let content = capture.content.snapshot()
+        let stem = stemBridge?.snapshot()
         emit([
             "event": "state",
             "rms": meter.rms,
@@ -1208,22 +1632,49 @@ if options.reportSeconds > 0 {
             "media_percent": Double(snapshot.mediaPercent),
             "bypass": snapshot.bypass,
             "mode": snapshot.mode,
+            "base_gain": Double(snapshot.baseGain),
             "bands": snapshot.bands.map { Double($0) },
             "applied_bands": appliedBands.map { Double($0) },
             "content_harshness": Double(content.harshness),
+            "content_transient_risk": Double(content.transientRisk),
             "content_high_ratio": Double(content.highRatio),
             "content_mid_ratio": Double(content.midRatio),
+            "content_band_shape_db": content.bandShapeDb.map { Double($0) },
             "content_fed_frames": content.fedFrames,
             "content_analyses": content.analyses,
             "content_window_rms": Double(content.windowRms),
             "content_fill": content.fill,
             "out_ring_fill": resampleOutRing.fillCount,
+            "stem_stream": stemBridge != nil,
+            "stem_environment": stem?.environment ?? options.stemEnvironment,
+            "stem_ready": stem?.ready ?? false,
+            "stem_windows": stem?.windows ?? 0,
+            "stem_process_ms": stem?.processMs ?? 0,
+            "stem_rtf": stem?.rtf ?? 0,
+            "stem_input_frames": stem?.inputFrames ?? 0,
+            "stem_output_frames": stem?.outputFrames ?? 0,
+            "stem_output_fill": stemBridge?.outputRing.fillCount ?? 0,
+            "stem_error": stem?.lastError ?? "",
+            "stem_roles": stem?.roles ?? [:],
+            "stem_gains_db": stem?.gainsDb ?? [:],
+            "stem_strength": stem?.strength ?? 0,
+            "stem_risk": stem?.risk ?? 0,
+            "stem_crest_db": stem?.crestDb ?? 0,
+            "stem_active_stems": stem?.activeStems ?? 0,
+            "stem_vocal_side_ratio": stem?.vocalSideRatio ?? 0,
+            "stem_limiter_gain": stem?.limiterGain ?? 1,
             "content_env_exposure": Double(lastEnvExposure),
             "content_trim": Double(trimmedHarshness),
+            "masking_matrix_enabled": snapshot.maskingEnabled,
+            "masking_exposure": Double(maskingExposure),
+            "masking_active_bands": maskingActiveBands,
+            "masking_peak_db": Double(maskingPeakDb),
+            "masking_bands": maskingBands.map { Double($0) },
             "out_peak": outMeter.totals().peak,
             "out_clip_frames": outMeter.totals().clipFrames,
             "out_frames": outMeter.totals().frames,
             "headroom_trim_db": Double(outHeadroomTrimDb),
+            "output_headroom_gain": Double(outputHeadroomGain),
         ])
     }
     RunLoop.main.add(reportTimer!, forMode: .common)

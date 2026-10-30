@@ -6,6 +6,10 @@ set -e
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 SWIFTC="${SWIFTC:-swiftc}"
 command -v "$SWIFTC" >/dev/null 2>&1 || { echo "找不到 swiftc" >&2; exit 1; }
-"$SWIFTC" -O "$ROOT/systemeq.swift" -o "$ROOT/systemeq" \
+TARGET="${SWIFT_TARGET:-$(uname -m)-apple-macosx15.0}"
+MODULE_CACHE="${TMPDIR:-/tmp}/cores3-swift-module-cache"
+mkdir -p "$MODULE_CACHE"
+"$SWIFTC" -target "$TARGET" -module-cache-path "$MODULE_CACHE" \
+  -O "$ROOT/systemeq.swift" -o "$ROOT/systemeq" \
   -framework CoreAudio -framework AVFoundation -framework AppKit
 echo "已构建：$ROOT/systemeq"
