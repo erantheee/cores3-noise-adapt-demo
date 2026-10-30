@@ -80,3 +80,9 @@ add_test(NAME speech_gate_test COMMAND speech_gate_test)
 add_executable(dual_mic_test dual_mic_test.cpp)
 target_include_directories(dual_mic_test PRIVATE ../main)
 add_test(NAME dual_mic_test COMMAND dual_mic_test)
+
+# 「歌是 Mac 放的」状态（B1）：host 每 1 s 续期 `music on`，TTL 失效必须 fail-open。
+# 这个旗标错了不会崩，只会让设备永久以为歌在放——所以时序要在主机上钉死。
+add_executable(music_state_test music_state_test.cpp)
+target_include_directories(music_state_test PRIVATE ../main)
+add_test(NAME music_state_test COMMAND music_state_test)

@@ -23,6 +23,7 @@
 #include "imu.hpp"
 #include "mic_capture.hpp"
 #include "mic_decimator.hpp"
+#include "music_state.hpp"
 #include "sdkconfig.h"
 #include "sound_event.hpp"
 
@@ -115,6 +116,13 @@ constexpr int64_t kDialogVetoDefaultTtlMs = 20000;
 /// 上限：防御坏行把对话态锁死太久。
 constexpr int64_t kDialogVetoMaxTtlMs = 120000;
 
+// ---- 「歌是 Mac 放的」状态（阶段二/B1，2026-10-30）：`music on|off [ttl_ms]` 控制行 ----
+// 为什么需要：S3 听到的环境谱里混着自己放的歌，设备分不清"环境里有音乐"和"我自己放
+// 出来的音乐"。host 在歌真的在播时每 1 s 续期一次 `music on 3000`，TTL 失效自动回到
+// 没在放歌（fail-open）。**v1 只进遥测 `music_playing`**：设备侧对话/背景人声判据这一版
+// 明确不动——没有真机数据就改阈值，最可能把真实对话一起压掉。门控等 B2/B3 现场数据。
+music::State g_music;
+
 // ---- 键盘瞬态 → "正在打字"证据（D53，2026-10-28）----
 // 为什么需要：肩上/近耳位置，1 s 事件窗的 keyboard 命中率只有 15–20%（贴键盘时 52%），
 // 键盘掩蔽（D48）因此时有时无/节奏对不上；而同一位置帧内瞬态（NoiseAnalyzer 的
@@ -204,6 +212,9 @@ void emit_command_json(const EarbudCommand& command) {
                 "\"dialog_veto\":%s,"
                 // D53（追加可选键）：这一拍是否判为"正在打字"（帧内瞬态 + 1 s 窗口）。
                 "\"typing_active\":%s,"
+                // B1（追加可选键）：设备是否处于 host `music on` 的 TTL 内，即
+                // "Mac 正在放歌、S3 听到的可能是自己放的歌"。缺这个键 = B1 之前的固件。
+                "\"music_playing\":%s,"
                 "\"execution\":\"decision_only\",\"link\":\"simulated\","
                 "\"eq_gain_db\":[",
                 static_cast<unsigned long>(command.schema_version),
@@ -242,7 +253,8 @@ void emit_command_json(const EarbudCommand& command) {
                 g_voiceprint_self ? "true" : "false",
                 voiceprint_age_ms,
                 dialog_veto_active ? "true" : "false",
-                g_typing_active ? "true" : "false");
+                g_typing_active ? "true" : "false",
+                g_music.playing(esp_timer_get_time()) ? "true" : "false");
     for (std::size_t band = 0; band < kBandCount; ++band) {
         std::printf("%s%.1f", band == 0 ? "" : ",", static_cast<double>(command.eq_gain_db[band]));
     }
@@ -481,6 +493,28 @@ bool poll_console_command() {
                     } else if (std::strncmp(value, "yes", 3) == 0) {
                         g_dialog_veto_until_us = 0;
                         std::printf("dialog ack yes\n");
+                        handled = true;
+                    }
+                } else if (std::strncmp(g_console_line, "music ", 6) == 0) {
+                    // B1（2026-10-30）：`music on [ttl_ms]` / `music off`。v1 只更新遥测用的
+                    // 「歌是 Mac 放的」状态（见 main/music_state.hpp），不改对话/背景人声判据。
+                    // 先按同一套缺省/上限算出 effective 再回 ack，host 拿到的就是实际生效值。
+                    const char* value = g_console_line + 6;
+                    if (std::strncmp(value, "on", 2) == 0) {
+                        long ttl_ms = 0;
+                        const int parsed = std::sscanf(value + 2, "%ld", &ttl_ms);
+                        int64_t effective = (parsed == 1 && ttl_ms > 0)
+                                                ? static_cast<int64_t>(ttl_ms)
+                                                : music::kDefaultTtlMs;
+                        if (effective > music::kMaxTtlMs) {
+                            effective = music::kMaxTtlMs;
+                        }
+                        g_music.on(esp_timer_get_time(), effective);
+                        std::printf("music ack on %lld\n", static_cast<long long>(effective));
+                        handled = true;
+                    } else if (std::strncmp(value, "off", 3) == 0) {
+                        g_music.off();
+                        std::printf("music ack off\n");
                         handled = true;
                     }
                 } else if (std::strcmp(g_console_line, "route offline") == 0) {
