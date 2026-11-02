@@ -145,7 +145,12 @@ mkdir -p "$(dirname "$LOG")"
 if command -v setsid >/dev/null 2>&1; then
     nohup setsid "$PY" -u -m host "$@" >>"$LOG" 2>&1 &
 else
-    nohup "$PY" -u -m host "$@" >>"$LOG" 2>&1 &
+    # macOS has no setsid utility. nohup alone keeps the parent's process group.
+    "$PY" -c 'import subprocess, sys
+with open(sys.argv[1], "ab", buffering=0) as log:
+    subprocess.Popen(sys.argv[2:], stdin=subprocess.DEVNULL, stdout=log,
+                     stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
+' "$LOG" "$PY" -u -m host "$@"
 fi
 disown 2>/dev/null || true
 
