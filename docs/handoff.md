@@ -17,7 +17,7 @@
 - Mock render 69/69; four-stem/fingerprint/bypass render 81/81.
 - Role policy 6/6; worker components 3/3; scene/capture pipeline 2/2 (synthetic fixtures, not field evidence).
 - User reports host restarted and separating. 16:16 startup log confirms serial source + Qwen config; live snapshot/browser blocked, actual stem/build still unverified. Did not kill/flash/restart.
-- Escalation for local HTTP tests rejected because automatic approval model was unavailable; it was an approval-service failure, not a safety verdict. Local commits made; no push.
+- Provider config now reads openai, but approval still fails: codex-auto-review unavailable. Local HTTP denied; no runtime confirmation. Read-only terminal collector: chat outputs/check_live_host.py. Local commits made; no push.
 
 ## Next
 1. Restore local endpoint/process access; rerun full host suite and save live startup config before deployment.
