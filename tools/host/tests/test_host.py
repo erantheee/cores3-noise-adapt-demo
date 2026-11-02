@@ -84,6 +84,8 @@ from host.__main__ import (  # noqa: E402
     DialogOverrideLink,
     MusicKeepalive,
     masking_dose_for,
+    masking_matrix_enabled_for,
+    memo_scene_for,
     music_is_playing,
     song_eq_depth,
     DialogueTurnGate,
@@ -515,6 +517,46 @@ def test_context_model_frame() -> None:
     check(not legacy.problems, f"没有情境字段的旧帧不应有异常（实得 {legacy.problems}）")
     eq(legacy.value.context, None, "旧帧的 context 为 None（不是空串）")
     eq(legacy.value.context_valid, None, "旧帧的 context_valid 为 None：区分没报与报了假")
+
+
+def test_scene_model_frame() -> None:
+    """环境场景（scene_classifier.hpp）：四键一组，valid=false 只准报 unknown。
+
+    这是“情境”卡的新主值。九分类仍是同一个窗里的独立遥测，二者不能合用一个 valid。
+    """
+    base = (
+        '"type":"earbud_command","schema":4,"sequence":9,"timestamp_ms":900,'
+        '"speech_gain_db":0.00,"external_voice_gain_db":0.00,"media_percent":100,'
+        '"state":"OBSERVING","environment":"NOISY","confidence":0.80,'
+        '"own_voice_confidence":0.05,"link":"simulated","context":"other","context_score":0.740,'
+        '"context_valid":true,"context_us":160'
+    )
+    valid = parse_line("{" + base + ',"scene":"street","scene_score":0.913,'
+                       '"scene_valid":true,"scene_us":41}')
+    check(not valid.problems, f"有效场景帧不应有异常（实得 {valid.problems}）")
+    eq(valid.value.scene, "street", "场景类别原样读出")
+    close(valid.value.scene_score, 0.91, "场景置信度按两位小数读入")
+    eq(valid.value.scene_valid, True, "scene_valid 读为布尔真")
+    eq(valid.value.scene_us, 41, "场景头前向耗时原样读出")
+
+    warm = parse_line(
+        '{"type":"earbud_command","schema":4,"sequence":1,"timestamp_ms":100,'
+        '"speech_gain_db":0.00,"external_voice_gain_db":0.00,"media_percent":100,'
+        '"state":"OBSERVING","environment":"QUIET","confidence":0.80,'
+        '"own_voice_confidence":0.05,"link":"simulated","scene":"unknown","scene_score":0.000,'
+        '"scene_valid":false,"scene_us":0}'
+    )
+    check(not warm.problems, f"场景预热帧不应有异常（实得 {warm.problems}）")
+    eq(warm.value.scene_valid, False, "预热帧 scene_valid 为假")
+    eq(warm.value.scene, "unknown", "预热帧报占位类别")
+
+    bad = parse_line("{" + base + ',"scene":"office","scene_score":0.9,'
+                     '"scene_valid":true,"scene_us":40}')
+    check(any("未知场景类别" in item for item in bad.problems),
+          f"未知场景类别必须报异常（实得 {bad.problems}）")
+    partial = parse_line("{" + base + ',"scene":"market","scene_score":0.8}')
+    check(any("场景字段只报了一部分" in item for item in partial.problems),
+          f"场景四键缺一必须报异常（实得 {partial.problems}）")
 
 
 def test_context_mixed_fields() -> None:
@@ -2320,7 +2362,11 @@ def test_eq_mode_and_bypass_control() -> None:
         httpd.server_close()
         thread.join(timeout=3)
 
-    # systemeq 服务的字段校验：非法档位在发进程之前就被拒。
+
+
+def test_systemeq_execution_contract() -> None:
+    from host.systemeq import SystemEqError, SystemEqService
+    # 独立于 HTTP：字段校验、分轨回退和实际执行器回执。
     service = SystemEqService(autostart=False)
     try:
         service.command("mode", value="loud")
@@ -2337,6 +2383,12 @@ def test_eq_mode_and_bypass_control() -> None:
     sent: list[dict] = []
     service._process = _FakePlayerProcess()  # type: ignore[assignment]
     service._send = lambda payload: sent.append(payload)  # type: ignore[assignment]
+    service._ready = {"build_sha256": "abc123", "build_size": 246000}
+    service._state = {"rms": 0.1, "bypass": False, "applied_bands": [0.0] * 24}
+    service._state_at = time.monotonic()
+    build_snapshot = service.snapshot()
+    eq(build_snapshot["build_sha256"], "abc123", "快照回显实际执行器 SHA")
+    eq(build_snapshot["build_size"], 246000, "快照回显实际执行器大小")
     ambient = [-70.0 + index for index in range(24)]
     check(
         service.apply_decision(
@@ -2371,8 +2423,8 @@ def test_eq_mode_and_bypass_control() -> None:
         "曲线不变但环境谱变化时仍必须立即下发",
     )
 
-    # Demucs 分轨已经把 ring 塞满时，重启不会恢复实时性，
-    # 只会重复“断流→积压→重启”。必须本次 host 直接熔断。
+    # Demucs 分轨把 ring 塞满时，卸掉分轨并在下一次重试回到 24 段 EQ；
+    # 不能把整个 QQ 音乐执行端永久锁死，否则媒体卡也会消失。
     stem_service = SystemEqService(autostart=False, stem_worker="/tmp/stem-worker")
 
     class QuittingProcess:
@@ -2381,12 +2433,41 @@ def test_eq_mode_and_bypass_control() -> None:
             + "\n"
         ])
 
+        @staticmethod
+        def poll():
+            return 0
+
     stem_service._process = QuittingProcess()  # type: ignore[assignment]
     stem_service._read_stdout()
+    eq(stem_service.stem_worker, None, "分轨积压后必须卸掉 worker，避免继续断流")
+    eq(stem_service._no_auto_restart, None, "分轨积压不能把整个执行端永久禁用")
+    check("切回 24 段 EQ" in stem_service.reason, "失败原因要明确说明已回退")
+    check(stem_service._stem_fallback_reason.endswith("退出重建"),
+          "保留原始积压原因供面板诊断")
+    check(stem_service.snapshot()["stem_requested"] is True,
+          "回退后仍保留用户请求分轨的配置")
+    check(stem_service.snapshot()["stem_stream"] is False,
+          "回退后快照必须如实报告分轨已关闭")
+
+    # 分轨只改变声部组成，S3 24 段与事件包络仍必须进入同一个执行端。
+    layered = SystemEqService(autostart=False, stem_worker="/tmp/stem-worker")
+    layered_sent: list[dict] = []
+    layered._process = _FakePlayerProcess()  # type: ignore[assignment]
+    layered._send = lambda payload: layered_sent.append(payload)  # type: ignore[assignment]
+    s3_bands = [0.0] * 8 + [2.0] * 8 + [1.0] * 8
+    stem_ambient = [-60.0 + index * 0.25 for index in range(24)]
     check(
-        stem_service._no_auto_restart == "ring 持续积压，退出重建",
-        "分轨 ring 积压必须熔断，不得自动重启后继续断续",
+        layered.apply_decision(
+            s3_bands, 100.0, base_gain=1.0,
+            ambient_band_dbfs=stem_ambient, ambient_broadband_dbfs=-42.0,
+            masking_enabled=True, masking_dose=1.0,
+        ),
+        "分轨模式仍要下发 S3 包络",
     )
+    eq(layered_sent[-1]["bands"], s3_bands, "分轨不得吞掉 S3 24 段")
+    check(layered_sent[-1]["masking_enabled"] is True, "分轨不得关闭逐段掩蔽")
+    eq(layered_sent[-1]["ambient_band_dbfs"], stem_ambient, "分轨仍要携带环境谱")
+    eq(layered_sent[-1]["base_gain"], 0.0, "分轨仍不叠旧 demo 基线")
 
 
 def test_voiceprint_shadow_snapshot_is_harmless() -> None:
@@ -2780,6 +2861,35 @@ def test_masking_dose_for_eq_mode() -> None:
     eq(masking_dose_for("loud"), 1.0, "非法档位也退回 1.0×（不猜）")
 
 
+def test_observation_models_do_not_select_dialogue_memory() -> None:
+    from types import SimpleNamespace
+    frame = SimpleNamespace(environment="VOICE", scene="street", scene_valid=True,
+                            context="near_voice", context_valid=True)
+    before = memo_scene_for(frame)
+    frame.scene = "market"
+    frame.context = "music"
+    eq(memo_scene_for(frame), before, "场景/九分类变化不得改变对话记忆检索键")
+    eq(memo_scene_for(None), "未知", "缺帧不虚构场景")
+
+
+def test_masking_matrix_enable_gate() -> None:
+    """内容×环境矩阵只认有效 24 段谱，FLAT/坏谱必须 fail-open。"""
+    class Frame:
+        def __init__(self, mode: str) -> None:
+            self.mode = mode
+
+    spectrum = [-48.0] * 24
+    check(masking_matrix_enabled_for(Frame("SONG_EQ"), spectrum) is True,
+          "SONG_EQ + 有效 24 段环境谱启用矩阵")
+    check(masking_matrix_enabled_for(Frame("EXTERNAL_VOICE_INTENT"), spectrum) is True,
+          "EVI 仍可做逐段内容补偿，事件包络继续来自 S3")
+    check(masking_matrix_enabled_for(Frame("FLAT"), spectrum) is False,
+          "对话/FLAT 必须禁用矩阵")
+    check(masking_matrix_enabled_for(Frame("SONG_EQ"), spectrum[:23]) is False,
+          "缺段环境谱必须 fail-open")
+
+
+
 def test_media_card() -> None:
     """面板「当前媒体」卡（2026-10-30 用户口径）：媒体源 / 歌曲类型（估计）/ 调音思路。
 
@@ -2794,6 +2904,15 @@ def test_media_card() -> None:
     check("没有媒体" in card["source_text"], "并如实写没有媒体在出声")
     check(any("执行端没在跑" in line for line in card["tuning"]),
           "调音思路要说明现在听到的是原声")
+
+    failed = describe_media(
+        systemeq={"available": False, "reason": "分轨 ring 持续积压，已切回 24 段 EQ"},
+        player=None, frame=None, leak=None,
+    )
+    eq(failed["source"], "qqmusic_unavailable", "执行端故障不能显示成“没有媒体”")
+    check("QQ 音乐执行端未运行" in failed["source_text"], "媒体卡要写明执行端故障")
+    check("切回 24 段 EQ" in failed["source_text"], "媒体卡要带回退原因")
+    eq(failed["track"], None, "执行端不可用时不得编造曲目")
 
     # 2) 只有本地播放器：曲目名读得到
     card = describe_media(systemeq=None,
@@ -2938,6 +3057,14 @@ def test_leak_residual_estimator() -> None:
         eq(round(result.bands[index], 3), round(ambient[index] - 12.0, 3),
            "残差最多减 12 dB（宁可少减）")
     eq(result.bands[0], ambient[0], "歌没内容的频段原样保留（可能是真实环境声）")
+
+    # 1b) observe 必须真的计算指标，但不能把残差返回给调用方：这是 D58 的默认模式。
+    observed = estimate_leak(ambient, shape, enabled=True, apply=False)
+    eq(observed.applied, False, "observe 不改变调音动作")
+    eq(observed.reason, "observe", "observe 要明确标成只观测")
+    eq(round(observed.leak_level_db, 3), 40.0, "observe 仍要报整体偏移")
+    eq(round(observed.confidence, 3), 1.0, "observe 仍要报置信度")
+    eq(observed.bands, ambient, "observe 必须原样返回环境谱")
 
     # 2) 漏音 + 真实外部噪声：噪声段在残差里要保留下来，不被一起减掉。
     noisy = list(ambient)
@@ -4548,6 +4675,7 @@ def main() -> int:
         test_command_frame_full,
         test_new_firmware_frame_carries_tuning,
         test_context_model_frame,
+        test_scene_model_frame,
         test_context_mixed_fields,
         test_dual_mic_telemetry,
         test_event_frame,
@@ -4589,6 +4717,7 @@ def main() -> int:
         test_interval_stats_and_percentile,
         test_player_decision_path_is_not_silently_dropped,
         test_eq_mode_and_bypass_control,
+        test_systemeq_execution_contract,
         test_voiceprint_shadow_snapshot_is_harmless,
         test_voiceprint_energy_activity_fallback,
         test_voiceprint_learning_off_by_default_and_drift_visible,
@@ -4597,6 +4726,8 @@ def main() -> int:
         test_dialog_override_link,
         test_music_keepalive,
         test_masking_dose_for_eq_mode,
+        test_masking_matrix_enable_gate,
+        test_observation_models_do_not_select_dialogue_memory,
         test_eq_profile_and_noise_depth,
         test_media_card,
         test_leak_residual_estimator,

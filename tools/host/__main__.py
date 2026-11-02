@@ -57,7 +57,7 @@ from .eq_profile import protected_bands
 from .leak import estimate_leak
 from .media import describe_media, estimate_content_kind
 from .memo import MemoStore
-from .state import CONTEXT_TEXT, HostState, environment_text
+from .state import HostState, environment_text
 
 DEFAULT_WEB_PORT = 8787
 #: 用户记忆目录（gitignore）：rolling + sessions + profile 都在这里。
@@ -86,7 +86,7 @@ def song_eq_depth(broadband_dbfs: float | None, panel_depth: float) -> float:
     面板档位决定基准（basic 1.3× / 激进 2.5×），噪声决定起伏：
     安静（≤ -52 dBFS）0.8× 面板深度 → 嘈杂（≥ -30 dBFS）1.2×。
     这样"噪声多大推多少"是连续量，而不是固定两档；上限夹到 3.0×，
-    避免激进档 + 高噪声把削减推到刺耳。基础层的正增益仍由执行端 5/6 dB 预算封顶。
+    避免激进档 + 高噪声把削减推到刺耳。基础层的正增益由执行端基础 3 / 激进 4 dB 预算封顶。
     """
     if broadband_dbfs is None:
         return float(panel_depth)
@@ -179,6 +179,21 @@ def ambient_spectrum_for(frame) -> list[float]:
         values.append(value)
     # 固件用 -120 dBFS 表示没有有效能量；整条地板不能驱动调音。
     return values if max(values) > -119.0 else []
+
+
+def memo_scene_for(frame) -> str:
+    """Unvalidated scene/context models must not select dialogue memory prompts."""
+    return environment_text(frame.environment) if frame is not None else "未知"
+
+
+def masking_matrix_enabled_for(frame, ambient_spectrum: list[float]) -> bool:
+    """只在有效环境谱且非 FLAT 时启用内容×环境补偿。
+
+    键盘/EVI 事件包络已经包含在 S3 的 band_gain_db 中；这个开关只允许 Mac
+    比较环境谱与歌曲谱，不改变事件触发、attack/release 或对话策略。
+    """
+    return len(ambient_spectrum) == 24 and getattr(frame, "mode", None) != "FLAT"
+
 
 
 def apply_neutral_execution(player_service, systemeq_service) -> bool:
@@ -641,8 +656,48 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--stem-remix",
-        action="store_true",
-        help="对 QQ 音乐启用六分轨实时重混；S3 环境决定策略，旧 24 段 EQ 自动归零",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "对 QQ 音乐启用实时分轨重混（默认开）；四轨模型优先保证吞吐，"
+            "可用 --stem-model htdemucs_6s 切六轨。S3 环境决定策略，旧 24 段 EQ 自动归零"
+        ),
+    )
+    parser.add_argument(
+        "--stem-model",
+        choices=("htdemucs", "htdemucs_6s"),
+        default="htdemucs",
+        help="实时分轨模型：htdemucs=四轨、更快；htdemucs_6s=六轨、声部更细",
+    )
+    parser.add_argument(
+        "--stem-window",
+        type=float,
+        default=2.0,
+        help="分轨输入窗（秒）；这是分轨固定延迟的主要来源",
+    )
+    parser.add_argument(
+        "--stem-overlap",
+        type=float,
+        default=0.1,
+        help="相邻分轨窗重叠（秒）；默认 0.1 给处理抖动留吞吐余量",
+    )
+    parser.add_argument(
+        "--stem-segment",
+        type=float,
+        default=2.0,
+        help="Demucs 内部前向长度（秒），不能小于 --stem-window",
+    )
+    parser.add_argument(
+        "--stem-autocast",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="MPS float16 autocast；当前机器实测比 float32 快约 10–20%%",
+    )
+    parser.add_argument(
+        "--stem-strength",
+        type=float,
+        default=0.6,
+        help="分轨对比强度 0…1；越高，伴奏让位越明显",
     )
     parser.add_argument(
         "--relay-audio",
@@ -816,6 +871,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="完全不记录/注入用户记忆（--memo-dir "" 的等价开关）",
     )
     args = parser.parse_args(argv)
+    if args.stem_remix and not 0 < args.stem_overlap < args.stem_window:
+        parser.error("--stem-overlap 必须大于 0 且小于 --stem-window")
+    if args.stem_remix and args.stem_segment < args.stem_window:
+        parser.error("--stem-segment 不能小于 --stem-window")
     # `--earphone` 可重复；没给就用内置的两副耳机（Xiaomi 耳夹 + AirPods Pro）。
     args.earphones = tuple(args.earphone) if args.earphone else DEFAULT_EARPHONES
     return args
@@ -933,25 +992,9 @@ def main(argv: list[str] | None = None) -> int:
         except OSError as exc:
             print(f"用户记忆目录不可写，本次不记录：{exc}", file=sys.stderr)
 
-    # 场景/环境的取法：端侧 9 类情境模型优先（有中文译名），否则退回环境四分类。
-    # 它们引用下面才创建的 state —— 这些函数只在 assistant/主循环里被调用，届时 state
-    # 一定已经赋值（与 relay 的 attach 顺序同理，写错顺序会在启动时就暴露）。
-    # D46：混合环境（context_mixed）给 LLM/账本一个可读的复合场景名，
-    # 而不是只给 top1 单标签。
+    # 未验收模型只遥测；memo 的决策上下文只使用原有环境层。
     def current_scene() -> str:
-        frame = state.latest
-        if frame is None:
-            return "未知"
-        context = getattr(frame, "context", None)
-        if context is not None and getattr(frame, "context_valid", False):
-            label = CONTEXT_TEXT.get(str(context), "")
-            if label:
-                if getattr(frame, "context_mixed", False):
-                    top2 = CONTEXT_TEXT.get(str(getattr(frame, "context_top2", "") or ""), "")
-                    if top2:
-                        return f"{label}（混合：{top2}）"
-                return label
-        return environment_text(frame.environment)
+        return memo_scene_for(state.latest)
 
     def current_environment() -> str:
         frame = state.latest
@@ -1121,6 +1164,9 @@ def main(argv: list[str] | None = None) -> int:
         systemeq_service = SystemEqService(
             app=args.system_eq_app, mode=args.eq_mode, depth=eq_depth,
             demo=not args.stem_remix, stem_worker=stem_worker,
+            stem_model=args.stem_model, stem_window=args.stem_window,
+            stem_overlap=args.stem_overlap, stem_segment=args.stem_segment,
+            stem_autocast=args.stem_autocast, stem_strength=args.stem_strength,
         )
         state.attach_systemeq(systemeq_service)
 
@@ -1516,7 +1562,8 @@ def main(argv: list[str] | None = None) -> int:
                     leak = estimate_leak(
                         ambient_spectrum,
                         content_shape or [],
-                        enabled=args.leak_residual == "apply",
+                        enabled=args.leak_residual != "off",
+                        apply=args.leak_residual == "apply",
                     )
                     state.set_leak({
                         "mode": args.leak_residual,
@@ -1528,10 +1575,9 @@ def main(argv: list[str] | None = None) -> int:
                     })
                     if leak.applied and len(leak.bands) == 24:
                         ambient_spectrum = leak.bands
-                # 2026-10-30 用户："以前 QQ 音乐 100% 都能解决，现在又是毛又是变小"。
-                # 回归 D54（ed01782）链路：S3 处方 × 深度 + demo 基线 + 削波收缩 trim，
-                # **没有**全局余量压音量。环境×内容矩阵停用（代码与开关预留，B3 后再议）。
-                masking_enabled = False
+                # DS-1：恢复内容×环境逐段补偿，但保留 D54 的“无全局压音量”。事件包络仍由
+                # S3 处方提供；Mac 只在有效 24 段环境谱且非 FLAT 时补歌曲被遮住的频段。
+                masking_enabled = masking_matrix_enabled_for(latest, ambient_spectrum)
                 if args.stem_remix:
                     systemeq_service.set_stem_environment(stem_environment_for(latest))
                 else:

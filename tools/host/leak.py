@@ -56,7 +56,8 @@ class LeakEstimate:
     leak_level_db: float | None = None
     confidence: float = 0.0
     spread_db: float | None = None
-    #: 为什么没有应用：`disabled` / `invalid` / `few_bands` / `low_confidence`；应用时为空。
+    #: 为什么没有应用：`disabled` / `observe` / `invalid` / `few_bands` / `low_confidence`；
+    #: 应用时为空。
     reason: str = ""
 
 
@@ -81,8 +82,13 @@ def _median(values: list[float]) -> float:
     return 0.5 * (ordered[middle - 1] + ordered[middle])
 
 
-def estimate_leak(ambient_dbfs, content_shape_db, *, enabled: bool = True) -> LeakEstimate:
-    """估计并可选地扣掉 Mac 侧歌曲漏音。永远返回 24 段可用谱。"""
+def estimate_leak(ambient_dbfs, content_shape_db, *, enabled: bool = True,
+                  apply: bool = True) -> LeakEstimate:
+    """估计 Mac 侧歌曲漏音；`apply=False` 时只报指标，不改返回谱。
+
+    `enabled=False` 完全不计算（off）；`enabled=True, apply=False` 是 observe：
+    照常给出电平/置信度/离散度，但 `bands` 原样返回，调用方不能偷偷扣谱。
+    """
     ambient = [float(value) for value in ambient_dbfs] if _valid_spectrum(ambient_dbfs) else []
     content = [float(value) for value in content_shape_db] if _valid_spectrum(content_shape_db) else []
     if not ambient or not content:
@@ -137,6 +143,15 @@ def estimate_leak(ambient_dbfs, content_shape_db, *, enabled: bool = True) -> Le
             residual.append(level - MAX_SUBTRACT_DB)
         else:
             residual.append(10.0 * math.log10(remaining))
+    if not apply:
+        return LeakEstimate(
+            bands=ambient,
+            applied=False,
+            leak_level_db=offset,
+            confidence=confidence,
+            spread_db=spread,
+            reason="observe",
+        )
     return LeakEstimate(
         bands=residual,
         applied=True,

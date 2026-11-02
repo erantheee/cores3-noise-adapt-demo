@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Binary PCM worker for rolling six-stem separation.
+"""Binary PCM worker for rolling four- or six-stem separation.
 
 stdin/stdout are raw little-endian stereo float32 PCM.  Diagnostics go only to
 stderr so a Core Audio bridge can treat stdout as audio without framing.
@@ -8,6 +8,7 @@ stderr so a Core Audio bridge can treat stdout as audio without framing.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 import time
@@ -15,8 +16,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from demucs.api import Separator
-from demucs.audio import convert_audio
 
 from stem_remix import (
     STEMS,
@@ -43,7 +42,12 @@ def read_exact(stream, size: int) -> bytes:
 def stats_for(stems: dict[str, torch.Tensor]) -> dict[str, StemStats]:
     answer: dict[str, StemStats] = {}
     for name in STEMS:
-        tensor = stems[name]
+        tensor = stems.get(name)
+        if tensor is None:
+            # Four-stem models (htdemucs) fold guitar and piano into ``other``.
+            # Keep the shared policy schema six-wide without inventing content.
+            answer[name] = StemStats(rms_dbfs=-120.0, peak_dbfs=-120.0)
+            continue
         rms = float(torch.sqrt(torch.mean(tensor.float().square())).item())
         peak = float(torch.max(torch.abs(tensor)).item())
         to_db = lambda value: 20.0 * np.log10(max(value, 1e-9))
@@ -63,6 +67,8 @@ def mix_stems(
     reference = next(iter(stems.values()))
     mixed = original.to(device=reference.device, dtype=reference.dtype).clone()
     for stem in STEMS:
+        if stem not in stems:
+            continue
         delta = (10.0 ** (gains_db[stem] / 20.0)) - 1.0
         mixed += stems[stem] * delta
     return mixed
@@ -123,26 +129,50 @@ def emit_status(payload: dict) -> None:
 VALID_ENVIRONMENTS = {"quiet", "broadband", "keyboard", "wind", "babble"}
 
 
-def controlled_environment(path: str | None, fallback: str) -> str:
+def controlled_settings(path: str | None, fallback: str) -> tuple[str, bool]:
     if not path:
-        return fallback
+        return fallback, False
     try:
-        value = json.loads(Path(path).read_text(encoding="utf-8")).get("environment")
-    except (OSError, ValueError, AttributeError):
-        return fallback
-    return value if value in VALID_ENVIRONMENTS else fallback
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        environment = value.get("environment")
+        return (environment if environment in VALID_ENVIRONMENTS else fallback,
+                value.get("bypass") is True)
+    except (OSError, ValueError, AttributeError, TypeError):
+        return fallback, False
+
+
+def passthrough_window(window: np.ndarray, processed: np.ndarray, bypass: bool) -> np.ndarray:
+    """Bypass uses captured samples, avoiding separation/resampling/limiter coloration."""
+    return window.copy() if bypass else processed
 
 
 def main() -> int:
+    from demucs.api import Separator
+    from demucs.audio import convert_audio
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sample-rate", type=int, default=48_000)
     parser.add_argument("--channels", type=int, default=2)
     parser.add_argument("--window", type=float, default=2.0)
     parser.add_argument("--overlap", type=float, default=0.5)
+    parser.add_argument(
+        "--segment",
+        type=float,
+        default=None,
+        help=(
+            "Demucs 内部前向长度（秒）；默认沿用模型的 7.8 秒分段。"
+            "必须不小于 --window，否则窗口会被裁掉。"
+        ),
+    )
     parser.add_argument("--environment", default="broadband")
     parser.add_argument("--control-file")
     parser.add_argument("--model", default="htdemucs_6s")
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--autocast",
+        action="store_true",
+        help="在 MPS 上用 float16 autocast 推理",
+    )
     parser.add_argument("--strength", type=float, default=0.6)
     args = parser.parse_args()
 
@@ -153,6 +183,10 @@ def main() -> int:
     hop_frames = window_frames - overlap_frames
     if overlap_frames <= 0 or hop_frames <= 0:
         raise SystemExit("overlap must be greater than 0 and smaller than window")
+    if args.segment is not None and args.segment < args.window:
+        raise SystemExit("segment must be greater than or equal to window")
+    if args.autocast and args.device != "mps":
+        raise SystemExit("autocast is only enabled for MPS")
 
     started = time.monotonic()
     separator = Separator(
@@ -161,12 +195,24 @@ def main() -> int:
         shifts=0,
         overlap=0.1,
         split=False,
+        segment=args.segment,
         progress=False,
     )
+    autocast = (
+        torch.autocast(device_type="mps", dtype=torch.float16)
+        if args.autocast
+        else contextlib.nullcontext()
+    )
+
+    def separate(tensor: torch.Tensor):
+        with autocast:
+            original, stems = separator.separate_tensor(tensor, sr=args.sample_rate)
+        return original.float(), {name: stem.float() for name, stem in stems.items()}
+
     # Trigger MPS graph compilation before Core Audio starts feeding the first
     # audible window.  systemeq waits for this ready event before starting tap.
     warmup = torch.zeros((args.channels, window_frames), dtype=torch.float32)
-    separator.separate_tensor(warmup, sr=args.sample_rate)
+    separate(warmup)
     emit_status(
         {
             "event": "ready",
@@ -175,6 +221,8 @@ def main() -> int:
             "load_seconds": round(time.monotonic() - started, 3),
             "window_seconds": args.window,
             "overlap_seconds": args.overlap,
+            "segment_seconds": args.segment,
+            "autocast": args.autocast,
             "strength": args.strength,
         }
     )
@@ -202,7 +250,7 @@ def main() -> int:
         input_buffer = input_buffer[hop_frames:]
         tensor = torch.from_numpy(window.T.copy())
         infer_started = time.monotonic()
-        original, stems = separator.separate_tensor(tensor, sr=args.sample_rate)
+        original, stems = separate(tensor)
         stats = stats_for(stems)
         roles = dominant_roles(stats)
         if previous_roles is not None:
@@ -217,7 +265,7 @@ def main() -> int:
         risk, crest_db, active_stems, vocal_side_ratio = window_risk(
             original, stats, stems
         )
-        environment = controlled_environment(args.control_file, args.environment)
+        environment, bypass = controlled_settings(args.control_file, args.environment)
         requested_gains = role_profile(roles, environment)
         gains = contrast_only_profile(requested_gains, args.strength, risk)
         mixed = mix_stems(original, stems, gains)
@@ -225,6 +273,9 @@ def main() -> int:
             mixed, separator.samplerate, args.sample_rate, args.channels
         )
         output = mixed.detach().cpu().numpy().T.astype("<f4", copy=False)
+        output = passthrough_window(window, output, bypass)
+        if bypass:
+            gains = {name: 0.0 for name in gains}
 
         overlap_out = round(overlap_frames * len(output) / window_frames)
         hop_out = len(output) - overlap_out
@@ -235,7 +286,7 @@ def main() -> int:
             ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)[:, None]
             crossfade = previous_tail[:fade] * (1.0 - ramp) + output[:fade] * ramp
             emitted = np.concatenate((crossfade, output[fade:hop_out]), axis=0)
-        emitted = limiter.process(emitted).astype("<f4", copy=False)
+        emitted = (emitted if bypass else limiter.process(emitted)).astype("<f4", copy=False)
         sys.stdout.buffer.write(emitted.tobytes())
         sys.stdout.buffer.flush()
         previous_tail = output[hop_out:]
@@ -244,7 +295,9 @@ def main() -> int:
         emit_status(
             {
                 "event": "window",
+                "bypass": bypass,
                 "index": window_index,
+                "stems": list(stems),
                 "process_ms": round(elapsed * 1000.0, 1),
                 "rtf": round(elapsed / args.window, 3),
                 "roles": roles,
@@ -255,13 +308,13 @@ def main() -> int:
                 "crest_db": round(crest_db, 2),
                 "active_stems": active_stems,
                 "vocal_side_ratio": round(vocal_side_ratio, 3),
-                "limiter_gain": round(limiter.gain, 4),
+                "limiter_gain": 1.0 if bypass else round(limiter.gain, 4),
             }
         )
         window_index += 1
 
     if previous_tail is not None:
-        tail = limiter.process(previous_tail).astype("<f4", copy=False)
+        tail = (previous_tail if bypass else limiter.process(previous_tail)).astype("<f4", copy=False)
         sys.stdout.buffer.write(tail.tobytes())
         sys.stdout.buffer.flush()
     emit_status({"event": "eof", "windows": window_index})

@@ -148,7 +148,34 @@ if (frame) {
   }
   // 情境卡（融合第二轮）：三种状态必须被分成三种显示。把"还没判断"画成一个类别，
   // 或把"固件没报"画成一格空白，都会让看板的人以为模型给出了一个结论。
-  if (frame.context_valid === null || frame.context_valid === undefined) {
+  if (frame.scene !== null && frame.scene !== undefined) {
+    // 场景头优先：它是这一格的主值。九分类只作为 raw 行的“实验”括注。
+    if (frame.scene_valid !== true) {
+      check(text("ctx") === "感知中…", "场景窗没满时显示「感知中…」");
+      check(text("ctx-raw").includes("2 秒"), "并写明还差什么");
+    } else {
+      check(text("ctx") === frame.scene_text,
+            `场景显示为 ${frame.scene_text}（设备报的是 ${frame.scene}）`);
+      check(text("ctx").length > 0 && !text("ctx").includes("未知"),
+            "场景必须有中文映射，不得落到「未知(...)」兜底");
+      const pct = Math.round(frame.scene_score * 100);
+      check(pct > 0 ? text("ctx-raw").includes(String(pct)) : text("ctx-raw").includes("门控"),
+            pct > 0 ? `同时显示场景置信度 ${pct}%` : "门控/拒识要写成「门控」，不写成 0%");
+      check(text("ctx-raw").includes(frame.scene), "raw 行保留设备实报的 ASCII 类别");
+      check(text("ctx-note").includes("不参与决策"),
+            "场景卡必须写明本轮只显示、不参与决策");
+      check(text("ctx-note").includes("未做真机麦克风验收"),
+            "场景卡必须写明只做了文件域标定");
+      if (frame.scene_us !== null && frame.scene_us !== undefined) {
+        check(text("ctx-note").includes(String(frame.scene_us)),
+              "显示场景头前向的实测耗时");
+      }
+      if (frame.context_valid === true && frame.context) {
+        check(text("ctx-raw").includes("九分类"),
+              "九分类仍在 raw 行括注为实验，不抢主值");
+      }
+    }
+  } else if (frame.context_valid === null || frame.context_valid === undefined) {
     check(text("ctx") === "—", "固件没报情境字段时该格显示 —，不显示任何类别");
     check(text("ctx-note").includes("未上报"), "并写明是固件没有上报");
   } else if (!frame.context_valid) {
@@ -316,6 +343,22 @@ if (snapshot.player) {
   console.log("  （提示：这份快照没有 player 段，已跳过播放与回执断言）");
 }
 
+if (snapshot.systemeq) {
+  const trial = Object.assign({}, snapshot, {
+    systemeq: Object.assign({}, snapshot.systemeq, {
+      available: true, execution: "bypass", stem_stream: true, bypass: true,
+      stem_bypass: false, build_sha256: "a".repeat(64),
+    }),
+  });
+  render(trial);
+  check(text("systemeq-note").includes("执行器 aaaaaaaaaaaa"), "执行回执显示真实构建指纹");
+  check(text("systemeq-note").includes("等待分轨旁路回执"), "请求旁路不等于 worker 已旁路");
+  trial.systemeq.stem_bypass = true;
+  render(trial);
+  check(text("systemeq-note").includes("分轨已旁路（保留窗口延迟）"), "实际旁路回执说明仍有延迟");
+  render(snapshot);
+}
+
 if (snapshot.systemeq && snapshot.systemeq.stem_stream) {
   const stemText = text("stem-action");
   check(stemText.startsWith("分轨："), "分轨运行时动作卡必须显示当前分轨策略");
@@ -325,12 +368,18 @@ if (snapshot.systemeq && snapshot.systemeq.stem_stream) {
       frame: Object.assign({}, snapshot.frame, { event: "wind", event_valid: true, event_text: "吹风" }),
       systemeq: Object.assign({}, snapshot.systemeq, {
         stem_environment: "wind",
-        stem_gains_db: { vocals: 0, bass: -2.0, drums: -1.0 },
+        stem_model: "htdemucs",
+        stem_window_seconds: 2,
+        stem_names: ["vocals", "drums", "bass", "other"],
+        stem_gains_db: { vocals: 0, bass: -2.0, drums: -1.0, guitar: -2.2 },
       }),
     });
     render(windSnapshot);
     check(text("stem-action").includes("防风"), "风声必须映射到分轨防风策略");
+    check(text("stem-action").includes("四轨"), "四轨模型必须在动作卡如实标注");
+    check(text("stem-action").includes("2.0 s 窗"), "动作卡必须显示分轨固定窗长");
     check(text("stem-action").includes("低频 -2.0 dB"), "防风策略必须显示实际低频让位量");
+    check(!text("stem-action").includes("吉他"), "四轨模型不得把并入 other 的吉他显示成独立轨");
     check(text("stem-action").includes("不消耳外风声"), "防风策略必须说明它不能消除耳外真实风声");
     check(text("evt-note").includes("防风"), "事件卡必须说明风声正在驱动分轨策略");
     render(snapshot);

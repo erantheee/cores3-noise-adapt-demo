@@ -22,6 +22,7 @@ import Accelerate
 import AppKit
 import AVFoundation
 import CoreAudio
+import CryptoKit
 import Darwin
 import Foundation
 import os
@@ -61,11 +62,13 @@ let aggressiveBaseDb: [Float] = [
 /// 最终每段增益的上下界。用户明确不关心削波，所以放宽到 ±24 dB；
 /// 仍保留一个界是为了避免极端输入把 EQ 参数推到非法值。
 let maxAppliedGainDb: Float = 24.0
-//: 正增益**总**上限（2026-10-28 现场"人声毛刺"）：base 曲线 + 内容曲线 + D48 掩蔽
-//: 叠加后，presence 段实测 applied 峰值到 5.7–6.4 dB，而且是 0.3 oct 窄带。
-//: 掩蔽要靠"事件期间的时间门控"，不该靠无上限的静态抬升——静态抬到 6 dB 的代价
-//: 就是人声毛刺。这里给正增益一个总预算；负增益（去糊/削减）不受限。
-let maxBoostDb: Float = 5.0
+//: 正增益**总**上限：base 曲线 + 环境处方 + 内容矩阵叠加后的最终预算。
+//: 2026-10-30 真机反馈：基础档允许到 +5 dB 时，bass-heavy/氛围曲的 1–4 kHz
+//: 连续多段顶格，听感变成"另一首歌"。掩蔽应靠时间门控与逐段缺口，不应靠大面积
+//: 静态抬升；因此基础 3 dB、激进 4 dB。负增益（去糊/削减）不受限。
+func positiveBoostLimit(for mode: String) -> Float {
+    mode == "aggressive" ? 4.0 : 3.0
+}
 
 func emit(_ object: [String: Any]) {
     guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
@@ -223,6 +226,11 @@ final class AudioRingBuffer: @unchecked Sendable {
 final class StemBridge: @unchecked Sendable {
     struct Snapshot {
         var ready = false
+        var bypass = false
+        var model = ""
+        var windowSeconds = 0.0
+        var segmentSeconds = 0.0
+        var autocast = false
         var windows = 0
         var processMs = 0.0
         var rtf = 0.0
@@ -231,6 +239,7 @@ final class StemBridge: @unchecked Sendable {
         var lastError = ""
         var environment = "broadband"
         var roles: [String: String] = [:]
+        var stems: [String] = []
         var gainsDb: [String: Double] = [:]
         var strength = 0.0
         var risk = 0.0
@@ -248,6 +257,15 @@ final class StemBridge: @unchecked Sendable {
     private let initialEnvironment: String
     private let controlURL: URL
     private let device: String
+    private let model: String
+    private let windowSeconds: Double
+    private let overlapSeconds: Double
+    private let segmentSeconds: Double
+    private let autocast: Bool
+    private let strength: Double
+    private let controlLock = NSLock()
+    private var controlEnvironment = "broadband"
+    private var controlBypass = false
     private let process = Process()
     private let stdinPipe = Pipe()
     private let stdoutPipe = Pipe()
@@ -258,7 +276,9 @@ final class StemBridge: @unchecked Sendable {
     private var stderrBuffer = Data()
 
     init(inputRing: AudioRingBuffer, sampleRate: Int, channels: Int,
-         workerPath: String, environment: String, device: String) {
+         workerPath: String, environment: String, device: String,
+         model: String, windowSeconds: Double, overlapSeconds: Double,
+         segmentSeconds: Double, autocast: Bool, strength: Double) {
         self.inputRing = inputRing
         self.sampleRate = sampleRate
         self.channels = channels
@@ -267,6 +287,13 @@ final class StemBridge: @unchecked Sendable {
         self.controlURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("systemeq-stem-\(UUID().uuidString).json")
         self.device = device
+        self.model = model
+        self.windowSeconds = windowSeconds
+        self.overlapSeconds = overlapSeconds
+        self.segmentSeconds = segmentSeconds
+        self.autocast = autocast
+        self.strength = strength
+        self.controlEnvironment = environment
         // Holds >10 seconds so 2 s model bursts do not underrun the source node.
         self.outputRing = AudioRingBuffer(channelCount: channels,
                                           capacity: max(48_000, sampleRate * 12))
@@ -279,10 +306,15 @@ final class StemBridge: @unchecked Sendable {
             "uv", "run", "--python", "3.11", "--with", "demucs", "--with", "numpy",
             "--with", "soundfile", "python", workerPath,
             "--sample-rate", String(sampleRate), "--channels", String(channels),
-            "--window", "2", "--overlap", "0.5", "--environment", initialEnvironment,
+            "--window", String(windowSeconds),
+            "--overlap", String(overlapSeconds),
+            "--segment", String(segmentSeconds),
+            "--model", model,
+            "--strength", String(strength),
+            "--environment", initialEnvironment,
             "--control-file", controlURL.path,
             "--device", device,
-        ]
+        ] + (autocast ? ["--autocast"] : [])
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
@@ -329,13 +361,21 @@ final class StemBridge: @unchecked Sendable {
             return
         }
         stateLock.withLockUnchecked { state in
-            if object["event"] as? String == "ready" { state.ready = true }
+            if object["event"] as? String == "ready" {
+                state.ready = true
+                state.model = (object["model"] as? String) ?? state.model
+                state.windowSeconds = (object["window_seconds"] as? Double) ?? state.windowSeconds
+                state.segmentSeconds = (object["segment_seconds"] as? Double) ?? state.segmentSeconds
+                state.autocast = (object["autocast"] as? Bool) ?? state.autocast
+            }
             if object["event"] as? String == "window" {
+                state.bypass = (object["bypass"] as? Bool) ?? false
                 state.windows = ((object["index"] as? Int) ?? state.windows) + 1
                 state.processMs = (object["process_ms"] as? Double) ?? state.processMs
                 state.rtf = (object["rtf"] as? Double) ?? state.rtf
                 state.environment = (object["environment"] as? String) ?? state.environment
                 state.roles = (object["roles"] as? [String: String]) ?? state.roles
+                state.stems = (object["stems"] as? [String]) ?? state.stems
                 state.gainsDb = (object["gains_db"] as? [String: Double]) ?? state.gainsDb
                 state.strength = (object["strength"] as? Double) ?? state.strength
                 state.risk = (object["risk"] as? Double) ?? state.risk
@@ -353,9 +393,22 @@ final class StemBridge: @unchecked Sendable {
             throw NSError(domain: "StemBridge", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "未知分轨环境：\(value)"])
         }
-        let data = try JSONSerialization.data(withJSONObject: ["environment": value])
+        controlLock.lock()
+        defer { controlLock.unlock() }
+        let data = try JSONSerialization.data(withJSONObject:
+            ["environment": value, "bypass": controlBypass])
         try data.write(to: controlURL, options: .atomic)
-        stateLock.withLockUnchecked { $0.environment = value }
+        controlEnvironment = value
+    }
+
+    func setBypass(_ value: Bool) throws {
+        controlLock.lock()
+        defer { controlLock.unlock() }
+        guard value != controlBypass else { return }
+        let data = try JSONSerialization.data(withJSONObject:
+            ["environment": controlEnvironment, "bypass": value])
+        try data.write(to: controlURL, options: .atomic)
+        controlBypass = value
     }
 
     private func startInputPump() {
@@ -995,8 +1048,6 @@ final class EqState: @unchecked Sendable {
         var ambientBands = [Float](repeating: -120, count: 24)
         var ambientBroadbandDbfs: Float = -120
         var maskingEnabled = false
-        /// 掩蔽剂量倍数（面板「基础/激进」= 1.0/1.4）。只放大逐段掩蔽的目标与段别
-        /// budget，不绕过节别上限、内容瞬态门与输出余量。
         var maskingDose: Float = 1.0
     }
     private let lock = OSAllocatedUnfairLock(initialState: State())
@@ -1051,6 +1102,97 @@ final class EqState: @unchecked Sendable {
     }
 }
 
+/// 内容×环境补偿层的单段目标。S3 处方里已经包含键盘/EVI 事件包络；这里仅根据
+/// “环境谱压过歌曲谱”的逐段证据补足歌曲，不承担事件识别，避免重复定义掩蔽事件。
+func maskingBandTarget(index: Int, noiseRelative: Float, songRelative: Float,
+                       exposure: Float, dose: Float, transientRisk: Float) -> Float {
+    guard index >= 0 && index < 24 else { return 0 }
+    let safeExposure = clamp(exposure, 0, 1)
+    let safeDose = clamp(dose, 0.5, 2.0)
+    let safeTransient = clamp(transientRisk, 0, 1)
+    let noiseProminence = clamp((noiseRelative + 18.0) / 18.0, 0, 1)
+    let songPresence = clamp((songRelative + 24.0) / 24.0, 0, 1)
+    let deficit = clamp((noiseRelative - songRelative - 3.0) / 15.0, 0, 1)
+    let overlap = min(noiseProminence, songPresence)
+    // 歌曲自身在该段没有足够内容时，不能为了“可听”凭空补一个存在感凸起。
+    // -18 dB 以下视为空段，-12 dB 及以上视为有可用内容并在两者间连续过渡。
+    // 这一层保护的是音色：用户反馈 bass-heavy/氛围曲在 1.3–3.4 kHz 几乎没有能量，
+    // 旧版仍给到 +5 dB，整首歌会变成另一首。
+    let contentPresence = clamp((songRelative + 18.0) / 6.0, 0, 1)
+    let need = 0.45 + 0.55 * deficit
+    let bandBudget: Float = (index >= 8 && index <= 16) ? 5.0
+        : (index <= 7 ? 2.4 : 3.0)
+    let budget = bandBudget * safeDose
+    let transientScale = max(0.35, 1.0 - 0.75 * safeTransient)
+    var target: Float = 0
+
+    if noiseRelative - songRelative >= 3.0 {
+        let exposureScale = clamp((safeExposure - 0.35) / 0.45, 0, 1)
+        let floorDb: Float = (index >= 8 && index <= 16) ? 3.6
+            : (index <= 7 ? 1.6 : 2.6)
+        let audible = floorDb * safeDose * exposureScale / transientScale * contentPresence
+        let shaped = safeExposure * max(0.25, overlap) * need * budget * 1.8 * contentPresence
+        target = min(budget, max(shaped, audible))
+    }
+
+    // 不再使用固定的“抬人声带、削低频”音色模板。每个频段只在环境谱确实压过
+    // 歌曲内容、且歌曲在该段有内容时补偿；缺口在哪就补哪，没缺口就保持原样。
+    // 这避免 bass-heavy / 氛围曲被凭空做出人声凸起，也避免把歌曲改成另一首。
+    return target
+}
+
+/// 瞬态门只作用于内容×环境补偿的正增益。S3 处方、demo 基线和负向去糊不被它吞掉。
+func transientGatedMasking(_ value: Float, transientRisk: Float) -> Float {
+    guard value > 0 else { return value }
+    return value * (1.0 - 0.75 * clamp(transientRisk, 0, 1))
+}
+
+func executableBuildInfo() -> (sha256: String, size: Int) {
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[0])) else {
+        return ("unavailable", 0)
+    }
+    let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    return (digest, data.count)
+}
+
+func runSystemEqSelfTest() {
+    func require(_ condition: @autoclosure () -> Bool, _ message: String) {
+        guard condition() else {
+            fputs("SELFTEST FAIL: \(message)\n", stderr)
+            exit(1)
+        }
+    }
+    let basic = maskingBandTarget(index: 10, noiseRelative: 0, songRelative: -12,
+                                  exposure: 1, dose: 1.0, transientRisk: 0)
+    let aggressive = maskingBandTarget(index: 10, noiseRelative: 0, songRelative: -12,
+                                       exposure: 1, dose: 1.4, transientRisk: 0)
+    require(basic >= 3.0, "基础档存在感补偿必须进入可听区间")
+    require(aggressive > basic, "激进档必须比基础档更强")
+    require(maskingBandTarget(index: 1, noiseRelative: 0, songRelative: -12,
+                              exposure: 1, dose: 1.0, transientRisk: 0) > 1.0,
+            "低频有遮蔽缺口时也必须按需补偿")
+    require(maskingBandTarget(index: 10, noiseRelative: -20, songRelative: 0,
+                              exposure: 1, dose: 1.0, transientRisk: 0) == 0,
+            "没有遮蔽缺口的频段不得凭空抬升")
+    require(transientGatedMasking(4, transientRisk: 1) == 1,
+            "最强瞬态只保留矩阵正增益的 25%")
+    require(transientGatedMasking(-2, transientRisk: 1) == -2,
+            "瞬态门不得削弱负向去糊")
+    let absent = maskingBandTarget(index: 13, noiseRelative: 0, songRelative: -28,
+                                   exposure: 1, dose: 1.0, transientRisk: 0)
+    require(absent < 0.2, "歌曲空频段不得被强制补出存在感")
+    require(positiveBoostLimit(for: "basic") == 3.0
+            && positiveBoostLimit(for: "aggressive") == 4.0,
+            "档位正增益上限必须防止整首歌被改写")
+    let sourcePositive: Float = 2
+    require(sourcePositive + transientGatedMasking(4, transientRisk: 1) == 3,
+            "瞬态门不得削弱 S3 已有的正增益")
+    let build = executableBuildInfo()
+    require(build.sha256.count == 64, "执行器必须能回显 64 位 SHA256")
+    require(build.size > 0, "执行器必须能回显真实文件大小")
+    print("systemeq selftest: 11/11 passed")
+}
+
 // MARK: - Main
 
 struct Options {
@@ -1064,6 +1206,13 @@ struct Options {
     var stemWorker = ""
     var stemEnvironment = "broadband"
     var stemDevice = "mps"
+    var stemModel = "htdemucs"
+    var stemWindow = 2.0
+    var stemOverlap = 0.1
+    var stemSegment = 2.0
+    var stemAutocast = true
+    var stemStrength = 0.6
+    var selfTest = false
 }
 
 func parseOptions() -> Options {
@@ -1078,6 +1227,8 @@ func parseOptions() -> Options {
             if index < arguments.count { options.app = arguments[index] }
         case "--demo":
             options.demo = true
+        case "--selftest":
+            options.selfTest = true
         case "--stem-worker":
             index += 1
             if index < arguments.count { options.stemWorker = arguments[index] }
@@ -1087,6 +1238,23 @@ func parseOptions() -> Options {
         case "--stem-device":
             index += 1
             if index < arguments.count { options.stemDevice = arguments[index] }
+        case "--stem-model":
+            index += 1
+            if index < arguments.count { options.stemModel = arguments[index] }
+        case "--stem-window":
+            index += 1
+            if index < arguments.count { options.stemWindow = Double(arguments[index]) ?? options.stemWindow }
+        case "--stem-overlap":
+            index += 1
+            if index < arguments.count { options.stemOverlap = Double(arguments[index]) ?? options.stemOverlap }
+        case "--stem-segment":
+            index += 1
+            if index < arguments.count { options.stemSegment = Double(arguments[index]) ?? options.stemSegment }
+        case "--stem-strength":
+            index += 1
+            if index < arguments.count { options.stemStrength = Double(arguments[index]) ?? options.stemStrength }
+        case "--no-stem-autocast":
+            options.stemAutocast = false
         case "--bands":
             index += 1
             if index < arguments.count {
@@ -1116,6 +1284,10 @@ func parseOptions() -> Options {
 }
 
 let options = parseOptions()
+if options.selfTest {
+    runSystemEqSelfTest()
+    exit(0)
+}
 let state = EqState()
 let consumed = ConsumedMeter()
 state.update(bands: options.bands, depth: options.depth, mediaPercent: 100)
@@ -1136,7 +1308,13 @@ if !options.stemWorker.isEmpty {
         channels: capture.channels,
         workerPath: options.stemWorker,
         environment: options.stemEnvironment,
-        device: options.stemDevice)
+        device: options.stemDevice,
+        model: options.stemModel,
+        windowSeconds: options.stemWindow,
+        overlapSeconds: options.stemOverlap,
+        segmentSeconds: options.stemSegment,
+        autocast: options.stemAutocast,
+        strength: options.stemStrength)
     do {
         try bridge.start()
     } catch {
@@ -1342,8 +1520,7 @@ var outHeadroomTrimDb: Float = 0
 //: EQ 之后峰值超过 0 dBFS 时的输出余量。这是一个零延迟的
 //: 后级增益，比“猜哪个步进逐能少抬多少”可靠；高峰过了快降，
 //: 下降后慢慢恢复，避免音量抽动。
-var outputHeadroomGain: Float = 0.80
-var latestOutPeak: Float = 0
+var outputHeadroomGain: Float = 1.0
 var smoothedBaseGain: Float = 1.0
 var lastEnvExposure: Float = 0
 // S3 24 段环境谱 × QQ 音乐 24 段内容谱。它只产生小幅、逐段的掩蔽补偿；
@@ -1371,6 +1548,36 @@ func applyEq(_ state: EqState) {
     // 基线平滑：S3 切 FLAT（安静/对话）时 baseGain 0↔1 平滑过渡，避免硬切。
     smoothedBaseGain += (snapshot.baseGain - smoothedBaseGain) * 0.15
     let baseGain = smoothedBaseGain
+
+    // Mac 只补“环境谱压过歌曲谱”的频段。键盘/EVI 等事件包络已经包含在 S3 处方中，
+    // 不在这里重复识别或重新定时。
+    let spectrumReady = snapshot.maskingEnabled
+        && snapshot.ambientBands.count == 24
+        && content.bandShapeDb.count == 24
+    let exposureTarget = spectrumReady
+        ? clamp((snapshot.ambientBroadbandDbfs + 58.0) / 22.0, 0, 1)
+        : 0
+    maskingExposure += (exposureTarget - maskingExposure)
+        * (exposureTarget > maskingExposure ? 0.18 : 0.05)
+    let noiseMax = snapshot.ambientBands.max() ?? -120
+    maskingActiveBands = 0
+    maskingPeakDb = 0
+    for index in 0..<24 {
+        var target: Float = 0
+        if spectrumReady && noiseMax > -119 {
+            target = maskingBandTarget(
+                index: index,
+                noiseRelative: snapshot.ambientBands[index] - noiseMax,
+                songRelative: content.bandShapeDb[index],
+                exposure: maskingExposure,
+                dose: snapshot.maskingDose,
+                transientRisk: content.transientRisk)
+        }
+        let coefficient: Float = target > maskingBands[index] ? 0.18 : 0.05
+        maskingBands[index] += (target - maskingBands[index]) * coefficient
+        if abs(maskingBands[index]) > 0.05 { maskingActiveBands += 1 }
+        maskingPeakDb = max(maskingPeakDb, maskingBands[index])
+    }
     for index in 0..<24 {
         currentBands[index] += (snapshot.bands[index] - currentBands[index]) * 0.25
         let base: Float
@@ -1390,18 +1597,30 @@ func applyEq(_ state: EqState) {
             }
         }
         // 正增益的"动态部分"在输出削波时收缩（负增益不动：削减永远安全）。
-        var dynamic = currentBands[index] * snapshot.depth
+        let matrix = transientGatedMasking(
+            maskingBands[index], transientRisk: content.transientRisk)
+        var dynamic = currentBands[index] * snapshot.depth + matrix
         if dynamic > 0 && outHeadroomTrimDb > 0 {
             dynamic = max(0, dynamic - outHeadroomTrimDb)
         }
-        // 正增益总预算：base + extra + 动态 三者相加后封顶 maxBoostDb（负方向仍到
-        // -maxAppliedGainDb）。这是"听清歌曲"的硬约束：掩蔽不许把静态抬升堆到 6 dB。
+        // 正增益总预算：base + extra + 动态 三者相加后按档位封顶（负方向仍到
+        // -maxAppliedGainDb）。这是"不把歌曲改成另一首"的硬约束。
+        let boostLimit = positiveBoostLimit(for: snapshot.mode)
         let target = min(clamp(base + extra + dynamic,
-                               -maxAppliedGainDb, maxAppliedGainDb), maxBoostDb)
+                               -maxAppliedGainDb, maxAppliedGainDb), boostLimit)
         eq.bands[index].gain = target
         appliedBands[index] = target
     }
     eq.bypass = snapshot.bypass
+    // Bypass and stale/neutral execution must also stop stem alterations. The worker
+    // acknowledges the change on its next output window; queued audio keeps its delay.
+    let neutral = snapshot.baseGain == 0 && !snapshot.maskingEnabled
+        && snapshot.bands.allSatisfy { abs($0) < 0.0001 }
+    do { try stemBridge?.setBypass(snapshot.bypass || neutral) }
+    catch { emitError("分轨旁路控制失败：\(error.localizedDescription)") }
+    // D54 基线：不使用全局负增益制造余量。削波只收缩正向动态部分，避免再次出现
+    // “掩蔽没明显，整首歌反而变小”。
+    eq.globalGain = 0
     engine.mainMixerNode.outputVolume = clamp(snapshot.mediaPercent / 100.0, 0, 1)
 }
 
@@ -1447,6 +1666,7 @@ do {
     exit(4)
 }
 
+let executableBuild = executableBuildInfo()
 emit([
     "event": "ready",
     "app": options.app,
@@ -1461,8 +1681,14 @@ emit([
     "resampling": needResample,
     "engine_rate": Double(nodeFormat.sampleRate),
     "stem_stream": stemBridge != nil,
+    "stem_model": options.stemModel,
+    "stem_window_seconds": options.stemWindow,
+    "stem_segment_seconds": options.stemSegment,
+    "stem_autocast": options.stemAutocast,
     "stem_environment": options.stemEnvironment,
     "stem_preroll_ms": prerollWaitedMs,
+    "build_sha256": executableBuild.sha256,
+    "build_size": executableBuild.size,
 ])
 
 // stdin：和 player 一样按行 JSON。读不到 stdin（EOF）不退出，方便用 --seconds 做试听。
@@ -1486,12 +1712,11 @@ Thread {
             let baseGain = Float((object["base_gain"] as? Double) ?? 1.0)
             let ambientBroadband = Float((object["ambient_broadband_dbfs"] as? Double) ?? -120)
             let maskingEnabled = (object["masking_enabled"] as? Bool) ?? false
-            let maskingDose = Float((object["masking_dose"] as? Double) ?? 1.0)
             state.update(bands: bands, depth: depth, mediaPercent: media,
                          baseGain: baseGain, ambientBands: ambientBands,
                          ambientBroadbandDbfs: ambientBroadband,
                          maskingEnabled: maskingEnabled,
-                         maskingDose: maskingDose)
+                         maskingDose: Float((object["masking_dose"] as? Double) ?? 1.0))
         case "flat":
             state.flat()
         case "bypass":
@@ -1528,14 +1753,9 @@ var stallStreak = 0
 let controlTimer = Timer(timeInterval: 0.05, repeats: true) { _ in
     // 先看上一拍 EQ 之后有没有削波：有就收缩正增益预算（最快 1.4 dB/s），输出干净则慢回。
     let out = outMeter.take()
-    latestOutPeak = Float(out.peak)
     // D54（2026-10-28 现场"歌曲声音忽大忽小"）：headroom 的回落要**很慢**。原来 0.02/50ms
     // （≈0.4 dB/s）会在响/静交替的段落里来回收缩又放开，听成音量抽动；改成 0.004/50ms
     // （≈0.08 dB/s，20 s 才回 1 dB），收紧仍然快（秒级），避免削波。
-    // 2026-10-30：源本身已经贴满量程（QQ 音乐输出峰值 0.98–1.2），零星的 1–2 个削波
-    // 样本不是掩蔽造成的，冲正增益只会把"抬升"削掉一半——实测 out.peak 1.21 就把
-    // 2 dB 的 trim 顶满，存在感区目标 4.3 dB 到耳朵只剩 2.2 dB。改成只有**明显削波**
-    // （>1.05 或窗口内 ≥24 样本）才收缩，并且最多 1.5 dB。
     if out.peak >= 1.0 || out.clipFrames > 0 {
         outHeadroomTrimDb = min(2.0, outHeadroomTrimDb + 0.10)
     } else if out.peak < 0.90 {
@@ -1595,6 +1815,11 @@ if options.reportSeconds > 0 {
             "stem_stream": stemBridge != nil,
             "stem_environment": stem?.environment ?? options.stemEnvironment,
             "stem_ready": stem?.ready ?? false,
+            "stem_bypass": stem?.bypass ?? false,
+            "stem_model": stem?.model ?? options.stemModel,
+            "stem_window_seconds": stem?.windowSeconds ?? options.stemWindow,
+            "stem_segment_seconds": stem?.segmentSeconds ?? options.stemSegment,
+            "stem_autocast": stem?.autocast ?? options.stemAutocast,
             "stem_windows": stem?.windows ?? 0,
             "stem_process_ms": stem?.processMs ?? 0,
             "stem_rtf": stem?.rtf ?? 0,
@@ -1603,6 +1828,7 @@ if options.reportSeconds > 0 {
             "stem_output_fill": stemBridge?.outputRing.fillCount ?? 0,
             "stem_error": stem?.lastError ?? "",
             "stem_roles": stem?.roles ?? [:],
+            "stem_names": stem?.stems ?? [],
             "stem_gains_db": stem?.gainsDb ?? [:],
             "stem_strength": stem?.strength ?? 0,
             "stem_risk": stem?.risk ?? 0,
@@ -1613,10 +1839,10 @@ if options.reportSeconds > 0 {
             "content_env_exposure": Double(lastEnvExposure),
             "content_trim": Double(trimmedHarshness),
             "masking_matrix_enabled": snapshot.maskingEnabled,
+            "masking_dose": Double(snapshot.maskingDose),
             "masking_exposure": Double(maskingExposure),
             "masking_active_bands": maskingActiveBands,
             "masking_peak_db": Double(maskingPeakDb),
-            "masking_dose": Double(snapshot.maskingDose),
             "masking_bands": maskingBands.map { Double($0) },
             "out_peak": outMeter.totals().peak,
             "out_clip_frames": outMeter.totals().clipFrames,

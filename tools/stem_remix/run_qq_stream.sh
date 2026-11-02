@@ -1,5 +1,5 @@
 #!/bin/sh
-# QQ Music -> process tap -> rolling six-stem remix -> current output device.
+# QQ Music -> process tap -> rolling four-stem remix -> current output device.
 # Usage: sh tools/stem_remix/run_qq_stream.sh [environment]
 set -e
 
@@ -21,4 +21,8 @@ exec "$TOOLS/systemeq/systemeq" \
   --stem-worker "$HERE/stream_worker.py" \
   --stem-environment "$ENVIRONMENT" \
   --stem-device mps \
+  --stem-model htdemucs \
+  --stem-window 2 \
+  --stem-overlap 0.25 \
+  --stem-segment 2 \
   --report 1

@@ -53,6 +53,12 @@ class SystemEqService:
         stem_worker: str | None = None,
         stem_environment: str = "broadband",
         stem_device: str = "mps",
+        stem_model: str = "htdemucs",
+        stem_window: float = 2.0,
+        stem_overlap: float = 0.1,
+        stem_segment: float = 2.0,
+        stem_autocast: bool = True,
+        stem_strength: float = 0.6,
     ) -> None:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self.binary = binary or os.path.join(root, "systemeq", "systemeq")
@@ -62,8 +68,15 @@ class SystemEqService:
         #: demo 基线档位：basic＝网友共识克制版，aggressive＝"demo 要明显"×2 版。
         self.mode = mode
         self.stem_worker = stem_worker
+        self.stem_requested = bool(stem_worker)
         self.stem_environment = stem_environment
         self.stem_device = stem_device
+        self.stem_model = stem_model
+        self.stem_window = float(stem_window)
+        self.stem_overlap = float(stem_overlap)
+        self.stem_segment = float(stem_segment)
+        self.stem_autocast = bool(stem_autocast)
+        self.stem_strength = float(stem_strength)
         self._process: subprocess.Popen | None = None
         self._lock = threading.Lock()
         self._state: dict | None = None
@@ -77,6 +90,7 @@ class SystemEqService:
         self._last_masking_context: tuple[bool, list[float], float] = (False, [], -120.0)
         self._last_masking_dose: float = 1.0
         self._last_stem_environment: str | None = None
+        self._stem_fallback_reason = ""
         self._last_attempt = 0.0
         self.reason = ""
         self.last_error = ""
@@ -103,7 +117,14 @@ class SystemEqService:
                 "--stem-worker", self.stem_worker,
                 "--stem-environment", self.stem_environment,
                 "--stem-device", self.stem_device,
+                "--stem-model", self.stem_model,
+                "--stem-window", str(self.stem_window),
+                "--stem-overlap", str(self.stem_overlap),
+                "--stem-segment", str(self.stem_segment),
+                "--stem-strength", str(self.stem_strength),
             ])
+            if not self.stem_autocast:
+                command.append("--no-stem-autocast")
         try:
             self._process = subprocess.Popen(
                 command,
@@ -178,15 +199,16 @@ class SystemEqService:
                     reason = str(message.get("reason", "systemeq 退出"))
                     self.reason = reason
                     self.last_error = reason
-                    if (
-                        "采样率不匹配" in reason
-                        or (self.stem_worker and "ring 持续积压" in reason)
-                    ):
-                        # 分轨链已把 ring 塞满时，重启只会再经历
-                        # “等满 2 s 窗→输出断流→再积压”。这是算力
-                        # 不足，不是瞬时设备抖动：fail-open 后本次 host
-                        # 不再自动拉起分轨，避免用户持续听到断续。
+                    if "采样率不匹配" in reason:
                         self._no_auto_restart = reason
+                    elif self.stem_worker and "ring 持续积压" in reason:
+                        # 分轨跟不上时先活下来：卸掉 stem worker，下一次重试改为
+                        # 普通 24 段 EQ。媒体识别和 S3 包络随进程恢复，不能因为
+                        # 分轨失败把整条 QQ 音乐执行端永久留在 unavailable。
+                        self._stem_fallback_reason = reason
+                        self.stem_worker = None
+                        self.reason = "分轨 ring 持续积压，已切回 24 段 EQ"
+                        self.last_error = self.reason
                     else:
                         # ring 积压 / 设备配置变化等：允许自动重建，但 60 秒内最多 3 次。
                         now = time.monotonic()
@@ -274,14 +296,10 @@ class SystemEqService:
                        masking_enabled: bool = False,
                        masking_dose: float = 1.0) -> bool:
         if self.stem_worker:
-            # 分轨模式以原混音为底，只做负向对比；旧 24 段正增益再叠上去会把鼓、
-            # 电吉他和大混响重新推毛。媒体让位仍沿用 S3 的决定。
-            bands = [0.0] * 24
+            # 分轨只负责改变声部组成；S3 24 段、事件包络和掩蔽矩阵仍在下游执行。
+            # 初版在这里把三者全部归零，导致用户看到“分轨开了但包络没了”。
+            # 固定 demo 基线仍关掉，避免在模型输出上再叠一层旧音染。
             base_gain = 0.0
-            depth_override = 1.0
-            masking_enabled = False
-            ambient_band_dbfs = None
-            ambient_broadband_dbfs = None
         if not self.available:
             # QQ 音乐没在出声时 tap 起不来、进程会退出。这里每隔几秒重试一次，
             # 用户点开播放后不用重启上位机就能恢复执行。
@@ -363,6 +381,12 @@ class SystemEqService:
                 "app": self.app,
                 "demo": self.demo,
                 "stem_stream": bool(self.stem_worker),
+                "stem_requested": self.stem_requested,
+                "stem_model": self.stem_model,
+                "stem_window_seconds": self.stem_window,
+                "stem_segment_seconds": self.stem_segment,
+                "stem_autocast": self.stem_autocast,
+                "stem_fallback_reason": self._stem_fallback_reason,
                 "mode": self.mode,
                 "depth": self.depth,
                 "no_auto_restart_reason": self._no_auto_restart,
@@ -396,6 +420,7 @@ class SystemEqService:
             "app": self.app,
             "demo": self.demo,
             "stem_stream": bool(self.stem_worker),
+            "stem_requested": self.stem_requested,
             "mode": state.get("mode") or self.mode,
             "bypass": bypass,
             "depth": state.get("depth", self.depth),
@@ -408,6 +433,10 @@ class SystemEqService:
             "frames": state.get("frames"),
             "consumed_frames": state.get("consumed_frames"),
             "sample_rate": state.get("sample_rate") or (ready or {}).get("sample_rate"),
+            #: 运行中二进制的真实 SHA/大小。用它确认试听的是刚构建的执行器，不再用源码
+            #: 修改时间猜版本。
+            "build_sha256": (ready or {}).get("build_sha256"),
+            "build_size": (ready or {}).get("build_size"),
             #: 消费端是否在做重采样（tap 采样率 != 输出设备采样率时，2026-10-23）。
             "resampling": (ready or {}).get("resampling"),
             "engine_rate": (ready or {}).get("engine_rate"),
@@ -443,12 +472,18 @@ class SystemEqService:
             "headroom_trim_db": state.get("headroom_trim_db"),
             "output_headroom_gain": state.get("output_headroom_gain"),
             "stem_stream": bool(state.get("stem_stream")),
+            "stem_model": state.get("stem_model", self.stem_model),
+            "stem_window_seconds": state.get("stem_window_seconds", self.stem_window),
+            "stem_segment_seconds": state.get("stem_segment_seconds", self.stem_segment),
+            "stem_autocast": state.get("stem_autocast", self.stem_autocast),
             "stem_environment": state.get("stem_environment", self.stem_environment),
             "stem_ready": state.get("stem_ready"),
+            "stem_bypass": state.get("stem_bypass"),
             "stem_windows": state.get("stem_windows"),
             "stem_process_ms": state.get("stem_process_ms"),
             "stem_rtf": state.get("stem_rtf"),
             "stem_roles": state.get("stem_roles") or {},
+            "stem_names": state.get("stem_names") or [],
             "stem_gains_db": state.get("stem_gains_db") or {},
             "stem_strength": state.get("stem_strength"),
             "stem_risk": state.get("stem_risk"),
@@ -457,6 +492,7 @@ class SystemEqService:
             "stem_vocal_side_ratio": state.get("stem_vocal_side_ratio"),
             "stem_limiter_gain": state.get("stem_limiter_gain"),
             "stem_error": state.get("stem_error"),
+            "stem_fallback_reason": self._stem_fallback_reason,
             #: 设备建议（S3 原始 24 段）与 systemeq 真正设进 EQ 的值（含 demo 基线 + ×depth）。
             "source_bands": state.get("bands") or [],
             "applied_bands": values,

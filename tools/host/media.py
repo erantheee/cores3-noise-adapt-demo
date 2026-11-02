@@ -198,7 +198,8 @@ def tuning_lines(systemeq: dict, frame: dict | None, leak: dict | None) -> list[
     if leak:
         state = "已扣" if leak.get("applied") else "未扣"
         reason = {
-            "ok": "估计成立", "disabled": "仅观测", "low_confidence": "环境谱不像漏音",
+            "ok": "估计成立", "observe": "仅观测", "disabled": "未计算",
+            "low_confidence": "环境谱不像漏音",
             "few_bands": "歌的频段太少", "flat_content": "歌频谱太平", "invalid": "缺谱",
         }.get(str(leak.get("reason") or ""), str(leak.get("reason") or "?"))
         lines.append(f"漏音残差：{state}（{reason}）。")
@@ -210,6 +211,7 @@ def describe_media(*, systemeq: dict | None, player: dict | None,
     """面板「当前媒体」卡的完整内容。字段缺失一律如实写"不可读/没有"，不猜。"""
     systemeq = systemeq or {}
     player = player or {}
+    systemeq_failed = bool(systemeq) and systemeq.get("available") is False
     qq_running = bool(systemeq) and systemeq.get("available") is not False
     player_playing = bool(player.get("playing"))
 
@@ -228,6 +230,11 @@ def describe_media(*, systemeq: dict | None, player: dict | None,
         source_text = "Mac 本地播放器"
         track = player.get("track_title")
         track_note = "" if track else "曲目名不可读"
+    elif systemeq_failed:
+        reason = str(systemeq.get("reason") or "执行端没有在运行")
+        source_text = f"QQ 音乐执行端未运行：{reason}"
+        track = None
+        track_note = "执行端恢复后才能判断当前歌曲"
     else:
         source_text = "没有媒体在出声"
         track = None
@@ -237,7 +244,8 @@ def describe_media(*, systemeq: dict | None, player: dict | None,
         "kind": "unknown", "text": "无内容", "confidence": 0.0, "basis": "",
     }
     return {
-        "source": "qqmusic" if qq_running else ("player" if player_playing else "none"),
+        "source": "qqmusic" if qq_running else (
+            "player" if player_playing else ("qqmusic_unavailable" if systemeq_failed else "none")),
         "source_text": source_text,
         "track": track,
         "track_note": track_note,

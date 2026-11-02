@@ -150,23 +150,22 @@
       <div class="sub" id="env-note">参与 S3 动作与分轨环境选择</div>
     </div>
     <!--
-      情境 = 端侧小模型（v0.2-s3，92 维窗）的判断。它与左边「环境」**不是一回事**：
-      环境是固件自己的四分类，情境是模型的九分类。并排放就是为了看清两者的分歧——
-      这个模型现在还没有被信任到能参与决策（integration-plan.md 第二轮），而且
-      2026-10-29/30 真机复测（TODOS A-1）表明它还没通过真机验收：街道、外放音乐、
-      真实说话长时间判 other。**面板必须写明是实验模型**，不能让它看起来像产品能力。
+      情境 = 端侧环境场景（main/scene_classifier.hpp，92 维窗 → 街道/高速/市集）。
+      它与左边「环境」不是一回事：环境是驱动 EQ 的四分类，场景是语义判断。
+      九分类模型（v0.2-s3）仍在上报，但真机复测长期给 other（TODOS A-1），所以只作为
+      这一行下面的“实验”括注，不再占主值。场景头本轮只显示，不参与任何决策。
     -->
     <div class="card" id="ctx-card">
-      <h2>情境（端侧九分类）</h2>
+      <h2>情境（端侧场景）</h2>
       <div class="value" id="ctx">—</div>
       <div class="meter"><span id="ctx-bar"></span></div>
       <div class="sub" id="ctx-raw">—</div>
-      <div class="sub" id="ctx-note">2 秒窗 · 实验模型／未通过真机验收 · 仅观察，不参与决策</div>
+      <div class="sub" id="ctx-note">2 秒窗 · 文件域标定，未做真机麦克风验收 · 只显示，不参与决策</div>
       <div class="sub" id="vp">声纹 · 未启用</div>
     </div>
     <!--
       声音事件 = 1 s 窗规则判断（main/sound_event.hpp）：键盘 / 风 / 说话 / 撞击。
-      它与「情境」是两条独立判断：情境看 2 s × 9 类场景，事件看 1 s 瞬态。
+      它与「情境」是两条独立判断：情境看 2 s 环境的谱形，事件看 1 s 瞬态。
       三态必须分开：没报 / 窗未满（或刚被撞击清空）/ 有判断。把 valid=false 画成
       "安静"就是在把"还没判断"说成"判断为安静"。
     -->
@@ -393,8 +392,10 @@ const $ = (id) => document.getElementById(id);
 let lastSnapshot = null;
 //: 情境卡（九分类）的固定说明。TODOS A-1（2026-10-30 止损）：真机现场复测里街道噪声、
 //: 手机外放音乐、真实说话长时间都落在 other，模型还没通过真机验收。**必须逐字写明
-//: "实验模型／未通过真机验收"**，否则这一格会被当成一个可信能力去解释调音动作。
-const CTX_NOTE = "2 秒窗 · 实验模型／未通过真机验收 · 仅观察，不参与决策";
+//: 场景卡的主值是固件自己的场景头（scene_classifier.hpp），不是九分类模型。九分类只在
+//: raw 行里括注“实验”，避免把真机长期输出 other 的模型当成产品能力。
+const SCENE_NOTE = "2 秒窗 · 文件域标定，未做真机麦克风验收 · 只显示，不参与决策";
+const CTX_NOTE = "2 秒窗 · 九分类实验模型／未通过真机验收 · 仅观察，不参与决策";
 //: 用户正在拖进度条。拖动期间不接受状态回写，否则滑块会被每秒 10 次刷新拽回去。
 let playerSeeking = false;
 
@@ -547,7 +548,7 @@ function renderAmbient(s, f) {
   }
 }
 
-function renderContext(f) {
+function renderContextModel(f) {
   const bar = $("ctx-bar");
   const unknown = f.context_valid === null || f.context_valid === undefined;
   if (unknown) {
@@ -561,7 +562,7 @@ function renderContext(f) {
     $("ctx").textContent = "感知中…";
     bar.style.width = "0%";
     $("ctx-raw").textContent = "窗口未满 2 秒";
-    $("ctx-note").textContent = CTX_NOTE;
+    $("ctx-note").textContent = SCENE_NOTE;
     return;
   }
   const pct = Math.max(0, Math.min(100, (f.context_score || 0) * 100));
@@ -582,6 +583,35 @@ function renderContext(f) {
     note += ` · 说话 gate ${f.speech_gate.toFixed(2)}（${f.speech_gate_us ?? 0} µs，只做遥测）`;
   }
   $("ctx-note").textContent = note;
+}
+
+function renderContext(f) {
+  if (f.scene === null || f.scene === undefined) {
+    // 旧固件：没有场景头，继续按九分类显示。
+    renderContextModel(f);
+    return;
+  }
+  const bar = $("ctx-bar");
+  if (f.scene_valid !== true) {
+    $("ctx").textContent = "感知中…";
+    bar.style.width = "0%";
+    $("ctx-raw").textContent = "窗口未满 2 秒";
+    $("ctx-note").textContent = SCENE_NOTE;
+    return;
+  }
+  const pct = Math.max(0, Math.min(100, (f.scene_score || 0) * 100));
+  $("ctx").textContent = f.scene_text;
+  bar.style.width = pct + "%";
+  let raw = `${f.scene} · ${pct > 0 ? pct.toFixed(0) + "%" : "门控"}`;
+  if (f.context_valid === true && f.context) {
+    const modelPct = Math.max(0, Math.min(100, (f.context_score || 0) * 100));
+    raw += ` · 九分类 ${f.context} ${modelPct.toFixed(0)}%（实验）`;
+  }
+  $("ctx-raw").textContent = raw;
+  const prefix = f.scene_us === null || f.scene_us === undefined
+    ? "2 秒窗"
+    : `前向 ${f.scene_us} µs · 2 秒窗`;
+  $("ctx-note").textContent = `${prefix} · ${SCENE_NOTE.replace("2 秒窗 · ", "")}`;
 }
 
 function renderVoiceprint(s) {
@@ -864,10 +894,11 @@ function applyNote(s) {
     : `峰值 +${peakAbs.toFixed(2)} dB`;
   const owner = side.kind === "systemeq" ? "QQ音乐 tap" : "Mac";
   // 2026-10-29 起低延迟主链不再叠固定 demo 基线（base_gain=0），绿色柱子是
-  // "S3 24 段 × 深度 + 逐段掩蔽"；只有分轨实验才还带 demo 基线。旧文案会误导。
+  // "S3 24 段 × 深度 + 逐段掩蔽"；分轨模式由独立 worker 直接重混，旧 24 段归零。
+  const stemModel = exec.stem_model === "htdemucs_6s" ? "六轨" : "四轨";
   const extra = side.kind === "systemeq"
     ? (exec.stem_stream
-        ? "（分轨实验：含 demo 基线）"
+        ? `（${stemModel}实时分轨：模型输出直接重混，旧 24 段归零）`
         : `（低延迟主链：S3 24 段 × 深度 ${(exec.depth || 0).toFixed(1)}× + 逐段掩蔽，不含固定 demo 基线）`)
     : `（形状来自 S3，深度 ${(exec.depth || 0).toFixed(1)}× 是本机为"听得出来"设的演示参数）`;
   return `绿柱＝${owner} 真正设进 EQ 的值${extra}（${shape}，向上=抬 / 向下=削）；蓝线＝S3 报的原始建议。`;
@@ -936,14 +967,18 @@ function renderSystemEq(s) {
     ? ` · 逐段掩蔽 ${Number(se.masking_active_bands) || 0}/24 段 · 峰值 ${Number.isFinite(maskingPeak) ? maskingPeak.toFixed(2) : "?"} dB · 强度 ${Number.isFinite(maskingExposure) ? (maskingExposure * 100).toFixed(0) : "?"}%`
       + (Number.isFinite(maskingDose) ? ` · 剂量 ${maskingDose.toFixed(1)}×（${maskingDose > 1.05 ? "激进" : "基础"}）` : "")
     : " · 逐段掩蔽待环境谱";
+  const stemBypassNote = se.stem_bypass === true ? " · 分轨已旁路（保留窗口延迟）"
+    : se.bypass === true && se.stem_stream ? " · 等待分轨旁路回执" : "";
   const roles = se.stem_roles || {};
   const gains = se.stem_gains_db || {};
+  const availableStems = new Set(se.stem_names || []);
   const roleText = Object.keys(roles).length
     ? ` · 分轨 ${se.stem_environment || "?"}：主角 ${roles.lead || "?"} / 节奏 ${roles.rhythm || "?"} / 低频 ${roles.low || "?"} / 底色 ${roles.bed || "?"}`
     : "";
-  const cutText = Object.keys(gains).length
-    ? " · 实际削减 " + Object.entries(gains)
-        .filter(([, value]) => Number(value) < -0.05)
+  const stemCuts = Object.entries(gains)
+    .filter(([name, value]) => (!availableStems.size || availableStems.has(name)) && Number(value) < -0.05);
+  const cutText = stemCuts.length
+    ? " · 实际削减 " + stemCuts
         .map(([name, value]) => `${name} ${Number(value).toFixed(1)}dB`).join("、")
     : "";
   const risk = Number(se.stem_risk);
@@ -951,12 +986,15 @@ function renderSystemEq(s) {
     ? ` · 风险 ${Number.isFinite(risk) ? (risk * 100).toFixed(0) : "?"}% · 限幅 ${fmt(se.stem_limiter_gain, 3)}`
     : "";
   const baseGain = Number(se.base_gain);
-  const baseLabel = se.demo && Number.isFinite(baseGain) && baseGain > 0.05 ? " · demo基线" : "";
+  const buildNote = /^[a-f0-9]{64}$/.test(se.build_sha256 || "")
+    ? ` · 执行器 ${se.build_sha256.slice(0, 12)}` : "";
+  const baseLabel = (se.demo && Number.isFinite(baseGain) && baseGain > 0.05 ? " · demo基线" : "") + buildNote + stemBypassNote;
   // B2：歌曲漏音残差。default observe = 只报告不应用；reason 用中文写清为什么没扣。
   const leak = s.leak;
   const LEAK_REASON = {
     ok: "估计成立",
-    disabled: "仅观测",
+    disabled: "已关闭估计",
+    observe: "仅观测",
     low_confidence: "环境谱不像漏音",
     few_bands: "歌的频段太少",
     flat_content: "歌频谱太平",
@@ -986,7 +1024,7 @@ function renderStemAction(s) {
     return;
   }
   if (se.available === false) {
-    el.textContent = "低延迟：等待 QQ 音乐开始播放";
+    el.textContent = `执行端未运行：${se.reason || "等待 QQ 音乐开始播放"}`;
     return;
   }
   if (!se.stem_stream) {
@@ -1010,11 +1048,15 @@ function renderStemAction(s) {
       `高频 ${Number.isFinite(harsh) ? (harsh * 100).toFixed(0) : "?"}%`,
       `实际峰值 ${Number.isFinite(peak) ? `${peak >= 0 ? "+" : ""}${peak.toFixed(1)} dB` : "?"}`,
     ].join(" · ");
-    el.textContent = `低延迟调音师：${policy} · ${details}`;
+    const fallback = se.stem_fallback_reason
+      ? ` · 分轨已回退（${se.stem_fallback_reason}）`
+      : "";
+    el.textContent = `低延迟调音师：${policy} · ${details}${fallback}`;
     return;
   }
   if (se.stem_ready === false) {
-    el.textContent = "分轨：模型正在加载";
+    const model = se.stem_model === "htdemucs_6s" ? "六轨" : "四轨";
+    el.textContent = `分轨：${model}模型正在加载`;
     return;
   }
   const policies = {
@@ -1023,8 +1065,9 @@ function renderStemAction(s) {
   const stems = { vocals: "人声", drums: "鼓", bass: "低频", guitar: "吉他", piano: "钢琴", other: "其他" };
   const policy = policies[se.stem_environment] || se.stem_environment || "等待判断";
   const gains = se.stem_gains_db || {};
+  const available = new Set(se.stem_names || []);
   const cuts = Object.entries(gains)
-    .filter(([, value]) => Number(value) < -0.05)
+    .filter(([stem, value]) => (!available.size || available.has(stem)) && Number(value) < -0.05)
     .sort((a, b) => Number(a[1]) - Number(b[1]))
     .slice(0, 3)
     .map(([stem, value]) => `${stems[stem] || stem} ${Number(value).toFixed(1)} dB`);
@@ -1032,7 +1075,10 @@ function renderStemAction(s) {
   const riskText = Number.isFinite(risk) ? ` · 风险门 ${(risk * 100).toFixed(0)}%` : "";
   const action = cuts.length ? `让位 ${cuts.join(" / ")}` : "不改变原混音";
   const caveat = se.stem_environment === "wind" ? " · 防风=避让低频，不消耳外风声" : "";
-  el.textContent = `分轨：${policy} · ${action}${riskText}${caveat}`;
+  const model = se.stem_model === "htdemucs_6s" ? "六轨" : "四轨";
+  const window = Number(se.stem_window_seconds);
+  const windowText = Number.isFinite(window) && window > 0 ? ` · ${window.toFixed(1)} s 窗` : "";
+  el.textContent = `分轨：${model}${windowText} · ${policy} · ${action}${riskText}${caveat}`;
 }
 
 // 当前媒体卡：媒体源 / 内容类型（估计）/ 调音思路。判断在 host，这里只显示；

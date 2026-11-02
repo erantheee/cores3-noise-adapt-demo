@@ -2,9 +2,9 @@
 
 QQ 音乐 → Core Audio process tap → 24 段轻量 DSP → 当前默认输出（耳机）。
 
-S3 只做环境判断；host 把它映射成幅度受限的环境处方。Mac 同时用 1024 点 FFT
-检测高频密度与瞬态风险，对鼓点、钢琴起音等强瞬态收紧正增益。实时主链
-**不运行分轨模型**、不等 2 s 窗、不增加算法延迟。
+S3 只做环境判断；host 把它映射成幅度受限的环境处方。默认有两条执行链：
+无分轨的 24 段 EQ（不增加算法延迟），以及 `--stem-worker` 的实时四轨重混。
+Mac 同时用 1024 点 FFT 检测高频密度与瞬态风险，对鼓点、钢琴起音等强瞬态收紧正增益。
 
 ## 构建 / 运行
 
@@ -18,7 +18,7 @@ sh tools/systemeq/build.sh
   --depth 2.5 --ab 3 --seconds 12
 ```
 
-参数：`--app`（bundle id）、`--bands`（24 个逗号分隔）、`--depth`（默认 2.5）、`--demo`（叠加固定 demo 基线）、`--ab`（每 N 秒切换 EQ/直通）、`--seconds`（0=一直跑）、`--report`。
+参数：`--app`（bundle id）、`--bands`（24 个逗号分隔）、`--depth`（默认 2.5）、`--demo`（叠加固定 demo 基线）、`--ab`（每 N 秒切换 EQ/直通）、`--seconds`（0=一直跑）、`--report`。分轨参数为 `--stem-model htdemucs|htdemucs_6s`、`--stem-window`、`--stem-overlap`、`--stem-segment`、`--stem-strength`，以及 `--no-stem-autocast`。
 
 ### demo 基线（2026-10-22 用户口径）
 
@@ -38,10 +38,11 @@ sh tools/systemeq/build.sh
 就快速收紧，低于后缓慢恢复。它是零延迟的后级余量，不是添加预读的限幅器。
 host 用 `--system-eq-app` 时仍会开基础基线；现场剂量已收小，不再使用 S3 旧的 24 段形状。
 
-另有仅供离线实验的 stem 路径：`--stem-worker`。它用 2 s 滚动窗做六轨估算，固定延迟约
-2.8 s。2026-10-29 真机曾测到 **2.736 s/窗、RTF 1.368**，输出缓冲读空、输入 ring 塞满，
-听感为严重断续。现在它不是默认路径；且一旦 ring 持续积压，就 fail-open 且本次 host
-不再自动重启分轨。
+`--stem-worker` 现在是 host 默认路径。默认 `htdemucs` 输出四轨，2 s 输入窗、0.25 s
+overlap、内部 2 s 前向、MPS float16 autocast；六轨用 `--stem-model htdemucs_6s`。
+2026-10-30 30 s / 17 窗实测：处理均值 **1.40 s**、最大 **1.78 s**、平均 RTF **0.70**。
+首次出声仍需约 **3–4 s**，所以“能持续处理”不等于无延迟，也不解决歌词同步。
+一旦 ring 持续积压，仍会 fail-open，且本次 host 不再自动重启分轨。
 
 ## stdin 协议（供 host 接入）
 
@@ -81,3 +82,6 @@ stdout：`{"event":"ready",...}` / `{"event":"state",...}`（含 `rms/peak/ring_
   max 2.29 dB，≥2 dB 占 85%，P50 17/24 段参与；窗口内 `out_clip_frames` 增量 0
   （启动期累计 13 帧，源峰值 1.0033 已越过全量程）；输出余量中位 −2.93 dB；丢帧 0。
   注意 `applied_bands` 是全局余量前的相对值，听感是"谱形变了"而不是"更响"。
+- **2026-10-30 实时分轨 worker**：四轨 2 s/0.25 s 窗、内部 2 s 前向、MPS autocast，
+  30 s 曲目 17 窗，均值 1.40 s / 最大 1.78 s；可选六轨同样参数 20 s / 11 窗，
+  均值 1.61 s / 最大 2.33 s。四轨是默认吞吐路径，六轨保留作质量优先对照。
