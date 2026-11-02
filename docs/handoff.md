@@ -4,14 +4,14 @@
 - Branch: `feature/apple-conversation-awareness`; baseline `49dc752`.
 - `46cf115`: experimental scene telemetry, saved model + train/export split, real broadband capture.
 - `7ef7ad2`: four-stem + DS-1 selective compensation, observe fix, 3/4 dB ceilings, executor SHA and acknowledged worker bypass.
-- Latest training guard: reject non-integer labels before fitting (see git log).
-- DS-1 refs and original edits preserved in `/Users/eranthe/Documents/Codex/2026-11-02/que/work/recovery/` (bundle, refs, binary patch, 29-file archive). No history reset or branch deletion.
+- `fc3cf74`: reject non-integer training labels.
+- DS-1 refs and original edits preserved in `/Users/eranthe/Documents/Codex/2026-11-02/que/work/recovery/` (bundle, patch, 29-file archive). Refs preserved.
 - DS-1 context/top2 self-music filter omitted. Both unvalidated model outputs excluded from dialogue memo keys; scene remains telemetry/display only.
 - Four stems default: htdemucs, 2 s window/internal segment, 0.1 s overlap, autocast, strength 0.6; explicit six stems and `--no-stem-remix` supported.
 - EQ off requests raw-sample worker bypass; queued audio/window/crossfade delay remains. Snapshot distinguishes request vs actual acknowledgement.
 
 ## Verification
-- CTest 15/15 including saved-artifact export check; firmware build passed.
+- CTest 15/15 incl. export check. Initial incremental firmware build passed; post-commit reconfigure blocked by psutil process-list permission. Final rebuild unverified.
 - systemeq build + selftest 11/11; launcher passed.
 - Offline host: 102 registered groups / 8073 assertions passed; 9 permission-dependent groups excluded explicitly. Full host suite is NOT green/complete.
 - Mock render 69/69; four-stem/fingerprint/bypass render 81/81.

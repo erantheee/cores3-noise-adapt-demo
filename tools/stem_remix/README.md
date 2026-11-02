@@ -67,7 +67,7 @@ python3 -m host --system-eq-app com.tencent.QQMusicMac --stem-model htdemucs_6s
 避免与分轨处理叠加，S3 的媒体让位仍保留。歌曲内部角色由 Mac 上的模型判断，因此这是
 “S3 选环境策略、Mac 选歌曲角色”的闭环，不代表 S3 固件在端上分轨。
 
-当前默认参数为 2 s 输入窗、0.25 s overlap、Demucs 内部 2 s 前向、MPS float16
+当前默认参数为 2 s 输入窗、0.1 s overlap、Demucs 内部 2 s 前向、MPS float16
 autocast。2026-10-30 用《渡口》30 s 做 worker 测速，17 个窗口平均 **1.40 s**、
 最大 **1.78 s**，平均 RTF **0.70**；输出 hop 为 1.75 s，12 s ring 能吸收偶发抖动。
 首次出声仍要等一个输入窗加一次推理，约 **3–4 s**，因此歌词/视频同步问题并没有消失。
@@ -85,3 +85,8 @@ autocast。2026-10-30 用《渡口》30 s 做 worker 测速，17 个窗口平均
 ```sh
 python3 -m unittest tools/stem_remix/test_stem_remix.py
 ```
+
+## 2026-11-02 候选补充
+
+关闭EQ与断流后的中性处方会请求 worker 输出捕获的原始采样，状态以 `stem_bypass`
+回执为准。队列、窗口和交叉淡化延迟仍在，不能说是即时原声；组件测试不代表现场听感。
