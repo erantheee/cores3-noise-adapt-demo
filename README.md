@@ -529,7 +529,7 @@ CI 里这一步跑在固件构建**之前**（[`.github/workflows/build.yml`](.g
 上位机（`tools/host/`）另有一套自己的自测，同样是纯 Python、秒级、不需要设备：
 
 ```bash
-python3 tools/host/tests/test_host.py            # 90 组、7928 条断言（2026-10-26 实测，含暂停控制）
+python3 tools/host/tests/test_host.py            # 107 组、8096 条断言（2026-10-30 实测，含实时分轨参数）
 node tools/host/tests/render_check.js <快照.json> # 可选：用 DOM 桩真跑一遍界面渲染（约 80 条通过、0 条失败，条数随快照内容略变）
 ```
 
@@ -755,14 +755,21 @@ QQ 音乐实时主链走 **S3 环境判断 → 幅度受限的策略选择 → M
 100 ms 将 S3 的 24 段环境频谱与正在播放的 24 段内容频谱比较，只补“噪声占优且音乐不足”
 的重叠段；非分轨路径不再叠加固定 demo 基线。无有效环境频谱时回原音，旧类别曲线只用于兼容旧固件。
 Mac 同时用 FFT 检测高频密度和瞬态风险，强瞬态时收紧正增益，并用 EQ 链内实测余量防止输出削波。
-Demucs 六分轨只作为显式开启的离线实验：2 s 窗
-引入约 2.8 s 固定延迟，真机曾测到 RTF 1.368 导致严重断续，不能作为实时主链。
+QQ 音乐实时分轨默认用 **htdemucs 四轨**（vocals / drums / bass / other），显式传
+`--stem-model htdemucs_6s` 才切六轨。2026-10-30 在本机 30 s / 17 窗实测：2 s 输入窗、
+0.25 s overlap、Demucs 内部也按 2 s 前向、MPS float16 autocast；单窗均值 1.40 s、
+最大 1.78 s，RTF 均值约 0.70，输出 hop 1.75 s。12 s 输出 ring 能吸收偶发的小抖动，
+但仍不是零延迟：首次出声约 **3–4 s**，歌词/画面同步问题仍然存在。四轨的吉他与钢琴
+合并进 `other`；六轨质量更细但吞吐更重。
 
 ```bash
 sh tools/player/build.sh          # 用 swiftc 编出 tools/player/player（本机无 Xcode 全量，CLT 够）
 sh tools/relay/build.sh           # 用 swiftc 编出中继播放端 tools/relay/relaysink（--relay-audio 需要它）
 sh tools/host_up.sh               # 起上位机时会自动带起播放器（--no-player 可关）
 ```
+
+`host_up.sh` 默认同时开启 QQ 音乐四轨实时分轨。需要回到无分轨的 24 段 EQ 主链时传
+`--no-stem-remix`；需要六轨时传 `--stem-model htdemucs_6s`。
 
 - 曲库：`tools/player/tracks.json`。**先按两首做**（《渡口》与 Sweet Child），加第三首只需往
   `tracks` 里加一项，播放器与面板都不用改。
@@ -807,7 +814,7 @@ Mac 的 `applied` / `idle` / `silent` / `bypass` / `unavailable`（有证据：
 ### 上位机自测
 
 ```bash
-python3 tools/host/tests/test_host.py      # 90 组、7928 条断言，不需要设备、不需要串口
+python3 tools/host/tests/test_host.py      # 107 组、8096 条断言，不需要设备、不需要串口
 node tools/host/tests/render_check.js <快照.json>   # 用 DOM 桩真跑一遍 render()：约 80 条通过、0 条失败（条数随快照内容略变）
 ```
 
@@ -885,3 +892,11 @@ p50 = **100.03 ms**，主机侧到达间隔 p50 = **100.00 ms**。
 
 （`降噪` 也在字库内，但**设备屏幕现在不该再显示它**——本机不做降噪。把屏幕那一格改成
 `调音` 之前，先确认 `调` `音` 两个字在 `main/lv_font_ui_16.c` 里；缺字会显示成空白。）
+
+### 2026-11-02 集成候选
+
+四轨默认开启；六轨显式选择，`--no-stem-remix` 回退非分轨。按需掩蔽保留歌曲空频段
+保护，基础/激进正增益上限为 3/4 dB（待听感验收），不增加全局压音量。
+关闭EQ会请求分轨原始采样旁路，`stem_bypass` 回报实际窗口状态；已有队列与窗口延迟仍在。
+执行器回报 SHA256；场景头只显示，复现流程见 `experiments/scene-model/README.md`。
+当前模型金标准不代表独立准确率。现场验收与回退见 `docs/acceptance-20261102.md`。

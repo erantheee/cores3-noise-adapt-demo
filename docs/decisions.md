@@ -1955,3 +1955,43 @@ basic→1.0 / aggressive→1.4，执行端回报与 host 实发一致。host 105
 
 **文件**：`tools/host/eq_profile.py`（新）、`tools/host/{__main__,media}.py`、
 `tools/systemeq/systemeq.swift`、`tools/host/tests/test_host.py`。
+
+## D61 · 2026-10-30 QQ 音乐实时分轨默认改四轨，并缩短 Demucs 内部前向
+
+**用户口径**：需要 QQ 音乐实时分轨；接受它相对无分轨主链的延迟代价，但必须能持续出声。
+
+**根因**：旧 worker 只把输入窗设为 2 s，`Separator` 没有收到 `segment`，Demucs 仍按模型
+默认约 7.8 s 做前向。六轨在 MPS 上单窗 1.7–2.2 s，而 0.5 s overlap 只有 1.5 s hop，
+长期吞吐不足，ring 会积压。
+
+**决定**：
+1. 默认改 `htdemucs` 四轨（vocals/drums/bass/other），六轨继续可显式选；四轨缺少的
+   guitar/piano 在共享策略结构里按静音处理，不生成不存在的轨。
+2. 输入窗 2 s、overlap 0.25 s、内部 `segment=2 s`、MPS float16 autocast；worker 新增
+   `--segment` 并在 `segment < window` 时拒绝启动。
+3. 参数从 host → systemeq → worker 全链路透传；`host_up.sh` 默认开分轨，
+   `--no-stem-remix` 可回退，`--stem-model htdemucs_6s` 可切六轨。
+4. 面板显示四/六轨、输入窗、真实存在的轨道、角色与风险门，不再把合并进 `other` 的
+   吉他/钢琴显示成独立轨。
+
+**验证（2026-10-30，本机）**：30 s《渡口》、17 窗，处理均值 1.40 s、最大 1.78 s、
+平均 RTF 0.70，hop 1.75 s；host 107 组 / 8096 断言、stem_remix 6/6、launcher 通过。
+
+**边界**：首次出声约 3–4 s，QQ 歌词/视频同步问题未解决；分离伪影和现场听感未验收。
+这证明当前 Mac/当前曲目片段能持续处理，不能外推为所有歌曲或长时运行达标。
+
+**文件**：`tools/stem_remix/stream_worker.py`、`tools/systemeq/systemeq.swift`、
+`tools/host/{__main__,systemeq}.py`、`tools/host/web/index.html`、`tools/host_up.sh`。
+
+
+## D62 · 2026-11-02 收口候选：按需补偿 + 四轨 + 可复现场景遥测
+
+保留 DS-1 的按需补偿、空频段保护、observe 真计算和执行器指纹；暂不移入依赖未验收
+九分类的主唱漏音忽略规则。新 scene 不进入 memo 判定上下文，只显示与遥测。
+正增益基线为基础 3 / 激进 4 dB，剂量仍 1.0/1.4，无全局压音量；不是已验收最佳参数。
+四轨默认开启，六轨显式选择。关闭EQ同时请求 worker 旁路到原始采样，回执区分请求与
+实际窗口状态；分轨队列、窗口与交叉淡化延迟仍在，不宣称即时原声。
+场景导出工具迁入实验目录、训练/导出分离；旧模型参数已保存但旧全量拟合的金标准
+仅证明实现一致。新训练必须源录音不跨 train/validation/test，且只在 train 拟合标准化。
+真实采集工具改读固件 broadband_dbfs；不再用频段和冒充真实电平。现场协议与边界见
+`acceptance-20261102.md`，实际验证与部署状态见最新 handoff。
