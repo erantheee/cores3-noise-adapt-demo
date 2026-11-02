@@ -34,7 +34,8 @@ and wrapper rules. Neither test proves field classification quality.
 ## Train a new version
 
 Training is separate, CPU deterministic (seed 7, 500 epochs), using NumPy and
-PyTorch. Save the dependency versions in the artifact. Input NPZ must contain:
+PyTorch (pipeline tests here used NumPy 2.4.6 / PyTorch 2.15.0). Save the dependency
+versions in the artifact. Input NPZ must contain:
 
 - `X`: finite N×92 S3 features; `y`: integer labels 0..2.
 - `classes`: street, highway, market, in exactly that order.

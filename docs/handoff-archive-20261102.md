@@ -246,7 +246,7 @@
 - **下一步**：① 用户听感结论（转头忽大忽小/停手回落）；② 查 t≈280 的 FLAT 异常；
   ③ "音乐漏音不当作背景人声"——建议加 host→S3 `music on|off` 控制行（S3 不知道音乐是
   自己放的）；④ A0 真人对话验收仍未做。
- 
+
 ## 最新补充：千问接口切换（2026-10-26）
 - 分支 `feature/apple-conversation-awareness`；千问轮改动已于 10-26 提交，HEAD 见 `git log`。
 - LLM 改用千问 OpenAI Chat API：`qwen3.7-flash`、关闭 thinking、JSON；ASR 新 worker 使用 `qwen-audio-3.0-asr-flash`，WAV Base64 上传。provider 可分别回退；配置见 `docs/qianwen-api.md`。Key 仅在 gitignore 的 `.env`，0600。
