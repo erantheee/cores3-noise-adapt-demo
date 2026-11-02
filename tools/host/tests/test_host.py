@@ -2441,13 +2441,22 @@ def test_systemeq_execution_contract() -> None:
     stem_service._read_stdout()
     eq(stem_service.stem_worker, None, "分轨积压后必须卸掉 worker，避免继续断流")
     eq(stem_service._no_auto_restart, None, "分轨积压不能把整个执行端永久禁用")
-    check("切回 24 段 EQ" in stem_service.reason, "失败原因要明确说明已回退")
+    check("回退 24 段 EQ" in stem_service.reason, "失败原因要明确说明已回退")
     check(stem_service._stem_fallback_reason.endswith("退出重建"),
           "保留原始积压原因供面板诊断")
     check(stem_service.snapshot()["stem_requested"] is True,
           "回退后仍保留用户请求分轨的配置")
     check(stem_service.snapshot()["stem_stream"] is False,
           "回退后快照必须如实报告分轨已关闭")
+
+    underflow = SystemEqService(autostart=False, stem_worker="/tmp/stem-worker")
+    process = QuittingProcess()
+    process.stdout = iter([json.dumps({"event": "quitting", "reason": "分轨输出欠载，退出并回退普通 EQ"})])
+    underflow._process = process
+    underflow._read_stdout()
+    eq(underflow.stem_worker, None, "欠载后卸掉分轨而不是重复启动慢模型")
+    eq(underflow._no_auto_restart, None, "欠载后允许普通 EQ 恢复")
+    check("欠载" in underflow.snapshot()["stem_fallback_reason"], "保留真实欠载原因")
 
     # 分轨只改变声部组成，S3 24 段与事件包络仍必须进入同一个执行端。
     layered = SystemEqService(autostart=False, stem_worker="/tmp/stem-worker")

@@ -586,6 +586,32 @@ final class ConsumedMeter: @unchecked Sendable {
     func snapshot() -> (frames: Int, callbacks: Int) { lock.withLockUnchecked { ($0.frames, $0.callbacks) } }
 }
 
+/// Counts missing output frames once playback has actually started.
+final class UnderrunMeter: @unchecked Sendable {
+    private struct State { var started = false; var frames = 0; var events = 0 }
+    private let lock = OSAllocatedUnfairLock(initialState: State())
+    func record(requested: Int, supplied: Int) {
+        lock.withLockUnchecked { s in
+            if supplied > 0 { s.started = true }
+            if s.started && supplied < requested {
+                s.frames += requested - supplied
+                s.events += 1
+            }
+        }
+    }
+    func snapshot() -> (frames: Int, events: Int) {
+        lock.withLockUnchecked { ($0.frames, $0.events) }
+    }
+}
+
+/// Only fractional resampling demand carries over, never starvation debt.
+func resampleDemand(frames: Int, ratio: Double, remainder: inout Double) -> Int {
+    let total = remainder + Double(frames) * ratio
+    let demand = Int(total.rounded(.down))
+    remainder = total - Double(demand)
+    return demand
+}
+
 /// 音乐内容特征（Mac 侧，tap 到的音乐流）：区分"稀疏人声"与"密集器乐/电子"。
 ///   * harshness = 0 → 人声清唱/稀疏内容（保留高频，清透）；
 ///   * harshness = 1 → 密集器乐/电子（收高频，压底噪/嘶声）。
@@ -1190,7 +1216,21 @@ func runSystemEqSelfTest() {
     let build = executableBuildInfo()
     require(build.sha256.count == 64, "执行器必须能回显 64 位 SHA256")
     require(build.size > 0, "执行器必须能回显真实文件大小")
-    print("systemeq selftest: 11/11 passed")
+    var fraction = 0.0
+    var demand = 0
+    for _ in 0..<441 { demand += resampleDemand(frames: 100, ratio: 48000.0 / 44100.0, remainder: &fraction) }
+    require(abs(demand - 48000) <= 1, "resampling preserves long-term fractional demand")
+    for _ in 0..<100 { _ = resampleDemand(frames: 512, ratio: 48000.0 / 44100.0, remainder: &fraction) }
+    require(resampleDemand(frames: 512, ratio: 48000.0 / 44100.0, remainder: &fraction) <= 558,
+            "empty input must not accumulate resampling debt")
+    let missing = UnderrunMeter()
+    missing.record(requested: 512, supplied: 0)
+    require(missing.snapshot().frames == 0, "startup silence is not a playback underrun")
+    missing.record(requested: 512, supplied: 500)
+    missing.record(requested: 512, supplied: 0)
+    require(missing.snapshot().frames == 524 && missing.snapshot().events == 2,
+            "partial and empty reads must count exact missing frames")
+    print("systemeq selftest: 15/15 passed")
 }
 
 // MARK: - Main
@@ -1290,6 +1330,7 @@ if options.selfTest {
 }
 let state = EqState()
 let consumed = ConsumedMeter()
+let underruns = UnderrunMeter()
 state.update(bands: options.bands, depth: options.depth, mediaPercent: 100)
 
 let capture: TapCapture
@@ -1390,8 +1431,8 @@ let sourceNode = AVAudioSourceNode(format: nodeFormat) { _, _, frameCount, audio
         while resampleOutRing.fillCount < frames && rounds < 4 {
             rounds += 1
             // 每次转换产出约 frames 帧；输入按比例累加取整（滑动累加器，长期零损耗）。
-            resampleInputAccum += Double(frames) * ratio
-            let needIn = min(Int(inBuffer.frameCapacity), Int(resampleInputAccum.rounded(.down)))
+            let needIn = min(Int(inBuffer.frameCapacity),
+                             resampleDemand(frames: frames, ratio: ratio, remainder: &resampleInputAccum))
             let read = withUnsafeTemporaryAllocation(
                 of: UnsafeMutablePointer<Float>.self, capacity: inChannels
             ) { pointers -> Int in
@@ -1401,7 +1442,6 @@ let sourceNode = AVAudioSourceNode(format: nodeFormat) { _, _, frameCount, audio
                 return playbackRing.read(into: pointers.baseAddress!,
                                          channelCount: inChannels, frames: needIn)
             }
-            resampleInputAccum -= Double(read)
             if read == 0 { break }
             inBuffer.frameLength = AVAudioFrameCount(read)
             if read < needIn {
@@ -1450,6 +1490,7 @@ let sourceNode = AVAudioSourceNode(format: nodeFormat) { _, _, frameCount, audio
             return resampleOutRing.read(into: base, channelCount: count, frames: frames)
         }
         consumed.add(frames: readOut)
+        underruns.record(requested: frames, supplied: readOut)
         if readOut < frames {
             for buffer in buffers {
                 guard let data = buffer.mData else { continue }
@@ -1474,6 +1515,7 @@ let sourceNode = AVAudioSourceNode(format: nodeFormat) { _, _, frameCount, audio
         return playbackRing.read(into: base, channelCount: count, frames: frames)
     }
     consumed.add(frames: read)
+    underruns.record(requested: frames, supplied: read)
     if read < frames {
         let missing = frames - read
         for buffer in buffers {
@@ -1749,6 +1791,9 @@ Thread {
 
 let startTime = Date()
 var stallStreak = 0
+var underrunCheckAt = ProcessInfo.processInfo.systemUptime
+var underrunCheckFrames = 0
+var underrunCheckInput = capture.meter.snapshot().frames
 
 let controlTimer = Timer(timeInterval: 0.05, repeats: true) { _ in
     // 先看上一拍 EQ 之后有没有削波：有就收缩正增益预算（最快 1.4 dB/s），输出干净则慢回。
@@ -1762,6 +1807,21 @@ let controlTimer = Timer(timeInterval: 0.05, repeats: true) { _ in
         outHeadroomTrimDb = max(0, outHeadroomTrimDb - 0.004)
     }
     applyEq(state)
+    let now = ProcessInfo.processInfo.systemUptime
+    if now - underrunCheckAt >= 5.0 {
+        let missing = underruns.snapshot().frames
+        let input = capture.meter.snapshot().frames
+        // Require sustained capture: a stopped player must not trigger fallback.
+        // 100 ms of missing output in 5 s is a failure, even with no backlog.
+        if stemBridge != nil,
+           input - underrunCheckInput >= Int(sourceFormat.sampleRate * 4),
+           missing - underrunCheckFrames >= Int(nodeFormat.sampleRate * 0.1) {
+            quit("分轨输出欠载，退出并回退普通 EQ")
+        }
+        underrunCheckAt = now
+        underrunCheckFrames = missing
+        underrunCheckInput = input
+    }
     // 链路自检（2026-10-23）：tap 采样率与输出设备不一致时（如 QQ 音乐 48 kHz、蓝牙
     // 设备 44.1 kHz），消费端永远比生产端慢，ring 持续积满 → 丢帧 = 用户听到的抖动。
     // 连续 3 秒 fill > 80% 就判定不匹配：退出并销毁 tap，让 QQ 音乐原声恢复（fail-open）。
@@ -1794,6 +1854,8 @@ if options.reportSeconds > 0 {
             "frames": meter.frames,
             "ring_fill": capture.ring.fillCount,
             "consumed_frames": consumed.snapshot().frames,
+            "output_underrun_frames": underruns.snapshot().frames,
+            "output_underrun_events": underruns.snapshot().events,
             "consumed_callbacks": consumed.snapshot().callbacks,
             "depth": Double(snapshot.depth),
             "media_percent": Double(snapshot.mediaPercent),

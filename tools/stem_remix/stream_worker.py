@@ -299,7 +299,7 @@ def main() -> int:
                 "index": window_index,
                 "stems": list(stems),
                 "process_ms": round(elapsed * 1000.0, 1),
-                "rtf": round(elapsed / args.window, 3),
+                "rtf": round(elapsed / (hop_out / args.sample_rate), 3),
                 "roles": roles,
                 "environment": environment,
                 "gains_db": gains,

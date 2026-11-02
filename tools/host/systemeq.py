@@ -201,13 +201,13 @@ class SystemEqService:
                     self.last_error = reason
                     if "采样率不匹配" in reason:
                         self._no_auto_restart = reason
-                    elif self.stem_worker and "ring 持续积压" in reason:
+                    elif self.stem_worker and ("ring 持续积压" in reason or "分轨输出欠载" in reason):
                         # 分轨跟不上时先活下来：卸掉 stem worker，下一次重试改为
                         # 普通 24 段 EQ。媒体识别和 S3 包络随进程恢复，不能因为
                         # 分轨失败把整条 QQ 音乐执行端永久留在 unavailable。
                         self._stem_fallback_reason = reason
                         self.stem_worker = None
-                        self.reason = "分轨 ring 持续积压，已切回 24 段 EQ"
+                        self.reason = f"{reason}；将回退 24 段 EQ"
                         self.last_error = self.reason
                     else:
                         # ring 积压 / 设备配置变化等：允许自动重建，但 60 秒内最多 3 次。
@@ -432,6 +432,8 @@ class SystemEqService:
             "callbacks": state.get("callbacks"),
             "frames": state.get("frames"),
             "consumed_frames": state.get("consumed_frames"),
+            "output_underrun_frames": state.get("output_underrun_frames"),
+            "output_underrun_events": state.get("output_underrun_events"),
             "sample_rate": state.get("sample_rate") or (ready or {}).get("sample_rate"),
             #: 运行中二进制的真实 SHA/大小。用它确认试听的是刚构建的执行器，不再用源码
             #: 修改时间猜版本。
