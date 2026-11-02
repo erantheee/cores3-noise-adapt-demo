@@ -24,6 +24,7 @@
 #include "mic_capture.hpp"
 #include "mic_decimator.hpp"
 #include "music_state.hpp"
+#include "scene_classifier.hpp"
 #include "sdkconfig.h"
 #include "sound_event.hpp"
 
@@ -275,6 +276,10 @@ void emit_command_json(const EarbudCommand& command) {
                 // unknown/0.0/false，与 context 组同构。
                 "\"context_top2\":\"%s\",\"context_top2_score\":%.3f,"
                 "\"context_mixed\":%s,"
+                // 环境场景（追加可选键，不涨 schema）：与 context 同一 2 s 窗，
+                // 但只回答街道/高速/市集/安静/人声/其他。valid=false 表示窗未满。
+                "\"scene\":\"%s\",\"scene_score\":%.3f,\"scene_valid\":%s,"
+                "\"scene_us\":%ld,"
                 "\"event\":\"%s\",\"event_valid\":%s,"
                 "\"speech_gate\":%.3f,\"speech_gate_valid\":%s,\"speech_gate_us\":%ld}\n",
                 command.context.class_name, static_cast<double>(command.context.score),
@@ -285,6 +290,9 @@ void emit_command_json(const EarbudCommand& command) {
                     : "unknown",
                 static_cast<double>(command.context.top2_score),
                 command.context.mixed ? "true" : "false",
+                scene_name(command.scene.kind), static_cast<double>(command.scene.score),
+                command.scene.valid ? "true" : "false",
+                static_cast<long>(command.scene.inference_us),
                 command.event.class_name,
                 command.event.valid ? "true" : "false",
                 static_cast<double>(command.speech_gate_score),
@@ -670,6 +678,7 @@ void processing_task(void*) {
 
     NoiseAnalyzer analyzer;
     AdaptController controller;
+    scene::Classifier scene_classifier;
     controller.set_evidence_policy(kEvidencePolicy);
     latency::LatencyProfiler profiler;
     latency::ProfilerOverhead overhead;
@@ -1074,6 +1083,7 @@ void processing_task(void*) {
             // frames before the gap form a slope and a modulation statistic together with the
             // frames after it. The analyser has the same rule for its own history.
             context_window->reset();
+            scene_classifier.reset();
         }
 
         ContextResult context_result;
@@ -1131,6 +1141,17 @@ void processing_task(void*) {
             const float gate_exp1 = std::exp(gate_logits[1] - gate_max);
             command.speech_gate_score = gate_exp1 / (gate_exp0 + gate_exp1);
             command.speech_gate_valid = true;
+
+            // 环境场景（街道/高速/市集/安静/人声/其他）。与 9 类模型同一个 92 维窗；
+            // 先去掉整体电平再跑 92→3 线性头，只上报/显示，不改决策。
+            const int64_t scene_started_us = esp_timer_get_time();
+            const scene::Result scene_out = scene_classifier.update(
+                window_vector, command.environment == EnvironmentKind::voice_likely);
+            command.scene.valid = scene_out.valid;
+            command.scene.kind = scene_out.kind;
+            command.scene.score = scene_out.score;
+            command.scene.inference_us =
+                static_cast<int32_t>(esp_timer_get_time() - scene_started_us);
         }
         // Assigned after `controller.update()`, and the controller never reads it back: that
         // separation is what makes this a no-behaviour-change round.

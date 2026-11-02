@@ -83,6 +83,11 @@ CONTEXT_CLASSES = (
 #: 把预热期显示成一个结论。
 CONTEXT_UNKNOWN = "unknown"
 
+#: 端侧环境场景（main/scene_classifier.hpp）。`unknown` 只允许出现在 scene_valid=false
+#: 的帧里；valid=true 时必须是下面六类之一。
+SCENE_CLASSES = ("quiet", "street", "highway", "market", "speech", "other")
+SCENE_UNKNOWN = "unknown"
+
 #: 端侧声音事件判断（main/sound_event.hpp）的类别。顺序与 `Class` 枚举一致。
 #: `artifact` 是输入中断（削波/撞击），不是声音类别：它只表示"这一帧不可用、窗已清空"。
 EVENT_CLASSES = ("quiet", "speech", "keyboard", "wind", "artifact")
@@ -207,6 +212,12 @@ class CommandFrame:
     context_top2: str | None = None
     context_top2_score: float | None = None
     context_mixed: bool | None = None
+    #: 端侧环境场景（main/scene_classifier.hpp）。None = 旧固件没报。
+    #: `scene_valid=False` 是“2 秒窗还没满”，不是“判断为 unknown”。
+    scene: str | None = None
+    scene_score: float | None = None
+    scene_valid: bool | None = None
+    scene_us: int | None = None
     #: 92 维窗上的说话/非说话二分类学生输出（speech_gate_model.h）。None = 旧固件没报。
     #: **只做遥测**：当前不参与决策，替换四判据要过 D19 验收。
     speech_gate: float | None = None
@@ -429,6 +440,11 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
     context_top2_score = _as_float(payload, "context_top2_score")
     raw_context_mixed = payload.get("context_mixed")
     context_mixed = raw_context_mixed if isinstance(raw_context_mixed, bool) else None
+    scene = _as_str(payload, "scene")
+    scene_score = _as_float(payload, "scene_score")
+    scene_us = _as_int(payload, "scene_us")
+    raw_scene_valid = payload.get("scene_valid")
+    scene_valid = raw_scene_valid if isinstance(raw_scene_valid, bool) else None
     event = _as_str(payload, "event")
     raw_event_valid = payload.get("event_valid")
     event_valid = raw_event_valid if isinstance(raw_event_valid, bool) else None
@@ -605,6 +621,26 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
             f"context_valid=false 却报了第二候选 {context_top2!r}（占位符应是 {CONTEXT_UNKNOWN!r}）"
         )
 
+    # 环境场景四键一组。`scene_valid=false` 时固件报 `unknown`；valid=true 时必须是六类之一。
+    scene_fields = (scene, scene_score, scene_valid, scene_us)
+    scene_reported = [value is not None for value in scene_fields]
+    if any(scene_reported) and not all(scene_reported):
+        problems.append(
+            "场景字段只报了一部分（scene/scene_score/scene_valid/scene_us 是一组）"
+        )
+    elif scene_valid is True:
+        if scene not in SCENE_CLASSES:
+            problems.append(f"未知场景类别 {scene!r}")
+        if scene_score is None or not 0.0 <= scene_score <= 1.0:
+            problems.append(f"场景置信度 {scene_score} 不在 [0,1]")
+        if scene_us is not None and scene_us < 0:
+            problems.append(f"场景推理耗时 {scene_us} µs 为负数")
+    elif scene_valid is False:
+        if scene is not None and scene != SCENE_UNKNOWN:
+            problems.append(
+                f"scene_valid=false 却报了类别 {scene!r}（占位符应是 {SCENE_UNKNOWN!r}）"
+            )
+
     speech_gate = _as_float(payload, "speech_gate")
     speech_gate_valid = _as_bool(payload, "speech_gate_valid")
     speech_gate_us = _as_int(payload, "speech_gate_us")
@@ -683,6 +719,10 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
                 None if context_top2_score is None else d2(context_top2_score)
             ),
             context_mixed=context_mixed,
+            scene=scene,
+            scene_score=None if scene_score is None else d2(scene_score),
+            scene_valid=scene_valid,
+            scene_us=scene_us,
             speech_gate=speech_gate,
             speech_gate_valid=speech_gate_valid,
             speech_gate_us=speech_gate_us,

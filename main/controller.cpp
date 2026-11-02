@@ -903,6 +903,19 @@ const char* environment_name(EnvironmentKind environment) {
     return "UNKNOWN";
 }
 
+const char* scene_name(SceneKind scene) {
+    switch (scene) {
+        case SceneKind::quiet: return "quiet";
+        case SceneKind::street: return "street";
+        case SceneKind::highway: return "highway";
+        case SceneKind::market: return "market";
+        case SceneKind::speech: return "speech";
+        case SceneKind::other: return "other";
+        case SceneKind::unknown: return "unknown";
+    }
+    return "unknown";
+}
+
 const char* noise_spectrum_name(NoiseSpectrum spectrum) {
     switch (spectrum) {
         case NoiseSpectrum::none: return "NONE";

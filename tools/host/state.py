@@ -35,6 +35,7 @@ from .protocol import (
     DEMO_SPEECH_GAIN_DB,
     KNOWN_ENVIRONMENTS,
     KNOWN_STATES,
+    SCENE_CLASSES,
     MAX_BAND_GAIN_DB,
     MAX_NOISE_REDUCTION_DB,
     MAX_SPEECH_GAIN_DB,
@@ -106,6 +107,17 @@ CONTEXT_TEXT = {
     "wind": "风声",
 }
 
+#: 端侧环境场景（main/scene_classifier.hpp）。与上面的 9 类情境是两条判断：
+#: 场景回答“哪种环境”，9 类模型回答“模型认为像什么”。中文只在这一层映射。
+SCENE_TEXT = {
+    "quiet": "安静",
+    "street": "街道",
+    "highway": "高速",
+    "market": "菜市场",
+    "speech": "人声",
+    "other": "其他",
+}
+
 
 #: 端侧声音事件判断（main/sound_event.hpp）的类别译名。`artifact` 是输入中断（削波/撞击），
 #: 不是声音类别；界面上要把它显示成"受撞击"而不是"未知"。
@@ -136,6 +148,15 @@ def context_text(value: str | None) -> str:
     if value == "unknown":
         return "尚未判断"
     return CONTEXT_TEXT.get(value, f"未知({value})")
+
+
+def scene_text(value: str | None) -> str:
+    """环境场景的显示文本。`unknown` 是窗未满的占位符，不是第 7 个场景。"""
+    if value is None:
+        return "—"
+    if value == "unknown":
+        return "尚未判断"
+    return SCENE_TEXT.get(value, f"未知({value})")
 
 
 def environment_text(value: str | None) -> str:
@@ -883,6 +904,13 @@ class HostState:
                 "context_top2_text": context_text(frame.context_top2),
                 "context_top2_score": frame.context_top2_score,
                 "context_mixed": frame.context_mixed,
+                # 环境场景（scene_classifier.hpp）。四字段整体 None = 旧固件没报；
+                # `scene_valid=False` = 窗还没满，不是“判断为 unknown”。
+                "scene": frame.scene,
+                "scene_text": scene_text(frame.scene),
+                "scene_score": frame.scene_score,
+                "scene_valid": frame.scene_valid,
+                "scene_us": frame.scene_us,
                 # 声音事件判断。与情境模型同一纪律：没报 / 窗未满 / 有判断三态分开。
                 "event": frame.event,
                 "event_text": event_text(frame.event),
@@ -998,6 +1026,9 @@ def self_check() -> list[str]:
     for name in CONTEXT_CLASSES:
         if name not in CONTEXT_TEXT:
             notes.append(f"缺少情境类别中文映射: {name}")
+    for name in SCENE_CLASSES:
+        if name not in SCENE_TEXT:
+            notes.append(f"缺少场景类别中文映射: {name}")
     return notes
 
 
@@ -1006,6 +1037,7 @@ __all__ = [
     "CAPTURE_PERIOD_MS",
     "CONTEXT_TEXT",
     "ENVIRONMENT_TEXT",
+    "SCENE_TEXT",
     "LINK_TEXT",
     "SOURCE_TEXT",
     "STATE_TEXT",
@@ -1016,6 +1048,7 @@ __all__ = [
     "Stats",
     "capture_text",
     "context_text",
+    "scene_text",
     "event_text",
     "environment_text",
     "link_text",

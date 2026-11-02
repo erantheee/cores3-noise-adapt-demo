@@ -12,12 +12,9 @@
 特征（同一段代码在推理时也用这些值），用它训练等于"特征零错位"。录音通道是 16 kHz 的
 降采样流，只用来人工复核和低频段交叉验证。
 
-两处已知近似（都属于"JSON 里暂时没有这个字段"，上固件时都只是一行 printf）：
-  * broadband_dbfs：用 24 频段功率和近似（带限 RMS，缺 14 kHz 以上与 20 Hz 以下的能量）
-  * motion：固定 0（IMU 值当前不在 JSON 里）
-
-因此用本工具产出的数据训练出的模型，在固件里落地的第一步应当是：把这两个字段补进 JSON，
-再用同一条管线重训一次，消掉近似。
+宽带电平直接使用固件 broadband_dbfs；缺字段拒绝转换，不用频段和冒充真实 RMS。
+motion 仍固定 0，采集时间以设备 timestamp_ms 为准。真实数据不自动分到验证集，
+训练前必须按录音源／会话切分；相邻窗不得跨集合。
 """
 
 from __future__ import annotations
@@ -37,17 +34,18 @@ from features import (BAND_COUNT, FEATURE_NAMES, VOCAL_BANDS, WINDOW_FRAMES,  # 
                       window_vector)
 
 
-def frames_from_bands(band_dbfs: np.ndarray) -> dict:
+def frames_from_bands(band_dbfs: np.ndarray, broadband: np.ndarray, times: np.ndarray) -> dict:
     """把逐帧频段值补齐成 window_vector 需要的结构（描述量是频段的确定性函数，可精确重构）。"""
     import features as F
 
     feats = F.voice_features_from_bands(band_dbfs)
-    power = np.power(10.0, band_dbfs / 10.0)
-    broadband = 10.0 * np.log10(np.maximum(power.sum(axis=-1), 1e-12))
+    broadband = np.asarray(broadband, dtype=np.float64)
+    if broadband.shape != (len(band_dbfs),) or not np.isfinite(broadband).all():
+        raise ValueError("missing/non-finite real broadband_dbfs; recapture with current firmware")
     vl = F.voice_likelihood(band_dbfs, broadband, feats)
     n = band_dbfs.shape[0]
     return {
-        "t_s": np.arange(n) * 0.1,
+        "t_s": times,
         "broadband_dbfs": broadband,
         "band_dbfs": band_dbfs,
         "voice_likelihood": vl,
@@ -62,21 +60,29 @@ def convert(root: Path, out: Path, hop: int = 5, min_frames: int = WINDOW_FRAMES
         raise SystemExit(f"{root} 下没有找到 <label>/frames.jsonl")
     X, y, meta, classes = [], [], [], []
     for sess in sessions:
-        label = sess.name.split("-")[0]
+        label = json.loads((sess / "meta.json").read_text())["label"]
         if label not in classes:
             classes.append(label)
         ci = classes.index(label)
         rows = [json.loads(l) for l in (sess / "frames.jsonl").read_text().splitlines() if l.strip()]
-        bands = np.array([r["ambient_band_dbfs"] for r in rows], dtype=np.float64)
-        if bands.shape[1] != BAND_COUNT:
-            raise SystemExit(f"{sess}: 频段数 {bands.shape[1]} != {BAND_COUNT}")
-        frames = frames_from_bands(bands)
+        if len(rows) < min_frames:
+            raise SystemExit(f"{sess}: fewer than {min_frames} frames")
+        bands = np.array([r["band_dbfs"] for r in rows], dtype=np.float64)
+        if bands.ndim != 2 or bands.shape[1] != BAND_COUNT or not np.isfinite(bands).all():
+            raise SystemExit(f"{sess}: invalid band array {bands.shape}")
+        try:
+            times = np.array([r["t_ms"] for r in rows], dtype=np.float64) / 1000
+            if not np.isfinite(times).all() or np.any(np.diff(times) <= 0):
+                raise ValueError("timestamps must increase within a session")
+            frames = frames_from_bands(bands, np.array([r["broadband_dbfs"] for r in rows]), times)
+        except (KeyError, ValueError) as exc:
+            raise SystemExit(f"{sess}: {exc}") from exc
         n = len(rows)
         starts = range(0, max(n - min_frames + 1, 1), hop)
         for s in starts:
             X.append(window_vector(frames, s, s + WINDOW_FRAMES, motion=None, when=None))
             y.append(ci)
-            meta.append(f"{sess.name}@{s * 0.1:.1f}s")
+            meta.append(f"{sess.name}@{times[s]:.3f}s")
     X = np.asarray(X, dtype=np.float32)
     y = np.asarray(y, dtype=np.int64)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -90,7 +96,7 @@ def convert(root: Path, out: Path, hop: int = 5, min_frames: int = WINDOW_FRAMES
 def capture(port: str, baud: int, label: str, seconds: float, out_dir: Path, wav: bool):
     import serial
 
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=False)
     frames_path = out_dir / "frames.jsonl"
     wav_path = out_dir / "audio.wav"
     writer = wave.open(str(wav_path), "wb") if wav else None
@@ -121,6 +127,7 @@ def capture(port: str, baud: int, label: str, seconds: float, out_dir: Path, wav
                 fh.write(json.dumps({
                     "t_ms": payload.get("timestamp_ms"),
                     "band_dbfs": payload["ambient_band_dbfs"],
+                    "broadband_dbfs": payload.get("broadband_dbfs"),
                     "mode": payload.get("mode"),
                     "environment": payload.get("environment"),
                     "confidence": payload.get("confidence"),
@@ -138,7 +145,7 @@ def capture(port: str, baud: int, label: str, seconds: float, out_dir: Path, wav
     (out_dir / "meta.json").write_text(json.dumps({
         "label": label, "seconds": seconds,
         "frames": n_frames, "mic_chunks": n_chunks,
-        "note": "broadband 用频段和近似；motion 固定 0（见脚本头部说明）",
+        "note": "broadband_dbfs 为固件实测；motion 固定 0；独立会话采集后再切分",
     }, ensure_ascii=False, indent=2))
     print(f"{n_frames} 帧 JSON、{n_chunks} 个音频块 -> {out_dir}")
 

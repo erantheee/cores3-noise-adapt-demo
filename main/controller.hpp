@@ -60,6 +60,19 @@ enum class EnvironmentKind : uint8_t {
     loud,
 };
 
+/// 端侧环境场景（scene_classifier.hpp）。与上面的 EnvironmentKind 分开：
+/// EnvironmentKind 是“该不该调、怎么调”的四档行为输入；SceneKind 是“这是哪种环境”的
+/// 语义判断。前者继续驱动现有 EQ，后者先只上报/显示，等真机验收后再接决策。
+enum class SceneKind : uint8_t {
+    unknown,
+    quiet,
+    street,
+    highway,
+    market,
+    speech,
+    other,
+};
+
 /// 当前遮蔽噪声主要落在哪个频段。它来自 24 段实测谱，不把“风/键盘”等事件类别
 /// 硬猜成频率；事件模型回答是什么声音，频谱分类回答歌曲该补哪里。
 enum class NoiseSpectrum : uint8_t {
@@ -159,6 +172,17 @@ struct ContextResult {
     int32_t inference_us = 0;
     /// Points at a string literal from `listening_model.h`: static storage, never freed.
     const char* class_name = "unknown";
+};
+
+/// 端侧环境场景输出（scene_classifier.hpp）。与 ContextResult 同一纪律：音频任务写，
+/// AdaptController 不读回；本轮只上报/显示，不改任何决策。
+struct SceneResult {
+    /// False = 2 秒窗还没满，不是“判断为 unknown”。
+    bool valid = false;
+    SceneKind kind = SceneKind::unknown;
+    /// 场景头的 softmax 置信度；quiet 固定 1.0，speech 用窗均 voice。
+    float score = 0.0f;
+    int32_t inference_us = 0;
 };
 
 /// 端侧声音事件判断（键盘 / 风 / 说话 / 安静 / 撞击）的输出。
@@ -270,6 +294,8 @@ struct EarbudCommand {
     EvidencePolicy evidence_policy = EvidencePolicy::bone_only;
     /// Model telemetry. `AdaptController` never touches this field.
     ContextResult context;
+    /// 环境场景（街道/高速/市集/安静/人声/其他）。只上报/显示，不参与决策。
+    SceneResult scene;
     /// 声音事件判断（1 s 窗）。键盘/说话/撞击只上报；风在 song_eq 且无对话时压低频
     /// 抬升上限（D21，见 apply_wind_eq）。
     SoundEventResult event;
@@ -408,6 +434,7 @@ private:
 
 const char* adapt_state_name(AdaptState state);
 const char* environment_name(EnvironmentKind environment);
+const char* scene_name(SceneKind scene);
 const char* noise_spectrum_name(NoiseSpectrum spectrum);
 const char* tuning_mode_name(TuningMode mode);
 const char* conversation_state_name(ConversationState state);

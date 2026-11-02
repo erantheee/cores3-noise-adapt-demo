@@ -69,6 +69,12 @@ add_executable(sound_event_test sound_event_test.cpp)
 target_include_directories(sound_event_test PRIVATE ../main)
 add_test(NAME sound_event_test COMMAND sound_event_test)
 
+# 环境场景头（92 维窗 → 街道/高速/市集）。金标准由 experiments/scene-model/export_model.py
+# 一并导出：Python 与 C++ 必须给同一组 logits，不能“看起来差不多”。
+add_executable(scene_test scene_test.cpp)
+target_include_directories(scene_test PRIVATE ../main)
+add_test(NAME scene_test COMMAND scene_test)
+
 # 说话 vs 非说话二分类学生（92 维窗）。金标准与 main/speech_gate_model.h 由
 # experiments/sound-events/export_speech_gate.py 一起生成。
 add_executable(speech_gate_test speech_gate_test.cpp)
@@ -86,3 +92,10 @@ add_test(NAME dual_mic_test COMMAND dual_mic_test)
 add_executable(music_state_test music_state_test.cpp)
 target_include_directories(music_state_test PRIVATE ../main)
 add_test(NAME music_state_test COMMAND music_state_test)
+
+# Saved-parameter export must reproduce tracked headers; no model training in CI.
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_test(NAME scene_export_check
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../experiments/scene-model/export_model.py
+    --model ${CMAKE_CURRENT_SOURCE_DIR}/../experiments/scene-model/artifacts/v0.1-s3-scene.json
+    --output-root ${CMAKE_CURRENT_SOURCE_DIR}/.. --check)

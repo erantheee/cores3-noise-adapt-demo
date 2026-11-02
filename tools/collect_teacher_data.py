@@ -187,6 +187,7 @@ class Capture:
             "host_time_ms": int(time.monotonic() * 1000),
             "t_ms": timestamp,
             "bands": payload["ambient_band_dbfs"],
+            "broadband_dbfs": payload.get("broadband_dbfs"),
             "environment": payload.get("environment"),
             "event": payload.get("event"),
             "event_valid": payload.get("event_valid"),
