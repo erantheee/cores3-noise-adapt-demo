@@ -19,7 +19,10 @@ def main():
         p.error('output already exists; choose a new version/artifact')
     with np.load(args.dataset, allow_pickle=False) as data:
         x = data['X'].astype(np.float32)
-        y = data['y'].astype(np.int64)
+        labels = data['y']
+        if labels.dtype.kind not in 'iu':
+            p.error('y must contain integer class labels, not rounded floats')
+        y = labels.astype(np.int64)
         groups = data['source_id'].astype(str)
         split = data['split'].astype(str)
         classes = data['classes'].astype(str).tolist()
