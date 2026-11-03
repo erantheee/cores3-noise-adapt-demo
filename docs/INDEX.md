@@ -25,3 +25,4 @@
 
 - [2026-11-02 集成候选验收协议](acceptance-20261102.md)
 - [场景模型复现与训练边界](../experiments/scene-model/README.md)
+- [混合声源独立输出、标注与验收](../experiments/sound-sources/README.md)

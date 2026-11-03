@@ -161,6 +161,14 @@
       <div class="meter"><span id="ctx-bar"></span></div>
       <div class="sub" id="ctx-raw">—</div>
       <div class="sub" id="ctx-note">2 秒窗 · 文件域标定，未做真机麦克风验收 · 只显示，不参与决策</div>
+      <div class="sub" id="sources-card">
+        <span>并存声源 · </span><span id="sources">—</span>
+        <details id="sources-details" style="display:none">
+          <summary>识别详情（未验证）</summary>
+          <div id="sources-detail"></div>
+          <div id="sources-note">仅观察</div>
+        </details>
+      </div>
       <div class="sub" id="vp">声纹 · 未启用</div>
     </div>
     <!--
@@ -585,6 +593,37 @@ function renderContextModel(f) {
   $("ctx-note").textContent = note;
 }
 
+function renderSources(s) {
+  const value = s.frame && s.frame.sound_sources;
+  const names = {traffic:"车流", horn_alarm:"鸣笛／警报", speech:"人声", wind:"风噪",
+                 music:"音乐", keyboard:"键盘", mechanical:"稳态机械声"};
+  const live = s.connected && (s.control_data_live === undefined ? !s.stale : s.control_data_live);
+  const statuses = {window_incomplete:"窗口未满", input_invalid:"输入异常",
+                    model_unavailable:"模型待训练", model_invalid:"模型异常",
+                    data_interrupted:"数据中断"};
+  $("sources-note").textContent = "未验证 · 仅观察";
+  $("sources-details").style.display = value && live && value.valid === true ? "" : "none";
+  if (!value || !live || value.valid !== true) {
+    $("sources").textContent = !s.frame ? "等待数据" : !live ? "数据中断"
+      : !value ? "当前固件未提供" : statuses[value.status] || "无法判断";
+    $("sources-detail").textContent = "";
+    return;
+  }
+  const detected = [], details = [];
+  for (const [key, label] of Object.entries(names)) {
+    const channel = value.channels && value.channels[key];
+    if (!channel || typeof channel.score !== "number") {
+      details.push(`${label}：未训练／未验证`);
+      continue;
+    }
+    if (channel.detected === true) detected.push(label);
+    details.push(`${label}：${channel.detected ? "检出" : "未检出"} · 分数 ${channel.score.toFixed(2)} · ${channel.validated ? "已验证" : "未验证"}`);
+  }
+  $("sources").textContent = detected.length ? detected.join("＋") : "未检出已支持声源";
+  $("sources-detail").textContent = details.join("；");
+  $("sources-note").textContent = `版本 ${value.version} · 仅观察 · 安静状态未标定`;
+}
+
 function renderContext(f) {
   if (f.scene === null || f.scene === undefined) {
     // 旧固件：没有场景头，继续按九分类显示。
@@ -699,6 +738,7 @@ function render(s) {
     : "暂停 = 停执行端（EQ/媒体/环境声复位），采集与 AI 继续；启动请双击 Mac 上的「启动演示.command」";
 
   const f = s.frame;
+  renderSources(s);
   if (!f) {
     ["env", "ctx", "state", "gain", "media", "link", "conf"].forEach((id) => ($(id).textContent = "—"));
     $("amb").textContent = "—";
@@ -1702,6 +1742,7 @@ $("player-seek").addEventListener("change", async () => {
 // 暴露给渲染校验（tools/host/tests/render_check.js）：那台脚本用 DOM 桩把 render()
 // 真跑一遍，断言"喂进真实快照时界面上会出现什么"。界面里唯一会算错的就是这一层。
 window.__render = render;
+window.__renderSources = renderSources;
 
 function connect() {
   const source = new EventSource("/events");
@@ -1709,6 +1750,7 @@ function connect() {
     try { render(JSON.parse(event.data)); } catch (error) { console.error(error); }
   };
   source.onerror = () => {
+    renderSources({connected:false, frame:null});
     $("conn-dot").className = "dot bad";
     $("conn-text").textContent = "与上位机的连接断了，正在重连…";
   };

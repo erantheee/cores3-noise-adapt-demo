@@ -28,6 +28,8 @@ from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Iterable
 
+from .sound_sources import parse_sources
+
 #: 本上位机实现的协议版本。设备侧 schema_version 不是这个值时必须显式报告不兼容，
 #: 而不是按 v1 去解读——字段含义变了却继续显示，比显示不出来更糟。
 #: v4 加了 `ambient_open`（环境声开放意图），同时读 v1–v4 的历史日志。
@@ -218,6 +220,7 @@ class CommandFrame:
     scene_score: float | None = None
     scene_valid: bool | None = None
     scene_us: int | None = None
+    sound_sources: dict | None = None
     #: 92 维窗上的说话/非说话二分类学生输出（speech_gate_model.h）。None = 旧固件没报。
     #: **只做遥测**：当前不参与决策，替换四判据要过 D19 验收。
     speech_gate: float | None = None
@@ -679,6 +682,13 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
     if mic_coherence is not None and not -1.0 <= mic_coherence <= 1.0:
         problems.append(f"双麦相关系数 {mic_coherence} 不在 [-1,1]")
 
+    sound_sources = None
+    if "sound_sources" in payload:
+        try:
+            sound_sources = parse_sources(payload["sound_sources"])
+        except ValueError as exc:
+            problems.append(str(exc))
+
     return ParsedLine(
         value=CommandFrame(
             sequence=sequence,
@@ -723,6 +733,7 @@ def _parse_command(payload: dict[str, Any]) -> ParsedLine:
             scene_score=None if scene_score is None else d2(scene_score),
             scene_valid=scene_valid,
             scene_us=scene_us,
+            sound_sources=sound_sources,
             speech_gate=speech_gate,
             speech_gate_valid=speech_gate_valid,
             speech_gate_us=speech_gate_us,

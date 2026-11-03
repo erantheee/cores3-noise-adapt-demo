@@ -95,6 +95,16 @@ add_test(NAME music_state_test COMMAND music_state_test)
 
 # Saved-parameter export must reproduce tracked headers; no model training in CI.
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_executable(sound_sources_test sound_sources_test.cpp)
+target_include_directories(sound_sources_test PRIVATE ../main)
+add_test(NAME sound_sources_test COMMAND sound_sources_test)
+add_test(NAME sound_sources_protocol_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../tools/host/tests/test_sound_sources.py)
+find_program(NODE_EXECUTABLE node)
+if(NODE_EXECUTABLE)
+    add_test(NAME sound_sources_render_test
+        COMMAND ${NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../tools/host/tests/render_sound_sources.js)
+endif()
 add_test(NAME scene_export_check
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../experiments/scene-model/export_model.py
     --model ${CMAKE_CURRENT_SOURCE_DIR}/../experiments/scene-model/artifacts/v0.1-s3-scene.json

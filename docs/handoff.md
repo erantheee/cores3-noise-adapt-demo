@@ -1,5 +1,58 @@
 # Session handoff — 2026-11-02
 
+## Git synchronization preparation (2026-11-03)
+- User requested pushing the current version. Remaining mixed-source telemetry/pipeline/UI edits and prior dropout evidence are being committed with the existing ten local commits on feature/apple-conversation-awareness.
+- Rechecked: CTest 18/18, host 111 groups/8136 assertions, synthetic pipeline 4/4, firmware build passed. No flashing or live-service restart.
+- User reports current playback no longer stutters. Read-only snapshot during planning showed ordinary EQ active after stem underrun fallback; this does not establish that four-stem playback is continuously active. Masking benefit remains unaccepted.
+
+## UI consolidation and acceptance refresh (19:55)
+- User rejected standalone sound-sources card; merged its existing IDs into ctx-card as one subline. Valid-source details are collapsed; unavailable data has no expanded detail area. Existing concurrent sound-source implementation preserved. render_sound_sources.js passed; HTML nesting check passed. Server reads HTML per request; browser refresh suffices.
+- 19:53 EQ unavailable; by 19:55 host uptime reset (not restarted by this check) and candidate SHA151d9a9aaa78… EQ applied. 8-second follow-up: zero underrun, clips310→342, stems disabled after starvation. Voiceprint ready. Overall audio acceptance NOT passed; four-stem stability and listening tests remain open.
+
+## Mixed-source classification implementation (separate chat, 2026-11-02)
+- Manual approval retry completed (20:08): firmware build passed; binary SHA256 `5bba38aec038607548900e54fe2ffcc8fa5bae80214d7023e7139c05870e6feb`. Full host tests passed: 111 groups / 8136 assertions (`/tmp/sound-sources-host-manual.log`). Final CTest 18/18 and pipeline 4/4 passed. No deployment or shared-service restart.
+- Working checkout `feature/apple-conversation-awareness`, observed HEAD `be6ae74`; edits uncommitted. Preserved other chats' handoff, dropout evidence and deployment work. This chat did not flash, restart the host, take the serial port, play media or upload audio.
+- Added display-only `sound_sources` telemetry: seven independent sigmoid channels, portable 92→24→7 inference, continuity/input-invalid states, compact score/mask wire format, validated host parsing and panel clearing on stale/disconnected data. Legacy event/controller/EQ/dialogue/memo inputs unchanged by this implementation.
+- Added `collect_teacher_data.py --window-vectors` (new directories only), exact S3 feature-version/cadence markers; overlapping human annotation template/build/audit; masked multi-label NumPy training; train-only normalization/fit and validation-only thresholds; source/session split rejection; immutable saved artifacts/staging export. Pipeline and class/acceptance contract: `experiments/sound-sources/README.md`.
+- No real seven-label model trained/installed: inspected four tracked and ten local session directories (some copies); no new exact-vector records or multi-label human annotations. Two local voiceprint sessions report audio gaps. Default model accessor remains unavailable; quiet calibration remains null; all classes unvalidated. Existing model top2 is not coexisting-source evidence.
+- Verification: CTest 18/18 (C++, protocol/collector and Node render tests); pipeline 4/4 synthetic tests, including Python/C++ exported-score agreement and test-label isolation. Python syntax and whitespace checks passed. Synthetic results do not establish S3 accuracy, runtime/bandwidth, or field benefit.
+- Earlier restricted full host run had 9 permission-related failures and firmware configuration was blocked by sysctl access; manual approval resolved both as recorded above. Earlier deployment results below do NOT validate these new source edits on hardware.
+- Next: coordinate live serial owner before any deployment/capture. Collect real single/mixed conditions, manually review overlapping labels, then train/evaluate by independent source/session. Require real-S3 per-class all+mixed precision/recall ≥80%, FPR ≤10%, ≥60 s positive and negative coverage and ≥3 test sessions per subset, then device added inference ≤2 ms/frame/no extra losses. New outputs stay telemetry only.
+
+## Deployment and underrun fix (this thread, latest)
+- Commits c44f722 (underrun counters/fallback, bounded resampling demand, hop-based RTF), be6ae74 (macOS detached host uses new process session). Swift selftest 15/15; host 111 groups/8136 assertions; launcher passed.
+- Flashed firmware SHA 7918aa783d1aa7202dbd3465c1299fd6a09671c27cf36145efd54b0ce8b562bd. Fresh serial scene_valid telemetry confirmed. Executor SHA 151d9a9aaa78e8d67c5e82e820aab368daa18863ed3c16e5e7bd71d7f253bb16 confirmed live.
+- Deployment owner was DS-1 PID26462; preserved QQMusic/basic/voice gate/ambient off and DS-1 training/memo dirs. Corrected voiceprint enrollment to main checkout 记录/声纹/self-device (3 existing WAVs); worker now ready, no error.
+- Four-stem startup actually triggered new underrun fallback. Ordinary EQ then showed 0 underrun frames in an 8 s check, but +5 clipped samples. This is fallback validation, NOT stable stem/listening acceptance.
+- Latest later snapshot: host alive >2400 s, voiceprint ready; EQ unavailable after repeated output-device configuration changes triggered >3 restarts/60 s protection. Do not claim healthy audio. Investigate route churn before restarting again.
+- Concurrent sound_sources edits appeared in main/host/UI; preserved, not included in these commits. Flash log and live JSONs in 2026-11-02/que/work/deploy and outputs. No push yet.
+
+## Listening feedback: masking not achieved (read-only diagnosis)
+- User reports smoother sound after stems, but no audible masking. Treat comfort improvement and masking acceptance separately; masking remains failed by user listening feedback.
+- Checkout observed at `c44f722`; existing handoff/launcher edits preserved. Live snapshots: stem_requested=true but stem_stream=false, stem_ready=false, fallback_reason=分轨输出欠载，退出并回退普通 EQ. No restart or parameter changes.
+- Swift masking compares independently normalized environment/song spectral shapes, not calibrated at-ear music/noise SPL. Content-presence gate suppresses sparse song bands; transient gate, positive gain ceilings and headroom further constrain boosts. Latest snapshot masking_peak_db≈1.54, headroom_trim_db≈1.97; these alone do not quantify net masking or prove the cause of this listening result.
+- Next: identify noise type and listening conditions; distinguish desired reduction in noise noticeability from full coverage. Validate controlled listening A/B before claiming masking. No code/test/deployment changes in this check.
+
+## Approval diagnosis (latest)
+- 18:53 user applied configure.py successfully (backup config.toml.before-auto-review-20261102-185338-160925). Current config parsed: on-request + auto_review; session permission instructions also now enable auto_review. Actual escalated read-only `sub2api-client mode status --json --non-interactive` still rejected before execution: `Model "codex-auto-review" is not available for this group`. Configuration repair applied, automatic approval NOT restored. Previous manual/granular mode no longer explains this latest failure; next investigation must trace reviewer request/model support along proxy/upstream route, without assuming which layer owns the error.
+- Latest log 10:50:20 UTC for this chat confirms application-supplied `requestApprovalsReviewer=user`, permission profile `:workspace`, granular sandbox/rules/skill approvals=false. User explicitly wants automatic review. Root config still omits both approval keys; changing root defaults alone does not demonstrate removal of this chat override.
+- Prepared `/Users/eranthe/Documents/Codex/2026-11-02/auto-approval/configure.py`: preview or --apply, backups, parsed semantic check limiting changes to on-request + auto_review, preserves sandbox/provider, detects concurrent edits. Preview validated against current config; no global write performed (outside writable roots; sandbox approvals disabled). User must apply and select automatic approval in application, then verify real eligible approval. No repair-success claim.
+- Correction after user consulted pool operator: model-unavailable response establishes failure of the automatic-review request, not proof of a pool-side permission restriction. User's live doctor confirms agent ready, key/subscription/access valid and pool reachable.
+- Current root config has neither approval_policy nor approvals_reviewer. User screenshot proposes on-request + auto_review; official config reference says auto_review invokes reviewer subagent, so that alone does not establish a fix for missing reviewer model.
+- Current chat runtime now injects granular policy with sandbox_approval/rules/skill_approval=false; these categories automatically reject. Root-file defaults do not prove a change to this existing chat. No permission settings changed in this turn.
+- Local listener `127.0.0.1:58127` exists: PID 2924, Sub2API agent 0.6.2. Config provider `sub2api-lan`, model `gpt-6.1-sol`, local backend-api/codex URL.
+- Read-only escalated `sub2api-client doctor --all --live --json --non-interactive` was rejected before execution: `Automatic approval review failed: Model "codex-auto-review" is not available for this group`. Explicitly a review-service failure, not an unsafe-action determination.
+- Sandbox-only doctor/status cannot access agent reliably; their stopped/key-absent fields do not prove actual service/credential state. No provider/permission/agent changes made. User-reported 503 request `0b7f4144-3e00-41e0-a44a-896b49800550` remains untraced.
+- User Terminal run rejected `doctor --all --live --json --non-interactive` with BAD_ARGUMENT. Verified installed protocol.sh: JSON doctor accepts only optional --all, invokes route refresh. Correct command: `sub2api-client doctor --all --json --non-interactive` (no --live). Earlier description as purely read-only was inaccurate: JSON doctor refreshes the route.
+- Next: user runs corrected doctor in Terminal; gateway operator checks group availability/routing for approval model and traces the 503 request. Do not bypass approval checks.
+
+## Music dropout diagnosis (later read-only check)
+- Checkout HEAD `d438ea4`; running binary SHA `d68567cb0eac1f67ffb45942c092be907db3645a854b0188aba5b935ccfe406f`, verified against DS-1 worktree binary. No restart/config/firmware change.
+- Live four-stem htdemucs 2 s windows, 0.1 s overlap => 1.9 s output/hop. Observed process_ms 2312.1 and 2128.7: windows can miss playback deadlines. No stem error/fallback; media_percent stayed 100 throughout 20 samples.
+- Evidence: `docs/music-dropout-20261102.json`. Over sample endpoints, output meter advanced 1772820 stereo samples (=886410 frames), source supplied 878350 frames: ~8060 frames/183 ms deficit at 44.1 kHz (reporting skew applies). Confirms output supply gaps; source code fills shortage with zeros. No listening A/B performed.
+- Running source uses stem-only playback ring, initial >=24000-frame preroll, no immediate dry fallback on starvation; watchdog only detects high backlog. RTF divides by 2 s window rather than 1.9 s hop. Resampler also retains unfilled input demand after starvation; assess in fix.
+- CPU/process inspection blocked by broken automatic approval reviewer (`codex-auto-review` unavailable); resource contention/thermal cause of latency spikes remains unverified. Next: preserve live startup flags, fix underrun handling and measure bypass/stem A/B before claiming listening resolution.
+
 ## Candidate
 - Branch: `feature/apple-conversation-awareness`; baseline `49dc752`.
 - `46cf115`: experimental scene telemetry, saved model + train/export split, real broadband capture.
@@ -11,16 +64,16 @@
 - EQ off requests raw-sample worker bypass; queued audio/window/crossfade delay remains. Snapshot distinguishes request vs actual acknowledgement.
 
 ## Verification
-- CTest 15/15 incl. export check. Initial incremental firmware build passed; post-commit reconfigure blocked by psutil process-list permission. Final rebuild unverified.
+- CTest 15/15 incl. export check. Final firmware rebuild passed after manual approval; SHA 7918aa783d1aa7202dbd3465c1299fd6a09671c27cf36145efd54b0ce8b562bd.
 - systemeq build + selftest 11/11; launcher passed.
-- Offline host: 102 registered groups / 8073 assertions passed; 9 permission-dependent groups excluded explicitly. Full host suite is NOT green/complete.
+- Full host suite now passed: 111 groups / 8133 assertions after manual approval (work/host-tests-unrestricted.log in chat workspace).
 - Mock render 69/69; four-stem/fingerprint/bypass render 81/81.
 - Role policy 6/6; worker components 3/3; scene/capture pipeline 2/2 (synthetic fixtures, not field evidence).
-- User reports host restarted and separating. 16:16 startup log confirms serial source + Qwen config; live snapshot/browser blocked, actual stem/build still unverified. Did not kill/flash/restart.
-- Provider config now reads openai, but approval still fails: codex-auto-review unavailable. Local HTTP denied; no runtime confirmation. Read-only terminal collector: chat outputs/check_live_host.py. Local commits made; no push.
+- Read user-saved snapshots 17:03/17:07: serial live, htdemucs four stems ready, +4 windows/8 s, RTF 0.330–0.395, no stem error/fallback. Running SHA d68567cb0eac differs from disk candidate 948f33d1c174; requested/bypass fields missing. Clips +5/+2 per 8 s, +1161 across ~250 s. Sparse snapshots, not 30-min/listening acceptance. Did not kill/flash/restart.
+- Approval root evidence: latest request to localhost:58127/backend-api/codex/responses returned 404 for codex-auto-review. Config now sub2api-lan; Sub2API agent intent pool (revision 16). Earlier config-only repair did not restore access. Managed sub2api-client mode direct syncs intent/config but its execution was also rejected by broken approval. Resolved later by selecting manual approval, retaining Sub2API; live read, process inspection, full tests and build succeeded. Local commits; no push.
 
 ## Next
-1. Restore local endpoint/process access; rerun full host suite and save live startup config before deployment.
+1. Access restored via manual approval; 17:58 live snapshots +4 stem windows/8 s, clips +25. Owner PID 26462 runs DS-1 copy at 2026-10-30/feature-apple-conversation-awareness-ds-1/work/cores3-ds/tools. Preserve voiceprint, voice gate, stem, QQMusic basic, ambient off, training-dir from that copy. Do not deploy over shared live work without coordination.
 2. Coordinate serial owner, flash matching artifact, restart through host_up with preserved parameters and existing cloud-audio authorization.
 3. Follow `docs/acceptance-20261102.md`: 30 min playback, three-mode/leak A/B, 4 dialogue scenarios x3, cross-day voiceprint, S3 labelled capture. None completed this turn.
 4. Old narrative archived in `handoff-archive-20261102.md`; no independent scene accuracy claim.

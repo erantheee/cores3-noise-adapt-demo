@@ -29,6 +29,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from .sound_sources import snapshot_sources
+
 from .protocol import (
     CAPTURE_RATE_HZ,
     CONTEXT_CLASSES,
@@ -911,6 +913,8 @@ class HostState:
                 "scene_score": frame.scene_score,
                 "scene_valid": frame.scene_valid,
                 "scene_us": frame.scene_us,
+                "sound_sources": snapshot_sources(
+                    frame.sound_sources, self.connected and self.has_live_control_data(now)),
                 # 声音事件判断。与情境模型同一纪律：没报 / 窗未满 / 有判断三态分开。
                 "event": frame.event,
                 "event_text": event_text(frame.event),

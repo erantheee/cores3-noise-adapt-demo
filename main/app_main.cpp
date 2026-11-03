@@ -25,6 +25,7 @@
 #include "mic_decimator.hpp"
 #include "music_state.hpp"
 #include "scene_classifier.hpp"
+#include "sound_sources_model.h"
 #include "sdkconfig.h"
 #include "sound_event.hpp"
 
@@ -171,7 +172,7 @@ bool update_typing_active(bool click, int64_t now_us) {
 ///
 /// Band gains are printed with one decimal on purpose: they only ever hold 0 or a small
 /// per-band value from SONG_EQ, and one decimal keeps a frame near 250 bytes.
-void emit_command_json(const EarbudCommand& command) {
+void emit_command_json(const EarbudCommand& command, const sound_sources::Result& sources) {
     // 声纹门控遥测（v4 只增键）：valid 是"当前是否有新鲜判定"而不是"曾经收到过"，
     // age=-1 表示从未收到。把它报出来，现场才分得清"没人说话"与"声纹判定已过期/停用"。
     const int64_t voiceprint_age_us =
@@ -281,7 +282,7 @@ void emit_command_json(const EarbudCommand& command) {
                 "\"scene\":\"%s\",\"scene_score\":%.3f,\"scene_valid\":%s,"
                 "\"scene_us\":%ld,"
                 "\"event\":\"%s\",\"event_valid\":%s,"
-                "\"speech_gate\":%.3f,\"speech_gate_valid\":%s,\"speech_gate_us\":%ld}\n",
+                "\"speech_gate\":%.3f,\"speech_gate_valid\":%s,\"speech_gate_us\":%ld",
                 command.context.class_name, static_cast<double>(command.context.score),
                 command.context.valid ? "true" : "false",
                 static_cast<long>(command.context.inference_us),
@@ -298,6 +299,23 @@ void emit_command_json(const EarbudCommand& command) {
                 static_cast<double>(command.speech_gate_score),
                 command.speech_gate_valid ? "true" : "false",
                 static_cast<long>(command.speech_gate_us));
+    std::printf(",\"sound_sources\":{\"schema\":1,\"status\":\"%s\",\"version\":\"%s\","
+                "\"valid\":%s,\"inference_us\":%ld,\"quiet\":null,\"scores\":[",
+                sources.status, sources.version, sources.valid ? "true" : "false",
+                static_cast<long>(sources.inference_us));
+    unsigned detected_mask = 0, validated_mask = 0;
+    for (std::size_t c = 0; c < sound_sources::kClasses; ++c) {
+        if (c) std::printf(",");
+        if (sources.valid && sources.available[c]) {
+            std::printf("%.5f", static_cast<double>(sources.scores[c]));
+            if (sources.detected[c]) detected_mask |= 1u << c;
+            if (sources.validated[c]) validated_mask |= 1u << c;
+        } else {
+            std::printf("null");
+        }
+    }
+    std::printf("],\"detected_mask\":%u,\"validated_mask\":%u}}\n",
+                detected_mask, validated_mask);
 }
 
 /// Report the per-stage breakdown, then clear the window so the next report covers the
@@ -380,6 +398,7 @@ std::size_t g_console_fill = 0;
 /// 用来核对端侧特征与训练侧 features.py 是否同口径（golden 只覆盖金标准样例）。
 float g_latest_window_vector[context::kFeatureCount];
 bool g_latest_window_vector_valid = false;
+bool g_latest_sources_window_valid = false;
 uint32_t g_latest_window_vector_ms = 0;
 
 /// Read whatever the console has and act on complete lines. Returns true when a command
@@ -404,8 +423,10 @@ bool poll_console_command() {
                 } else if (std::strncmp(g_console_line, "vector", 6) == 0) {
                     if (g_latest_window_vector_valid) {
                         std::printf("{\"type\":\"window_vector\",\"valid\":true,"
-                                    "\"t_ms\":%lu,\"vector\":[",
-                                    static_cast<unsigned long>(g_latest_window_vector_ms));
+                                    "\"t_ms\":%lu,\"sources_window_valid\":%s,"
+                                    "\"feature_version\":\"s3-context-92-v1\",\"vector\":[",
+                                    static_cast<unsigned long>(g_latest_window_vector_ms),
+                                    g_latest_sources_window_valid ? "true" : "false");
                         for (std::size_t i = 0; i < context::kFeatureCount; ++i) {
                             std::printf("%s%.6f", i == 0 ? "" : ",",
                                         static_cast<double>(g_latest_window_vector[i]));
@@ -679,6 +700,7 @@ void processing_task(void*) {
     NoiseAnalyzer analyzer;
     AdaptController controller;
     scene::Classifier scene_classifier;
+    sound_sources::Continuity sources_continuity;
     controller.set_evidence_policy(kEvidencePolicy);
     latency::LatencyProfiler profiler;
     latency::ProfilerOverhead overhead;
@@ -1087,9 +1109,19 @@ void processing_task(void*) {
         }
 
         ContextResult context_result;
+        sound_sources::Result sources_result;
+        const bool sources_full = sources_continuity.push(frame.timestamp_ms, frame.mic_valid);
+        g_latest_sources_window_valid = sources_full && context_window->full();
+        if (!frame.mic_valid) sources_result.status = "input_invalid";
         if (context_window->full()) {
             float window_vector[context::kFeatureCount];
             context_window->build_vector(window_vector);
+            if (sources_full) {
+                const int64_t sources_started_us = esp_timer_get_time();
+                sources_result = sound_sources::evaluate(sound_sources_model::get(), window_vector);
+                sources_result.inference_us =
+                    static_cast<int32_t>(esp_timer_get_time() - sources_started_us);
+            }
             for (std::size_t i = 0; i < context::kFeatureCount; ++i) {
                 g_latest_window_vector[i] = window_vector[i];
             }
@@ -1206,7 +1238,7 @@ void processing_task(void*) {
         overhead.record(static_cast<float>(probe_end_us - probe_start_us));
         ++analysed_frames;
 
-        emit_command_json(command);
+        emit_command_json(command, sources_result);
 
         if (bsp_display_lock(100)) {
             demo_ui_update(frame, command, g_mac_route, processing_ms,

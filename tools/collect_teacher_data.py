@@ -116,14 +116,19 @@ def load_serial():
 
 
 class Capture:
-    def __init__(self, out_dir: Path) -> None:
+    def __init__(self, out_dir: Path, window_vectors: bool = False) -> None:
         self.out_dir = out_dir
+        if window_vectors and out_dir.exists():
+            raise ValueError("window-vector capture requires a new output directory")
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.wav = wave.open(str(out_dir / "audio.wav"), "wb")
         self.wav.setnchannels(1)
         self.wav.setsampwidth(2)
         self.wav.setframerate(RATE)
         self.frames_path = (out_dir / "frames.jsonl").open("w", encoding="utf-8")
+        self.vectors_path = ((out_dir / "vectors.jsonl").open("x", encoding="utf-8")
+                             if window_vectors else None)
+        self.vector_count = 0
         self.chunks = 0
         self.audio_samples = 0
         self.frame_count = 0
@@ -150,6 +155,9 @@ class Capture:
             self._chunk(payload)
         elif kind == "earbud_command" and payload.get("ambient_band_dbfs"):
             self._frame(payload)
+        elif kind == "window_vector" and self.vectors_path is not None:
+            self.vectors_path.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            self.vector_count += 1
 
     def _chunk(self, payload: dict) -> None:
         pcm = payload.get("pcm")
@@ -197,6 +205,7 @@ class Capture:
             "speech_gate_valid": payload.get("speech_gate_valid"),
             "speech_gate_us": payload.get("speech_gate_us"),
             "media_percent": payload.get("media_percent"),
+            "sound_sources": payload.get("sound_sources"),
         }
         self.frames_path.write(json.dumps(record, ensure_ascii=False) + "\n")
         self.frame_count += 1
@@ -207,6 +216,8 @@ class Capture:
     def close(self, seconds: float) -> dict:
         self.wav.close()
         self.frames_path.close()
+        if self.vectors_path is not None:
+            self.vectors_path.close()
         frame_rate = self.frame_count / seconds if seconds > 0 else 0.0
         audio_seconds = self.audio_samples / RATE
         meta = {
@@ -217,6 +228,7 @@ class Capture:
             "chunks": self.chunks,
             "chunk_gaps": self.chunk_gaps,
             "bad_lines": self.bad_lines,
+            "window_vectors": self.vector_count,
             "first_frame_ts_ms": self.first_frame_ts,
             "last_frame_ts_ms": self.last_frame_ts,
             "first_chunk_ts_ms": self.first_chunk_ts,
@@ -230,9 +242,10 @@ class Capture:
 
 
 def capture(port: str, baud: int, seconds: float, out_dir: Path,
-            phases: list[tuple[str, float]] | None = None, no_cue: bool = False) -> int:
+            phases: list[tuple[str, float]] | None = None, no_cue: bool = False,
+            window_vectors: bool = False) -> int:
     serial = load_serial()
-    capture_state = Capture(out_dir)
+    capture_state = Capture(out_dir, window_vectors=window_vectors)
     started = time.monotonic()
     boundaries: list[dict] = []
     if phases:
@@ -254,7 +267,11 @@ def capture(port: str, baud: int, seconds: float, out_dir: Path,
             connection.write(b"rec start\n")
             connection.flush()
             print(f"开始采集 {seconds:.0f} s -> {out_dir}", flush=True)
+            next_vector = time.monotonic()
             while time.monotonic() - started < seconds:
+                if window_vectors and time.monotonic() >= next_vector:
+                    connection.write(b"vector\n")
+                    next_vector = time.monotonic() + 0.5
                 line = connection.readline()
                 if line:
                     capture_state.feed(line)
@@ -278,6 +295,9 @@ def capture(port: str, baud: int, seconds: float, out_dir: Path,
     print(f"事件分布：{meta['event_counts']}")
     if meta["frames"] == 0:
         print("!! 没有帧；确认固件在无限录音模式下仍按 100 ms 发 earbud_command", file=sys.stderr)
+        return 1
+    if window_vectors and meta["window_vectors"] == 0:
+        print("!! 没有设备窗口向量；检查固件版本与 vector 命令", file=sys.stderr)
         return 1
     if meta["frame_rate_hz"] < 8.0:
         print(
@@ -326,6 +346,8 @@ def main() -> int:
     parser.add_argument("--script", default="",
                         help="分段：ready:6,quiet:20,keyboard:40,wind:30,speech:30,knock:12")
     parser.add_argument("--no-cue", action="store_true", help="分段但不播报提示语")
+    parser.add_argument("--window-vectors", action="store_true",
+                        help="每 0.5 秒保存 S3 实际 92 维窗口；使用新的输出目录")
     parser.add_argument("--check", type=Path, help="检查已有采集目录")
     args = parser.parse_args()
     if args.check:
@@ -334,7 +356,7 @@ def main() -> int:
         parser.error("采集模式需要 --port 与 --out")
     try:
         return capture(args.port, args.baud, args.seconds, args.out,
-                       parse_script(args.script) or None, args.no_cue)
+                       parse_script(args.script) or None, args.no_cue, args.window_vectors)
     except MissingDependency as exc:
         print(f"依赖未就位：\n{exc}", file=sys.stderr)
         return 3
