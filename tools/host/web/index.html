@@ -129,7 +129,7 @@
   <!--
     演示控制（2026-10-26）。为什么「启动」不在这里：上位机没跑时没有进程能响应网页请求，
     所以启动只能放在 Mac 上（双击「启动演示.command」）。这里管运行中的暂停/继续/关闭。
-    暂停 = 停执行端（EQ/媒体/环境声复位），采集与 AI 继续；关闭 = 释放串口并退出。
+    暂停 = 停执行端（包络调节/媒体/环境声复位），采集与 AI 继续；关闭 = 释放串口并退出。
   -->
   <div class="card" id="exec-card">
     <h2>演示控制</h2>
@@ -139,7 +139,7 @@
       <button id="btn-resume">继续执行</button>
       <button id="btn-close-host">关闭上位机</button>
     </div>
-    <div class="sub" id="exec-note">暂停 = 停执行端（EQ/媒体/环境声复位），采集与 AI 继续；启动请双击 Mac 上的「启动演示.command」</div>
+    <div class="sub" id="exec-note">暂停 = 停执行端（包络调节/媒体/环境声复位），采集与 AI 继续；启动请双击 Mac 上的「启动演示.command」</div>
   </div>
 
   <div class="grid cards">
@@ -151,7 +151,7 @@
     </div>
     <!--
       情境 = 端侧环境场景（main/scene_classifier.hpp，92 维窗 → 街道/高速/市集）。
-      它与左边「环境」不是一回事：环境是驱动 EQ 的四分类，场景是语义判断。
+      它与左边「环境」不是一回事：环境是驱动 包络调节的四分类，场景是语义判断。
       九分类模型（v0.2-s3）仍在上报，但真机复测长期给 other（TODOS A-1），所以只作为
       这一行下面的“实验”括注，不再占主值。场景头本轮只显示，不参与任何决策。
     -->
@@ -245,7 +245,7 @@
       <h2>决策模式</h2>
       <div class="value" id="media">—</div>
       <div class="meter"><span id="media-bar"></span></div>
-      <div class="sub">歌曲 EQ / 现实人声 / 安全保持</div>
+      <div class="sub">歌曲包络调节 / 现实人声 / 安全保持</div>
     </div>
     <div class="card">
       <h2>控制链路</h2>
@@ -732,10 +732,10 @@ function render(s) {
   $("btn-pause").disabled = paused;
   $("btn-resume").disabled = !paused;
   $("exec-note").textContent = paused
-    ? "执行端已复位（EQ 平直 / 媒体 100% / 环境声关闭）；采集与 AI 继续。继续请点「继续执行」。"
+    ? "执行端已复位（包络调节平直 / 媒体 100% / 环境声关闭）；采集与 AI 继续。继续请点「继续执行」。"
     : !controlLive
       ? "S3 没有新控制帧：执行端已复位为原声 / 媒体 100%，不会沿用旧调音处方。"
-    : "暂停 = 停执行端（EQ/媒体/环境声复位），采集与 AI 继续；启动请双击 Mac 上的「启动演示.command」";
+    : "暂停 = 停执行端（包络调节/媒体/环境声复位），采集与 AI 继续；启动请双击 Mac 上的「启动演示.command」";
 
   const f = s.frame;
   renderSources(s);
@@ -932,13 +932,13 @@ function applyNote(s) {
   const shape = cutBands > 0
     ? `绝对值最大 ${peakAbs.toFixed(2)} dB（其中最大削减 ${maxCut.toFixed(2)} dB，${cutBands} 段在削）`
     : `峰值 +${peakAbs.toFixed(2)} dB`;
-  const owner = side.kind === "systemeq" ? "QQ音乐 tap" : "Mac";
+  const owner = side.kind === "systemeq" ? (side.data.app === "system" ? "系统音频 tap" : "应用 tap") : "Mac";
   // 2026-10-29 起低延迟主链不再叠固定 demo 基线（base_gain=0），绿色柱子是
-  // "S3 24 段 × 深度 + 逐段掩蔽"；分轨模式由独立 worker 直接重混，旧 24 段归零。
+  // "S3 24 段 × 深度 + 逐段掩蔽"；分轨重混后仍保留下游包络与 包络调节。
   const stemModel = exec.stem_model === "htdemucs_6s" ? "六轨" : "四轨";
   const extra = side.kind === "systemeq"
     ? (exec.stem_stream
-        ? `（${stemModel}实时分轨：模型输出直接重混，旧 24 段归零）`
+        ? `（${stemModel}实时分轨 + S3 24 段 × 深度 ${(exec.depth || 0).toFixed(1)}× + 逐段掩蔽，不含固定 demo 基线）`
         : `（低延迟主链：S3 24 段 × 深度 ${(exec.depth || 0).toFixed(1)}× + 逐段掩蔽，不含固定 demo 基线）`)
     : `（形状来自 S3，深度 ${(exec.depth || 0).toFixed(1)}× 是本机为"听得出来"设的演示参数）`;
   return `绿柱＝${owner} 真正设进 EQ 的值${extra}（${shape}，向上=抬 / 向下=削）；蓝线＝S3 报的原始建议。`;
@@ -961,7 +961,7 @@ function renderEqMode(se) {
     label.textContent = !se
       ? "未启用执行端"
       : bypass
-        ? "当前：EQ 全关（原声直通）"
+        ? "当前：包络调节全关（原声直通）"
         : "当前：" + (mode === "basic" ? "基础 · 掩蔽 1×（约 2 dB）" : "激进 · 掩蔽 1.4×（约 3 dB）");
   }
 }
@@ -1312,7 +1312,7 @@ function renderLatency(s) {
     "「无样本」＝该阶段要由对端上报，而当前没有接通的对端。";
 }
 
-// 24 频段数组是歌曲 EQ 建议。现实人声增益是另一条意图，绝不能在这里画成歌曲中频提升。
+// 24 频段数组是歌曲包络调节 建议。现实人声增益是另一条意图，绝不能在这里画成歌曲中频提升。
 function drawEq(tuning, fallbackGainDb) {
   const canvas = $("eq");
   if (!canvas || !canvas.getContext) return;
@@ -1668,7 +1668,7 @@ $("btn-close-host").addEventListener("click", async () => {
 });
 
 // ---------------------------------------------------------------- 播放（Mac 执行端）
-// 面板只发动作，不自作主张：EQ 的形状永远来自 S3 的那一帧，这里只负责把它落到音频上。
+// 面板只发动作，不自作主张：包络调节的形状永远来自 S3 的那一帧，这里只负责把它落到音频上。
 // 回控与设备侧同一条原则——白名单；失败原因原样显示，不把"点过了"当成"做到了"。
 function sendPlayer(payload) {
   return fetch("/api/player", {

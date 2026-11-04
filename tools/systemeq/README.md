@@ -3,7 +3,7 @@
 QQ 音乐 → Core Audio process tap → 24 段轻量 DSP → 当前默认输出（耳机）。
 
 S3 只做环境判断；host 把它映射成幅度受限的环境处方。默认有两条执行链：
-无分轨的 24 段 EQ（不增加算法延迟），以及 `--stem-worker` 的实时四轨重混。
+无分轨的 24 段 包络调节（不增加算法延迟），以及 `--stem-worker` 的实时四轨重混。
 Mac 同时用 1024 点 FFT 检测高频密度与瞬态风险，对鼓点、钢琴起音等强瞬态收紧正增益。
 
 ## 构建 / 运行
@@ -18,7 +18,7 @@ sh tools/systemeq/build.sh
   --depth 2.5 --ab 3 --seconds 12
 ```
 
-参数：`--app`（bundle id）、`--bands`（24 个逗号分隔）、`--depth`（默认 2.5）、`--demo`（叠加固定 demo 基线）、`--ab`（每 N 秒切换 EQ/直通）、`--seconds`（0=一直跑）、`--report`。分轨参数为 `--stem-model htdemucs|htdemucs_6s`、`--stem-window`、`--stem-overlap`、`--stem-segment`、`--stem-strength`，以及 `--no-stem-autocast`。
+参数：`--app`（bundle id）、`--bands`（24 个逗号分隔）、`--depth`（默认 2.5）、`--demo`（叠加固定 demo 基线）、`--ab`（每 N 秒切换 包络调节/直通）、`--seconds`（0=一直跑）、`--report`。分轨参数为 `--stem-model htdemucs|htdemucs_6s`、`--stem-window`、`--stem-overlap`、`--stem-segment`、`--stem-strength`，以及 `--no-stem-autocast`。
 
 ### demo 基线（2026-10-22 用户口径）
 
@@ -33,8 +33,8 @@ sh tools/systemeq/build.sh
 **"demo 要明显"**，整体 ×2 恢复翻倍版（245 Hz 保持 0，与固件
 `kSongEqContentDb` 的网友共识校准一致）。
 
-默认 EQ 路径的不同环境场景保持平滑（沿用 50 ms slew），**不增加算法延迟**。
-2026-10-29 加了 EQ 链内 `globalGain` 作为输出余量：直接测 EQ 后峰值，超过 0.94
+默认 包络调节路径的不同环境场景保持平滑（沿用 50 ms slew），**不增加算法延迟**。
+2026-10-29 加了 EQ 链内 `globalGain` 作为输出余量：直接测 包络调节后峰值，超过 0.94
 就快速收紧，低于后缓慢恢复。它是零延迟的后级余量，不是添加预读的限幅器。
 host 用 `--system-eq-app` 时仍会开基础基线；现场剂量已收小，不再使用 S3 旧的 24 段形状。
 
@@ -68,8 +68,8 @@ stdout：`{"event":"ready",...}` / `{"event":"state",...}`（含 `rms/peak/ring_
 ## 验证记录
 
 - 在线曲目，`PROBE_MUTE=0` 只读探测：48 kHz / 2 ch，3 s、284 回调、290,816 floats、RMS 0.308、peak 0.988。
-- systemeq 12 s A/B：`start=0`；producer/consumer 均约 48 kHz；`ring_fill` 稳定在 3–4k（不溢出）；`bypass` 每 3 s 切换，EQ 曲线（低切 -4/-2 dB、1–4 kHz +6 dB、高 +3 dB）生效。
-- 2026-10-29 低延迟主链实时验收：QQ 音乐输出源峰值 0.977，EQ 后峰值
+- systemeq 12 s A/B：`start=0`；producer/consumer 均约 48 kHz；`ring_fill` 稳定在 3–4k（不溢出）；`bypass` 每 3 s 切换，包络调节曲线（低切 -4/-2 dB、1–4 kHz +6 dB、高 +3 dB）生效。
+- 2026-10-29 低延迟主链实时验收：QQ 音乐输出源峰值 0.977，包络调节后峰值
   0.974–0.976，`out_clip_frames=0`；`ring_fill` 在 25–26k 稳定，无分轨进程。
 - 2026-10-29 S3 24 段掩蔽矩阵：内容端复用 1024 点 FFT 生成 24 段相对谱形，与
   `ambient_band_dbfs` 做归一化重叠判断；低/中/高段补偿上限分别为 2.35/2.50/2.35 dB。

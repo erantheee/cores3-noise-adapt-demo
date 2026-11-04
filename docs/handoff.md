@@ -1,4 +1,25 @@
-# Session handoff — 2026-11-02
+# Session handoff — 2026-11-04
+
+## 命名口径（2026-11-04，长期记忆）
+- 核心能力统一叫「**包络调节**」（envelope modulation），不是「EQ」。EQ = 频率域静态曲线；包络调节 = 时间域动态轮廓（事件驱动）。见 `docs/decisions.md` D63、`docs/product-alignment.md` 命名口径段。
+
+## 产品架构讨论（2026-11-04，未决，供下个会话继续）
+- 起点：跨音源包络调节不一致（QQ 好，网易云/B站完全没用）。定位到 Mac 执行端 process tap 的 `mutedWhenTapped` 对网易云/B站失效：原声直出、没进处理链，tap 只抓到「没人听到的副本」（数据在动、听感为零）。与包络参数/频谱无关。
+- 展开成产品级问题：全平台调音落点、分轨必要性、iOS 必 cover。
+- 关键收敛（待用户拍板）：
+  1. 端侧（耳机+仓）用低功耗 NPU 能闭环「感知 + 包络调节」，跑不动全尺寸分轨；录音戒指已证明小体积 NPU 可行。
+  2. 产品是「端侧 + 上位机 + 云端」三层，不是纯端侧闭环：端侧 = 感知 + 包络调节快层，上位机 = 分轨（有音频流处）+ 决策，云端 = LLM 对话判断慢层。
+  3. iOS 上全局音频接管无软件路径；要分轨全局只有「音频中继盒」：iPhone → A2DP → 仓（NPU 分轨 + 包络）→ 2.4G → 自研耳机。传输层「A2DP 进 + 2.4G 出」。
+  4. 未决：分轨进不进端侧闭环、上位机形态（手机 app / 桌面 / 两端）、是否自研耳机。
+- 本轮未改任何代码/固件；只新增 D63 + product-alignment 命名口径段。
+
+## Global system-audio capture (2026-11-03, current chat)
+- Implemented system target/default global stereo tap excluding own audio-process object; lookup failure aborts. Explicit bundle capture remains. Default launcher and panel/media labels updated; existing four-stem -> S3 envelope/EQ chain retained.
+- Host restart preserved prior training-dir, voiceprint, voice gate, basic mode, ambient off and web port; no firmware flash. Previous binary and full snapshot/launch flags saved under this chat's work/global-audio.
+- First global run fell back on starvation; follow-up starts with two output hops (3.8 s) instead of first burst. Final binary SHA 0fe67796be13f855d4c11a0c435665754823ce2786457d8eefec9942caefbbd2 verified live, scope=system/self_excluded=true/stems active. Initial final-run checks: zero underruns, increasing clipping; estimated pipeline frame lag ~4.6 s, not acoustic A/V measurement.
+- Swift 25 selftests, host 111 groups/8152 assertions, launcher regression, deployed render 103 checks passed. See docs/acceptance-global-audio-20261103.md. No C++/firmware changes, so firmware rebuild not required.
+- User reports source switching works, but reports weaker masking on NetEase Cloud Music versus QQ Music. No normalization/platform presets added; inspect equal-segment input levels, transient/headroom trim and actual gains first. Headroom trim persists across sources; 2 dB takes ~25 s under release conditions.
+- Thirty-minute observation completed: 361/361 samples report global/four stems, max sampled RTF 0.579, zero sampled underruns. Two executor resets at ~810/~1770 s while host stayed up; engine rate changed 44.1 -> 48 -> 44.1 kHz, exact trigger unretained. Clipping grew. Uninterrupted/clipping acceptance NOT passed. User changed live mode to aggressive; preserve it. A/V timing, clipping and cross-source masking remain open.
 
 ## Git synchronization preparation (2026-11-03)
 - User requested pushing the current version. Remaining mixed-source telemetry/pipeline/UI edits and prior dropout evidence are being committed with the existing ten local commits on feature/apple-conversation-awareness.

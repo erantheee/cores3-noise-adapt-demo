@@ -305,7 +305,7 @@ void demo_ui_update(const AnalysisFrame& frame, const EarbudCommand& command,
     lv_obj_set_style_text_color(link_value,
         route.mac_connected ? lv_color_hex(0x5FF2A7) : lv_color_hex(0xFFC857), 0);
 
-    // 事件类别放在"麦克风正常"同一行的右侧：它只是展示，不参与决策（风 EQ 除外，见 D21）。
+    // 事件类别放在"麦克风正常"同一行的右侧：它只是展示，不参与决策（风包络调节 除外，见 D21）。
     if (command.event.valid) {
         lv_label_set_text(event_value, command.event.class_name);
         uint32_t color = 0x9BA5B4;

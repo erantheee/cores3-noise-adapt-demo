@@ -133,7 +133,7 @@ def wait_for(predicate, timeout_s: float = 2.0) -> bool:
 
 
 def test_low_latency_strategy_is_bounded_and_fail_closed() -> None:
-    """QQ 音乐主链只吃克制环境处方，不再照搬 S3 旧粗暴 EQ。"""
+    """QQ 音乐主链只吃克制环境处方，不再照搬 S3 旧粗暴 包络调节。"""
 
     class Frame:
         mode = "SONG_EQ"
@@ -1400,7 +1400,7 @@ def test_mock_device_is_wire_compatible() -> None:
             check(max(frame["eq_gain_db"]) <= 4.0 + 1e-9, "song_eq 的逐段建议不超过 4 dB")
         elif frame["mode"] == "EXTERNAL_VOICE_INTENT":
             check(max(frame["eq_gain_db"]) == 0.0,
-                  "人声模式的歌曲 EQ 必须平直（D0：标量意图不是歌曲 EQ）")
+                  "人声模式的歌曲包络调节 必须平直（D0：标量意图不是歌曲包络调节）")
         elif frame["mode"] in ("FLAT", "SAFETY_HOLD"):
             check(max(frame["eq_gain_db"]) == 0.0, f"{frame['mode']} 不得给正增益")
         # v4 环境声意图：模拟源必须与当前固件同构，否则 --mock 会掩盖一条坏链路。
@@ -2339,7 +2339,7 @@ def test_eq_mode_and_bypass_control() -> None:
         check(not result["ok"] and "basic" in result["error"], "错误写明允许的档位")
 
         status, result = post(base, {"cmd": "bypass", "on": True})
-        eq(status, 200, "关闭EQ（bypass）返回 200")
+        eq(status, 200, "关闭包络调节（bypass）返回 200")
         eq(systemeq.sent[-1]["cmd"], "bypass", "bypass 透传给 systemeq")
         check(result["systemeq"] is not None, "回执快照带 systemeq")
     finally:
@@ -2743,7 +2743,7 @@ def test_dialog_override_link() -> None:
     """A1/D50：LLM/本地迟到否决 → S3 快路径回写（`dialog no|yes [ttl_ms]`）。
 
     为什么需要：D34 的迟到否决过去只能关 Mac 执行端的环境声，没有通道让 S3 放开快路径。
-    连续电视/播客会把端侧对话态一直顶在 engaged（EQ 压平、D41/D48 掩蔽停摆），
+    连续电视/播客会把端侧对话态一直顶在 engaged（包络调节压平、D41/D48 掩蔽停摆），
     LLM 判 no 也纠正不回来。回写纪律：
       * 只回写**新鲜**否决（age_s <= ttl_s）：过期交给 S3 自己的 TTL 解除（fail-open）；
       * 同一否决每 5 s 续期一次，不是每拍都刷串口；
@@ -2757,9 +2757,9 @@ def test_dialog_override_link() -> None:
     eq(link.update(fresh, 5.5), b"dialog no 20000\r\n",
        "每 5 s 续期一次，S3 的 TTL 不会在判定仍新鲜时过期")
 
-    # 判定过期：不再续期，并立即撤销——否则 S3 会多压 20 s 的 EQ。
+    # 判定过期：不再续期，并立即撤销——否则 S3 会多压 20 s 的 包络调节。
     stale = {"veto": True, "state": "llm_veto", "age_s": 25.0, "ttl_s": 20}
-    eq(link.update(stale, 6.0), b"dialog yes\r\n", "过期否决要撤销，不能把 EQ 压死")
+    eq(link.update(stale, 6.0), b"dialog yes\r\n", "过期否决要撤销，不能把包络调节压死")
     eq(link.update(stale, 7.0), None, "撤销只发一次")
 
     not_veto = {"veto": False, "state": "llm_confirmed", "age_s": 0.5, "ttl_s": 20}
@@ -2961,8 +2961,8 @@ def test_media_card() -> None:
     check("防削波收缩" in tuning and "累计削波 3 帧" in tuning,
           "写明防削波收缩与削波计数（D54 没有全局压音量）")
     check("漏音残差：未扣" in tuning, "漏音残差状态要一起说")
-    check("环境自适应 EQ（S3 24 段 × 深度 1.3×" in tuning,
-          "可听的环境自适应 EQ 要写出来（旧版能听见的就是这一层）")
+    check("环境自适应包络调节（S3 24 段 × 深度 1.3×" in tuning,
+          "可听的环境自适应包络调节 要写出来（旧版能听见的就是这一层）")
     check("人声流行向" in tuning, "类型保护要写出来")
 
     # 4) 低频主导 + 强瞬态 → 节奏/电子（估计）
@@ -2986,7 +2986,7 @@ def test_media_card() -> None:
     check("已停用" in tuning_off, "矩阵停用时如实说明")
     check("这一拍没有" not in tuning_off and "遮蔽强度" not in tuning_off,
           "停用时不再输出矩阵的补偿/强度行")
-    check("环境自适应 EQ" in tuning_off, "环境自适应 EQ 行仍要显示")
+    check("环境自适应包络调节" in tuning_off, "环境自适应包络调节 行仍要显示")
 
     # 5) 直通：调音思路只有一句"原声"
     bypassed = dict(systemeq)
@@ -4619,7 +4619,7 @@ def test_execution_pause_endpoint_and_snapshot() -> None:
 
 
 def test_pause_resets_execution_side() -> None:
-    """暂停必须把执行端复位（平直 / 媒体 100%），不能把上一帧的 EQ 留在音频上。"""
+    """暂停必须把执行端复位（平直 / 媒体 100%），不能把上一帧的 包络调节留在音频上。"""
     from host.__main__ import apply_neutral_execution
 
     class FakePlayer:

@@ -49,7 +49,7 @@ MAX_NOISE_REDUCTION_DB = 8.0
 CAPTURE_RATE_HZ = 16000
 CAPTURE_CHUNK_SAMPLES = 320
 
-#: 24 段歌曲 EQ 建议的合法区间（dB）。**有符号语义**：设备建议可以抬（正）也可以削（负）。
+#: 24 段歌曲包络调节 建议的合法区间（dB）。**有符号语义**：设备建议可以抬（正）也可以削（负）。
 #: 上下限取播放器真正能执行的范围（tools/player/player.swift 的 minAppliedGainDb=-12 /
 #: maxAppliedGainDb=+10，按深度放大后再钳位），不是"建议一般不会超过"的经验值。
 #: 越界的值按本模块的纪律**保留原始值并报异常**，不在这里钳掉——钳掉会把"协议不一致"

@@ -44,7 +44,7 @@ If the snapshot or owner cannot be inspected, do not kill or flash blindly.
 
 ## Listening tests (user participation required)
 
-Compare basic / aggressive / EQ off on identical track segments and headphone
+Compare basic / aggressive / envelope-modulation off on identical track segments and headphone
 volume. Compare with music attenuation alone for a genuine benefit claim.
 Record clarity, timbre, pumping, glitches and clipping for each condition; do not
 use changed frequency gains as a substitute for a listening result.
@@ -53,7 +53,7 @@ use changed frequency gains as a substitute for a listening result.
   and bass-heavy music; record underflow/drop counters, backlog, processing
   time/RTF and first sound delay. Any accumulating backlog or repeated audible
   interruption fails stability. User must confirm artifacts and delay acceptance.
-- EQ off: check both EQ bypass and worker `stem_bypass=true`. Stem bypass uses
+- envelope-modulation off: check both envelope-modulation bypass and worker `stem_bypass=true`. Stem bypass uses
   original captured samples. Queued audio, one window and the overlap transition
   retain delay; it is not an immediate zero-latency raw path.
 - Keyboard/background speech: compare masking and timbre across the three modes.

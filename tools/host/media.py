@@ -130,7 +130,7 @@ def tuning_lines(systemeq: dict, frame: dict | None, leak: dict | None) -> list[
         return ["已直通（关闭EQ）：听到的是原声，不做任何调音。"]
     mode = (frame or {}).get("mode")
     if mode == "FLAT":
-        return ["S3 报安静/对话：EQ 平直，掩蔽暂停（对话优先）。"]
+        return ["S3 报安静/对话：包络调节平直，掩蔽暂停（对话优先）。"]
 
     if not systemeq.get("masking_matrix_enabled"):
         lines.append("舒适层：环境×内容矩阵已停用（回归 S3 处方 + 类型保护；开关预留）。")
@@ -170,7 +170,7 @@ def tuning_lines(systemeq: dict, frame: dict | None, leak: dict | None) -> list[
         f"防削波收缩 {trim:.1f} dB（只砍抬升、不降总音量）；自启动累计削波 {int(clip)} 帧"
         "（不增长＝没在削）。"
     )
-    # 2026-10-30 用户口径：S3 24 段处方 × 深度 = 环境自适应 EQ（舒适层 A）的可听主体，
+    # 2026-10-30 用户口径：S3 24 段处方 × 深度 = 环境自适应包络调节（舒适层 A）的可听主体，
     # 而且它内部已经包含 S3 固件的事件驱动掩蔽包络（键盘 250 ms/2.6 s、EVI 1–4 kHz 拉满）。
     # 面板必须把它写出来，否则用户只看到补偿层的 1–3 dB，会以为"没调"。
     base_bands = [float(value) for value in ((frame or {}).get("tuning_bands") or [])]
@@ -183,7 +183,7 @@ def tuning_lines(systemeq: dict, frame: dict | None, leak: dict | None) -> list[
         peak_db = max(base_bands) * depth
         low_db = min(base_bands) * depth
         lines.append(
-            f"环境自适应 EQ（S3 24 段 × 深度 {depth:.1f}×，随噪声连续变化）："
+            f"环境自适应包络调节（S3 24 段 × 深度 {depth:.1f}×，随噪声连续变化）："
             f"最高 {peak_db:+.1f} / 最低 {low_db:+.1f} dB。"
         )
     # 掩蔽层 B：事件驱动的增益包络，主体在 S3 固件侧完成，处方里已经带上。

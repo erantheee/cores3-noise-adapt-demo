@@ -19,7 +19,7 @@
 // 口径（不许含糊）：
 //   * `source_bands` 是 S3 给的建议，`applied_bands` 是 Mac 真正设进 EQ 的值，两者都报，
 //     面板才能显示"设备建议 vs 实际执行"，而不是把二者混成一个数。
-//   * EQ 只在 S3 报了非零建议时才动；S3 说 flat 就回到平直——"什么时候不动作"同样是决策。
+//   * 包络调节只在 S3 报了非零建议时才动；S3 说 flat 就回到平直——"什么时候不动作"同样是决策。
 
 import AVFoundation
 import CoreAudio

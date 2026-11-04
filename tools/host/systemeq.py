@@ -203,7 +203,7 @@ class SystemEqService:
                         self._no_auto_restart = reason
                     elif self.stem_worker and ("ring 持续积压" in reason or "分轨输出欠载" in reason):
                         # 分轨跟不上时先活下来：卸掉 stem worker，下一次重试改为
-                        # 普通 24 段 EQ。媒体识别和 S3 包络随进程恢复，不能因为
+                        # 普通 24 段 包络调节。媒体识别和 S3 包络随进程恢复，不能因为
                         # 分轨失败把整条 QQ 音乐执行端永久留在 unavailable。
                         self._stem_fallback_reason = reason
                         self.stem_worker = None

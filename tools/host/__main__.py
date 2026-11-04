@@ -153,7 +153,7 @@ def low_latency_strategy_bands(frame) -> list[float]:
 
 #: 面板「EQ 档位」到掩蔽剂量的映射（2026-10-30 用户要求保留三级档位）：
 #: 基础 1.0×（可听档，约 2.15 dB 目标），激进 1.4×（约 3 dB，更明显），
-#: 关闭EQ 走执行端 bypass（原声），不经过剂量。真正的上限仍由段别 budget、
+#: 关闭包络调节走执行端 bypass（原声），不经过剂量。真正的上限仍由段别 budget、
 #: 内容瞬态门与输出余量兜住——剂量只是把目标调高，不是绕过安全门。
 MASKING_DOSE_BASIC = 1.0
 MASKING_DOSE_AGGRESSIVE = 1.4
@@ -197,7 +197,7 @@ def masking_matrix_enabled_for(frame, ambient_spectrum: list[float]) -> bool:
 
 
 def apply_neutral_execution(player_service, systemeq_service) -> bool:
-    """暂停时把执行端复位到"什么都不做"：EQ 全平直、媒体 100%。
+    """暂停时把执行端复位到"什么都不做"：包络调节全平直、媒体 100%。
 
     只复位一次（主循环负责在暂停沿调用）。环境声由主循环同时关掉。
     返回值表示是否真的下发成功——没有执行端时返回 False，不伪报成功。
@@ -321,11 +321,11 @@ class DialogOverrideLink:
 
     为什么需要它：D34 把 LLM 定位成"迟到否决"，但过去只能关 Mac 执行端的
     `ambient_open`，没有通道让 S3 自己放开快路径。连续电视/播客会让端侧对话态一直
-    engaged（EQ 压平、D41/D48 掩蔽停摆），即使 LLM 判 `dialogue=no` 也纠正不回来。
+    engaged（包络调节压平、D41/D48 掩蔽停摆），即使 LLM 判 `dialogue=no` 也纠正不回来。
 
     只回写**新鲜的语义否决**（`state == "llm_veto"` 且 `age_s <= ttl_s`）：
       * 过期后停止续期，交给 S3 的 TTL 自己解除（fail-open 回 D16 预判）——
-        host 崩了或串口断了也不会把 EQ 永久压平；
+        host 崩了或串口断了也不会把包络调节永久压平；
       * **本地否决（`local_veto`）不回写**。2026-10-28 真机发现：ASR 段"无有效语音"
         几乎在每次静音都会产生本地否决，若也回写 S3，设备会在没人说话时被锁在
         "释放对话态"的 TTL 里；用户随后真的开口，端侧预判反而被压住，首响退化到
@@ -639,8 +639,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--system-eq-app",
         default=None,
         help=(
-            "启用第三方播放器 system EQ 执行端（tools/systemeq），tap 指定 bundle id 的音频"
-            "过 24 段 EQ 后送当前耳机（例如 com.tencent.QQMusicMac）。启用后 S3 的 24 段"
+            "启用第三方播放器 system EQ 执行端（tools/systemeq），system=全局音频（排除自身）；其他值 tap 指定 bundle id 的音频"
+            "过 24 段 包络调节后送当前耳机（例如 com.tencent.QQMusicMac）。启用后 S3 的 24 段"
             "决策改发到这条链，而不是 tools/player。"
         ),
     )
@@ -1104,7 +1104,7 @@ def main(argv: list[str] | None = None) -> int:
 
         def _detach_writer() -> None:
             # 串口断开/退出前尽力告诉设备判定已失效，再把回控句柄摘掉（顺序不能反）。
-            # A1/D50：尚未过期的 S3 快路径否决也要撤销，否则退出后 EQ 会被压平到 TTL 结束。
+            # A1/D50：尚未过期的 S3 快路径否决也要撤销，否则退出后 包络调节会被压平到 TTL 结束。
             send_voiceprint_off()
             try:
                 line = dialog_link.release()
@@ -1412,7 +1412,7 @@ def main(argv: list[str] | None = None) -> int:
         broadcaster.publish()
         latest = state.latest
         # 面板「暂停执行」（2026-10-26）：只停执行端，采集与 AI 继续跑。
-        # 进入暂停时要**主动复位一次**执行端，否则上一帧的 EQ/下压会留在音频上，
+        # 进入暂停时要**主动复位一次**执行端，否则上一帧的 包络调节/下压会留在音频上，
         # 看起来像"暂停键没生效"。
         execution_paused = bool(getattr(state, "execution_paused", False))
         if execution_paused and not execution_paused_last:
@@ -1421,7 +1421,7 @@ def main(argv: list[str] | None = None) -> int:
                 ambient.set_open(False)
                 last_ambient_open = False
             state.note(
-                "演示已暂停：执行端已复位（EQ 平直 / 媒体 100%）"
+                "演示已暂停：执行端已复位（包络调节平直 / 媒体 100%）"
                 + ("、环境声已关闭" if ambient is not None else "")
                 + "；采集与 AI 继续"
                 + ("" if neutral_ok or (player_service is None and systemeq_service is None)
@@ -1526,7 +1526,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         if not execution_blocked and latest is not None and (player_service is not None or systemeq_service is not None):
             # 本地播放器仍保留 S3 旧 24 段通路；QQ 音乐实时主链则只读 S3
-            # 的环境意图，转成小幅低延迟处方，不再照搬粗暴 EQ 形状。
+            # 的环境意图，转成小幅低延迟处方，不再照搬粗暴 包络调节形状。
             bands = list(latest.tuning.band_gain_db) if latest.tuning else [0.0] * 24
             media_target = float(latest.media_percent)
             if effective_gate != "off" and not engagement_latch:
@@ -1591,7 +1591,7 @@ def main(argv: list[str] | None = None) -> int:
                 # D54 行为：demo 基线恢复（FLAT/安静时归零）——旧版"一耳朵能听出来"
                 # 的来源之一。类型保护与深度在它之上叠加。
                 base_gain = 0.0 if latest.mode == "FLAT" else 1.0
-                # 面板档位 → 掩蔽剂量：基础 1.0×、激进 1.4×（关闭EQ 走 bypass）。
+                # 面板档位 → 掩蔽剂量：基础 1.0×、激进 1.4×（关闭包络调节走 bypass）。
                 systemeq_mode = (systemeq_service.snapshot() or {}).get("mode")
                 systemeq_service.apply_decision(bands, media_target,
                                                 depth_override=depth_override,
@@ -1624,7 +1624,7 @@ def main(argv: list[str] | None = None) -> int:
             state.set_media(None)
         # A1/D50：把 LLM/本地的迟到否决回写 S3 快路径。**与执行端配置无关**——
         # 默认 `--ambient-executor off` 的演示最需要它：环境声本来就关着，但 S3 的
-        # 对话态会把歌曲 EQ 压平、把 D41/D48 的掩蔽停掉，LLM 的 no 必须能纠正快路径。
+        # 对话态会把歌曲包络调节 压平、把 D41/D48 的掩蔽停掉，LLM 的 no 必须能纠正快路径。
         if (
             not execution_paused
             and can_control

@@ -12,7 +12,7 @@ constexpr std::array<float, kBandCount> kBandCenter = {
     10677.1f, 13638.2f,
 };
 
-// ── 噪声自适应歌曲 EQ（2026-10-21，D38）─────────────────────────────────────────
+// ── 噪声自适应歌曲包络调节（2026-10-21，D38）─────────────────────────────────────────
 // 旧公式按"每段噪声能量"抬增益（4 × band_noise × importance × focus），本质是噪声谱的
 // 复读机：2026-10-21 现场 90 s 实测，低频隆隆环境下 24 段建议最大只有 0.34 dB（×2.5 后
 // 仍 ≤0.9 dB），1–4 kHz 恒 0 —— 用户说的"该凸显的没凸显"就是这条公式的直接后果。
@@ -27,7 +27,7 @@ constexpr std::array<float, kBandCount> kBandCenter = {
 // 曲线是**有符号**的：负增益 = 去糊。设备建议口径为 [-4, +4] dB/段，Mac 播放器再乘面板
 // 深度（默认 2.5，夹到 [-12, +10]）。形状与参数的来源与数值见
 // work/eq-design/design.md（2026-10-21 现场降噪实验稿）。
-// 2026-10-22 网友共识校准：社区通勤 EQ 共识把 250 Hz 列为"一多就糊"的高危段，
+// 2026-10-22 网友共识校准：社区通勤包络调节共识把 250 Hz 列为"一多就糊"的高危段，
 // 嘈杂环境应切 200–400 Hz（见 work/eq-design/community-eq-consensus.md），
 // 所以 244.9 Hz 段从 +1.0 改为 0——去糊区从 346 Hz 起削、245 Hz 不抬。
 constexpr std::array<float, kBandCount> kSongEqContentDb = {
@@ -61,8 +61,8 @@ constexpr std::size_t kExternalVoiceFirstBand = 8;  // 1.0 kHz
 constexpr std::size_t kExternalVoiceLastBand = 17;  // 4.04 kHz
 /// 掩蔽深度按 voice 置信度连续缩放，而不是"过了 0.55 就整条拉满"：
 /// 0.55（speech_active 门限）→0，0.75→满幅。结构上保证阈值处目标曲线连续，
-/// 微小噪声在 0.55 附近只会让 EQ 动一点点，不会一步 +4 dB。这里**不加时间去抖**，
-/// 所以不会给真实背景人声或环境声增加额外延迟；平滑仍由既有的 650/850 ms EQ slew 负责。
+/// 微小噪声在 0.55 附近只会让包络调节动一点点，不会一步 +4 dB。这里**不加时间去抖**，
+/// 所以不会给真实背景人声或环境声增加额外延迟；平滑仍由既有的 650/850 ms envelope-modulation slew 负责。
 constexpr float kExternalMaskVoiceFloor = 0.55f;
 constexpr float kExternalMaskVoiceFull = 0.75f;
 
@@ -97,7 +97,7 @@ constexpr float kKeyboardMaskSpanDb = 18.0f;
 constexpr float kMaskDepthAttackMs = 400.0f;
 constexpr float kMaskDepthReleaseMs = 1200.0f;
 /// 键盘掩蔽单独的时间常数（2026-10-28 现场追加）：起音要跟手（轻/重敲响应快一点），
-/// 释放要慢——用户反馈"完全安静后，歌曲调 EQ 的那一下比较唐突"，1.2 s 的回落太陡；
+/// 释放要慢——用户反馈"完全安静后，歌曲调 包络调节的那一下比较唐突"，1.2 s 的回落太陡；
 /// 2.6 s 让"盖住键盘"自然退场，而不是一下子把音乐音色拨回去。噪声掩蔽仍用上面那组。
 constexpr float kKeyboardMaskAttackMs = 250.0f;
 constexpr float kKeyboardMaskReleaseMs = 2600.0f;
@@ -553,22 +553,22 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms,
         valid_ms_ += dt_ms;
         // 模式路由与噪声暴露用平滑后的电平，不用原始帧：2026-10-21 现场实测 broadband 在
         // -30 dBFS 门槛附近被键盘/拍桌的 100 ms 瞬态推着来回穿，环境标签在 NOISY↔LOUD 间
-        // 每 100–200 ms 抖一次，SONG_EQ 与 SAFETY_HOLD 跟着切，EQ 曲线听起来就是抽动。
-        // 250 ms 的对称一阶平滑滤掉瞬态，又比 650/850 ms 的 EQ 平滑快一档。
+        // 每 100–200 ms 抖一次，SONG_EQ与 SAFETY_HOLD 跟着切，包络调节曲线听起来就是抽动。
+        // 250 ms 的对称一阶平滑滤掉瞬态，又比 650/850 ms 的 包络调节平滑快一档。
         smoothed_dbfs_ = slew(smoothed_dbfs_, frame.broadband_dbfs, dt_ms, 250.0f, 250.0f);
         const float noise = clamp01((frame.broadband_dbfs + 58.0f) / 30.0f);
         const float voice = clamp01(frame.voice_likelihood);
-        // 0.55：歌曲 EQ/场景判断用的"有人声"门槛；
+        // 0.55：歌曲包络调节/场景判断用的"有人声"门槛；
         // 0.65：**对话/环境声**的门槛。实测房间噪声的 voice_likelihood 常漂到 0.5–0.6，
-        // 若和 EQ 用同一个门槛，键盘/风扇/远处人声都会反复把对话顶起来（2026-10-19 实测
+        // 若和包络调节用同一个门槛，键盘/风扇/远处人声都会反复把对话顶起来（2026-10-19 实测
         // 环境声一直开着）。对话是更重的动作，门槛必须更高。
         constexpr float kConversationVoiceThreshold = 0.65f;
-        // self 判定（声纹，3 s 内新鲜）视为哼唱/自言自语：不触发人声 EQ 或对话。
+        // self 判定（声纹，3 s 内新鲜）视为哼唱/自言自语：不触发人声包络调节 或对话。
         // other / 没有判定都走 D16 的预判逻辑（D28 step3）。
         //
         // 2026-10-26（D49）：人声判定必须过事件层的 speech 类。旧写法只看 4 判据
         // voice + 电平，贴耳时 OWS 耳机漏音把 voice 顶到 0.8+，对话状态机被持续
-        // 证据锁进 engaged → EQ 压平、掩蔽中断（真机实测耳边打字 FLAT 占 47%）。
+        // 证据锁进 engaged → 包络调节压平、掩蔽中断（真机实测耳边打字 FLAT 占 47%）。
         // 事件层 speech 在漏音/键盘场景 0 帧触发，在真人回放证据帧 1464/1464 全部
         // 触发——门控对真实对话零损伤（回放连续段统计前后一致），代价是首响 +~1 s
         // （事件窗要先攒 1 s 语音）。
@@ -628,18 +628,18 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms,
         // own_voice 一律不作为对话证据（连同 bone 的失败判据一起）。
         (void)effective;
         evidence.own_voice = 0.0f;
-        // A1/D50：Mac 的迟到否决（`dialog no` TTL 内）。只否决"是不是对话"，噪声/EQ
+        // A1/D50：Mac 的迟到否决（`dialog no` TTL 内）。只否决"是不是对话"，噪声/包络调节
         // 继续正常工作——目的是把连续电视/播客误顶起来的 engaged 放回 SONG_EQ，
-        // 让 D41/D48 的掩蔽继续工作，而不是把 EQ 压平。
+        // 让 D41/D48 的掩蔽继续工作，而不是把 包络调节压平。
         evidence.dialogue_veto = dialogue_veto;
         awareness_out_ = awareness_.update(evidence, dt_ms);
         const conversation::Output& awareness_out = awareness_out_;
-        // 对话正在发生（**已确认的预览下压**或确认）都算"进入对话"：EQ 必须保持平直，
+        // 对话正在发生（**已确认的预览下压**或确认）都算"进入对话"：包络调节必须保持平直，
         // 音乐让位。注意这里用 `out.anticipating`（连续证据 ≥500 ms 的预览），而不是
         // `state == anticipating`（第一帧证据就进）——2026-10-28 贴耳打字现场：
         // 单帧瞬态会被 1 s 事件窗标成 speech、4 判据 voice 被音乐/敲击顶到 1.0，旧写法
         // 让状态机 1 帧就 anticipating → EQ 在 100–400 ms 内闪平再回 SONG_EQ（124 s 里
-        // 34 次），掩蔽被反复打断。预览前 500 ms 媒体本来也没下压，EQ 不应先动。
+        // 34 次），掩蔽被反复打断。预览前 500 ms 媒体本来也没下压，包络调节不应先动。
         const bool conversation_active =
             awareness_out.anticipating || awareness_out.engaged;
 
@@ -661,15 +661,15 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms,
         // 动作是分离的，字段也必须分离：
         //   * SONG_EQ 写"内容重要性 × 噪声暴露 × 噪声主导抑制"的有符号 24 段曲线（D38）；
         //   * EXTERNAL_VOICE_INTENT 用同一条内容曲线，再把 1.4–4 kHz 人声段额外强调一点
-        //     （D26 的"背景/别人说话也要把 EQ 拉起来"仍然成立，只是从"只抬中频"升级成
+        //     （D26 的"背景/别人说话也要把 包络调节拉起来"仍然成立，只是从"只抬中频"升级成
         //     "整条内容曲线 + 人声加权"）；
         //   * SAFETY_HOLD 只允许非正增益：保留去糊削减，绝不抬升（安全口径不变）；
         //     现实人声增益本身仍只走标量 `external_voice_gain_db`，不是"用歌曲中频
         //     假装现实人声增强"——D0 的字段分离不变。
-        // 已确认的对话（以及 self 判定）走 flat + 下压：这是 D25/D26 的"对话 EQ 全平"，
+        // 已确认的对话（以及 self 判定）走 flat + 下压：这是 D25/D26 的"对话 包络调节全平"，
         // 不在歌曲上叠任何抬升。
         if (conversation_active || external_self_voice) {
-            // 自己说话不算对话：环境声不开、外部人声 EQ 不动；模式保持平直。
+            // 自己说话不算对话：环境声不开、外部人声包络调节 不动；模式保持平直。
             command.environment = EnvironmentKind::voice_likely;
             command.tuning_mode = TuningMode::flat;
         } else if (smoothed_dbfs_ < -56.0f) {
@@ -749,10 +749,10 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms,
 
         // 掩蔽深度：只跟 voice 置信度走，不改变"何时进入 external_voice_intent"
         //（触发仍由上面的 speech_active 决定），也不影响 ambient_open / media_percent。
-        // 门限 0.55 处深度为 0，所以模式切换本身不会给 EQ 一个台阶；这里不加时间去抖，
-        // 真实背景人声的延迟只来自既有的 650/850 ms EQ slew，没有新增。
+        // 门限 0.55 处深度为 0，所以模式切换本身不会给包络调节一个台阶；这里不加时间去抖，
+        // 真实背景人声的延迟只来自既有的 650/850 ms envelope-modulation slew，没有新增。
         // 线性 0→满幅，而不是平方衰减：0.60 仍保留 25% 掩蔽（D41 听感不至于消失），
-        // 0.56 这种刚过线的单帧只有 ~1% 深度，不会再把 EQ 顶起来。
+        // 0.56 这种刚过线的单帧只有 ~1% 深度，不会再把包络调节顶起来。
         const float mask_voice =
             clamp01((voice - kExternalMaskVoiceFloor) /
                     (kExternalMaskVoiceFull - kExternalMaskVoiceFloor));
@@ -765,7 +765,7 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms,
         // （起音 400 ms / 释放 1200 ms）。第一版直接用 250 ms 平滑电平当深度，
         // 现场反馈"毛刺感极强"——掩蔽跟着敲击节奏与 SONG_EQ↔SAFETY_HOLD 边界抽动。
         // 这里每拍都更新（包括 flat / safety_hold 模式），让深度在对话或极响期间
-        // 也能自然衰减，回 SONG_EQ 时不会带着陈旧的高深度。
+        // 也能自然衰减，回 SONG_EQ时不会带着陈旧的高深度。
         const float noise_mask_target =
             clamp01((smoothed_dbfs_ - kNoiseMaskFloorDbfs) / kNoiseMaskSpanDb);
         const float keyboard_mask_target =
@@ -837,7 +837,7 @@ EarbudCommand AdaptController::update(const AnalysisFrame& frame, float dt_ms,
 
         // 频谱每拍都会抖，分类边界也可能在 LOW/MIXED/MID 间切换。对每段独立做时间平滑：
         // 上升 650 ms、回落 850 ms，约 1.5–2 s 完成主要变化；对话/自身语音仍由环境声门控
-        // 单独即时处理，不靠 EQ 曲线承担“关麦”职责。
+        // 单独即时处理，不靠 包络调节曲线承担“关麦”职责。
         for (std::size_t band = 0; band < kBandCount; ++band) {
             eq_gain_db_[band] = slew(eq_gain_db_[band], command.eq_gain_db[band], dt_ms,
                                      650.0f, 850.0f);

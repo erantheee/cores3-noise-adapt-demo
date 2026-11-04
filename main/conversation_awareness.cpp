@@ -31,7 +31,7 @@ Output Awareness::update(const Evidence& evidence, float dt_ms) {
     //      回 100%），环境声意图随 engaged 一起关掉；
     //   2. TTL 内新的对话证据一律不认——现场场景是连续电视/播客，同一段语音会在
     //      下一拍把状态机顶回 engaged，否决就失效了。
-    // 噪声/EQ 路径不受影响：本拍仍然照常算 voice/环境，背景人声掩蔽（D41/D48）继续。
+    // 噪声/包络调节 路径不受影响：本拍仍然照常算 voice/环境，背景人声掩蔽（D41/D48）继续。
     const bool veto = evidence.dialogue_veto;
     if (veto) {
         if (state_ == State::engaged || state_ == State::anticipating) {

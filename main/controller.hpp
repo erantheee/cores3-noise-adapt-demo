@@ -13,7 +13,7 @@ constexpr float kMaxSpeechGainDb = 6.5f;
 
 /// Demo exaggeration. The numbers above are the *product* policy: bounded, smooth, and chosen so
 /// a real listener is not startled. This instrument exists to answer a different question -- "is
-/// this闭-loop even happening, and how much is it doing?" -- and at 5.4 dB with a flat EQ the
+/// this闭-loop even happening, and how much is it doing?" -- and at 5.4 dB with a flat envelope modulation the
 /// answer looked like "nothing". A demo has to be visible.
 ///
 /// The ceilings are inherited from the user's standing rule for this project (no test may exceed
@@ -23,7 +23,7 @@ constexpr float kMaxSpeechGainDb = 6.5f;
 ///   * **the 24-band EQ has exactly two writers** (D26): SONG_EQ writes the noise-shaped 24-band
 ///     suggestion, and EXTERNAL_VOICE_INTENT writes a 1–3.6 kHz hump for background/other speech.
 ///     D0's separation still holds where it matters: the scalar `external_voice_gain_db` is the
-///     real-voice intent, and a confirmed conversation / self-voice stays flat (the song EQ is
+///     real-voice intent, and a confirmed conversation / self-voice stays flat (the song envelope modulation is
 ///     never used to pretend real-voice gain).
 ///   * media ducks to kDemoMediaFloorPercent (60%): enough to expose dialogue while keeping the
 ///     programme present. The previous 25% floor was a strong demo value, not a model result.
@@ -62,7 +62,7 @@ enum class EnvironmentKind : uint8_t {
 
 /// 端侧环境场景（scene_classifier.hpp）。与上面的 EnvironmentKind 分开：
 /// EnvironmentKind 是“该不该调、怎么调”的四档行为输入；SceneKind 是“这是哪种环境”的
-/// 语义判断。前者继续驱动现有 EQ，后者先只上报/显示，等真机验收后再接决策。
+/// 语义判断。前者继续驱动现有 包络调节，后者先只上报/显示，等真机验收后再接决策。
 enum class SceneKind : uint8_t {
     unknown,
     quiet,
@@ -234,7 +234,7 @@ struct OwnVoiceEvidence {
 
 /// Mac 侧 WavLM 声纹判定（串口回传 self / other）对决策的含义。
 ///
-/// D28 step3 的语义：**只把 self 当否决**——佩戴者自己说话时，不压媒体、不抬歌曲 EQ、
+/// D28 step3 的语义：**只把 self 当否决**——佩戴者自己说话时，不压媒体、不抬歌曲包络调节、
 /// 不开环境声；other 以及"没有判定"都按 D16 的预判逻辑走。判定超过 hold_us 没有新行即
 /// 过期，过期后不再影响任何决策：这是对"worker 崩一次 / 上位机重启后对话被永久锁死"的
 /// 修复，门控必须 fail-open 到 D16，而不是 fail-closed 到永不动作。
@@ -306,13 +306,13 @@ struct EarbudCommand {
     int32_t speech_gate_us = 0;
 };
 
-// ── 风场景 EQ（D21）────────────────────────────────────────────────────────────
+// ── 风场景包络调节（D21）────────────────────────────────────────────────────────────
 //
-// 本 demo 没有降噪，执行端只有 EQ。风噪的能量集中在低频，此时继续把歌曲低频往上抬
+// 本 demo 没有降噪，执行端只有 包络调节。风噪的能量集中在低频，此时继续把歌曲低频往上抬
 // 既听不出提升、又会让整体更浑；所以风场景的策略是**给低频抬升设上限**，中高频不动。
 // 这里只定义"风时怎么改形状"，不改变"是否放歌/是否下压"的决策：
 //   * 只在 tuning_mode == song_eq（正在放歌）时生效；
-//   * 对话优先（D21）：conversation != none 时 EQ 保持控制器给的原样，不叠加风策略；
+//   * 对话优先（D21）：conversation != none 时 包络调节保持控制器给的原样，不叠加风策略；
 //   * 低频段 = 前 5 个频段（70.7–451.7 Hz），因为它们装的是风噪/轰鸣的主要能量。
 // 真机听感验证需要真实风环境，见 docs/decisions.md D21 的待办。
 namespace wind_eq {
@@ -324,7 +324,7 @@ constexpr float kLowBandScale = 0.25f;
 constexpr std::size_t kLowBandCount = 5;
 }  // namespace wind_eq
 
-/// 把控制器的 EQ 形状按"有风"改一遍。纯函数，方便单测与离线复算。
+/// 把控制器的 包络调节形状按"有风"改一遍。纯函数，方便单测与离线复算。
 ///
 /// 2026-10-21（D38）：曲线已经是有符号的，低频 346/452 Hz 可能是**负值（去糊）**。
 /// 风策略只压"抬升"（正增益），负的去糊段原样保留——把削减也乘 1/4 等于风一吹就少削，
@@ -408,7 +408,7 @@ private:
     /// 否则环境谱和 LOW/MIXED 分型的轻微变化会听成音量抽动。
     std::array<float, kBandCount> eq_gain_db_{};
     /// 平滑后的宽带电平（250 ms，D38）。模式路由与噪声暴露用它，不用原始帧，
-    /// 否则 -30 dBFS 门槛附近的瞬态会让 SONG_EQ 与 SAFETY_HOLD 每 100–200 ms 抖一次。
+    /// 否则 -30 dBFS 门槛附近的瞬态会让 SONG_EQ与 SAFETY_HOLD 每 100–200 ms 抖一次。
     float smoothed_dbfs_ = -120.0f;
     /// 噪声/键盘掩蔽深度的时间平滑状态（D48，起音 400 ms / 释放 1200 ms）。
     /// 不跟原始帧的咔哒尖峰、也不跟 SONG_EQ↔SAFETY_HOLD 的模式边界抽动。

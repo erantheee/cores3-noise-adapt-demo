@@ -41,7 +41,7 @@ def _mock_dbfs(environment: str) -> float:
 
 #: 与环境对应的决策，按固件 controller.cpp 的分支给（不是随便造几个数）：
 #:   QUIET → flat，什么都不做；NOISY → song_eq，只给逐段建议、标量增益为 0；
-#:   VOICE → 预判到对话：媒体让位 + `ambient_open` 意图；歌曲 EQ 保持平直（D0）；
+#:   VOICE → 预判到对话：媒体让位 + `ambient_open` 意图；歌曲包络调节 保持平直（D0）；
 #:   LOUD  → safety_hold，禁止正增益（这一条最容易被模拟源写错成"越大声抬越多"）。
 TARGETS = {
     "QUIET": {"gain": 0.0, "media": 100, "confidence": 0.95, "mode": "FLAT",

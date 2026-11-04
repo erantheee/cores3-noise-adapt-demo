@@ -93,7 +93,7 @@ MacAudioRoute g_mac_route;
 
 // ---- Mac 侧 WavLM 声纹判定（串口回传）----
 // self/other 是**说话人判定**，不是目标人分类：self = 佩戴者自己，other = 别人。
-// D28 step3 的语义：self → 不压媒体、不抬歌曲 EQ、不开环境声；other 与"没有判定"都按
+// D28 step3 的语义：self → 不压媒体、不抬歌曲包络调节、不开环境声；other 与"没有判定"都按
 // D16 的预判逻辑走。
 //
 // 判定超过 kVoiceprintHoldUs 没有新行就视为过期，过期后不再影响任何决策。这是对
@@ -108,7 +108,7 @@ constexpr int64_t kVoiceprintHoldUs = 3000000;
 
 // ---- Mac 侧迟到否决回写（A1/D50）：`dialog no|yes [ttl_ms]` 控制行 ----
 // 背景：D34 把 LLM 定位成"迟到否决"，但过去 host 只能关执行端的环境声，没有任何
-// 通道回写 S3 的快路径。连续电视/播客会让端侧对话态一直 engaged（EQ 压平、掩蔽
+// 通道回写 S3 的快路径。连续电视/播客会让端侧对话态一直 engaged（包络调节压平、掩蔽
 // 停摆），LLM 判 no 也纠正不回来。host 现在在 llm_veto/local_veto 时下发
 // `dialog no <ttl_ms>`，S3 在 TTL 内强制释放对话态；LLM 确认/否决过期时下发
 // `dialog yes` 提前撤销。TTL 只在控制任务里读，不跨任务共享策略。
@@ -470,7 +470,7 @@ bool poll_console_command() {
                         g_voiceprint_self = false;
                     } else if (std::strncmp(value, "pending", 7) == 0) {
                         // Host 已启用声纹，但当前 embedding 没有可靠身份：撤销旧身份。
-                        // pending 不是说话人，也不能重置 EQ、对话状态或控制帧序号。
+                        // pending 不是说话人，也不能重置包络调节、对话状态或控制帧序号。
                         pending = true;
                         g_voiceprint_self = false;
                     } else if (std::strncmp(value, "off", 3) == 0 ||
@@ -492,8 +492,8 @@ bool poll_console_command() {
                     g_voiceprint_score = score;
                     g_voiceprint_us = esp_timer_get_time();
                     // pending 只撤销说话人身份，不得重置持续控制器。worker 在安静环境下会
-                    // 周期性回传 pending；整机 reset 会把控制帧序号、EQ 平滑状态和对话状态
-                    // 一起清零，表现成 8→1/9→1 的假重启以及音量/EQ 抖动。
+                    // 周期性回传 pending；整机 reset 会把控制帧序号、包络调节平滑状态和对话状态
+                    // 一起清零，表现成 8→1/9→1 的假重启以及音量/包络调节 抖动。
                     // 非 JSON 行：host 的协议解析器会忽略它，monitor 能看到。
                     std::printf("voiceprint ack %s %.2f\n",
                                 pending ? "pending" : (g_voiceprint_self ? "self" : "other"),
@@ -865,7 +865,7 @@ void processing_task(void*) {
         if (capturing) {
             while (staged >= kReadBlockSamples * 2) {
                 // Relay and environment control consume the same microphone stream. Capture
-                // used to starve analysis, so enabling relay silently froze VAD/EQ decisions.
+                // used to starve analysis, so enabling relay silently froze VAD/包络调节 decisions.
                 if (filled + kReadBlockSamples <= kFrameSamplesMax) {
                     // D47：窗口只存 L 路；R 路只进双麦累加器。
                     for (std::size_t i = 0; i < kReadBlockSamples; ++i) {
@@ -1052,7 +1052,7 @@ void processing_task(void*) {
               sound_event_out.cls == sound_event::Class::wind ||
               sound_event_out.cls == sound_event::Class::artifact));
         // 键盘单独进控制器：键盘特殊掩蔽（D48）只在"键盘事件 + SONG_EQ"时抬 EQ；
-        // 风/撞击仍只做否决与风 EQ，不叠键盘掩蔽。
+        // 风/撞击仍只做否决与风包络调节，不叠键盘掩蔽。
         const bool keyboard_event =
             typing_active ||
             (sound_event_out.valid && sound_event_out.cls == sound_event::Class::keyboard);
@@ -1061,7 +1061,7 @@ void processing_task(void*) {
         const bool speech_event =
             sound_event_out.valid && sound_event_out.cls == sound_event::Class::speech;
 
-        // 声纹门控（D28 step3）：self → 不压媒体、不抬歌曲 EQ、不开环境声；
+        // 声纹门控（D28 step3）：self → 不压媒体、不抬歌曲包络调节、不开环境声；
         // other 或没有判定 → 按 D16 的预判逻辑走。判定超过 3 s 没有新行即过期，
         // 过期后不再影响任何决策——worker 挂掉或上位机重启不会把功能锁死。
         const VoiceprintDecision voiceprint =
@@ -1069,8 +1069,8 @@ void processing_task(void*) {
                                 now_us - g_voiceprint_us, kVoiceprintHoldUs);
         const bool external_self_voice = voiceprint.self_voice;
         // A1/D50：host 的 `dialog no` TTL 内强制释放对话态。只否决策略里的"是不是
-        // 对话"；噪声/EQ/掩蔽照常。TTL 过期后自动恢复端侧预判（fail-open 到 D16），
-        // 不依赖 host 再发一条 yes——host 崩了也不会把 EQ 永久压平。
+        // 对话"；噪声/包络调节/掩蔽照常。TTL 过期后自动恢复端侧预判（fail-open 到 D16），
+        // 不依赖 host 再发一条 yes——host 崩了也不会把包络调节永久压平。
         const bool dialog_veto = g_dialog_veto_until_us > 0 && now_us < g_dialog_veto_until_us;
         EarbudCommand command =
             controller.update(frame, elapsed_ms, non_voice_event, external_self_voice,
@@ -1189,9 +1189,9 @@ void processing_task(void*) {
         // separation is what makes this a no-behaviour-change round.
         command.context = context_result;
 
-        // 风场景 EQ（D21）：只在放歌且没有对话时压低频抬升上限；对话优先。
+        // 风场景包络调节（D21）：只在放歌且没有对话时压低频抬升上限；对话优先。
         if (sound_event_out.valid && sound_event_out.cls == sound_event::Class::wind) {
-            // D54：wind 事件去抖（转头/呼吸/衣物摩擦会让 wind 在相邻拍跳变，wind EQ 把
+            // D54：wind 事件去抖（转头/呼吸/衣物摩擦会让 wind 在相邻拍跳变，wind 包络调节把
             // 低频抬升压到 1/4 → 现场听成"歌曲声音忽大忽小"）。连续 ≥800 ms wind 才应用，
             // 停止后保持 2 s；事件遥测本身不变。
             {

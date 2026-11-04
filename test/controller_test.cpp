@@ -50,11 +50,11 @@ int main() {
 
     EarbudCommand steady;
     for (int i = 0; i < 12; ++i) steady = controller.update(frame(-38, 0.0f), 150);
-    check(steady.tuning_mode == TuningMode::song_eq, "steady noise selects song EQ");
-    check(steady.media_percent == 100, "song EQ does not silently duck media");
+    check(steady.tuning_mode == TuningMode::song_eq, "steady noise selects song envelope modulation");
+    check(steady.media_percent == 100, "song envelope modulation does not silently duck media");
     bool song_eq_has_gain = false;
     for (float gain : steady.eq_gain_db) song_eq_has_gain = song_eq_has_gain || gain > 0.05f;
-    check(song_eq_has_gain, "steady environmental masking produces a song EQ suggestion");
+    check(song_eq_has_gain, "steady environmental masking produces a song envelope modulation suggestion");
     float previous_low = 0.0f;
     AdaptController smooth_controller;
     for (int i = 0; i < 8; ++i) {
@@ -73,7 +73,7 @@ int main() {
             low = low_controller.update(spectral_frame(-38.0f, 0, 6, -30.0f), 150);
         }
         check(low.noise_spectrum == NoiseSpectrum::low, "low-frequency noise is classified LOW");
-        check(low.tuning_mode == TuningMode::song_eq, "low-frequency noise still selects song EQ");
+        check(low.tuning_mode == TuningMode::song_eq, "low-frequency noise still selects song envelope modulation");
         check(low.eq_gain_db[14] > 0.5f,
               "content prior lifts the 2.5 kHz presence band even in low-frequency rumble");
         check(low.eq_gain_db[14] > low.eq_gain_db[1],
@@ -138,13 +138,13 @@ int main() {
         check(preview.conversation == ConversationState::speech_nearby,
               "400 ms is not yet anticipating at the controller (preview needs 500 ms)");
         check(!preview.ambient_open, "no ambient intent before confirmation");
-        // 2026-10-28 贴耳打字现场修正：单帧/短瞬态不能压平 EQ。旧写法在状态机一进
+        // 2026-10-28 贴耳打字现场修正：单帧/短瞬态不能压平 包络调节。旧写法在状态机一进
         // anticipating（首帧证据）就 flat，导致敲击/音乐瞬态让 EQ 100–400 ms 闪平
-        // （124 s 里 34 次，掩蔽被反复打断）。现在 EQ 压平跟着"预览确认（500 ms）"走。
+        // （124 s 里 34 次，掩蔽被反复打断）。现在 包络调节压平跟着"预览确认（500 ms）"走。
         check(preview.tuning_mode == TuningMode::external_voice_intent,
               "未确认的预判不压平 EQ：背景人声先走掩蔽");
 
-        // 再 100 ms（累计 500 ms）→ 预下压 + EQ 压平（预览确认）。
+        // 再 100 ms（累计 500 ms）→ 预下压 + 包络调节压平（预览确认）。
         preview = predictor.update(frame(-50, 0.8f), 100, /*non_voice_event=*/false,
                                    /*external_self_voice=*/false,
                                    /*keyboard_event=*/false, /*speech_event=*/true);
@@ -172,8 +172,8 @@ int main() {
         }
         check(engaged.media_percent <= 61, "confirmed conversation ducks to the floor");
         check(engaged.tuning_mode == TuningMode::flat,
-              "a conversation never lifts the song EQ");
-        // EQ 曲线有 650/850 ms 的一阶平滑（D38）：mode 变 flat 之后 band_gain 还要几秒
+              "a conversation never lifts the song envelope modulation");
+        // 包络调节曲线有 650/850 ms 的一阶平滑（D38）：mode 变 flat 之后 band_gain 还要几秒
         // 才收敛到 0；2026-10-28 起 EQ 从"预览确认（500 ms）"才开始压平、比旧写法晚
         // 400 ms，所以这里必须给足平滑时间，否则测到的是 slew 尾巴而不是行为。
         for (int i = 0; i < 70; ++i) {
@@ -243,7 +243,7 @@ int main() {
         EarbudCommand out;
         // -54 dBFS、voice 0.8：speech_active 成立，但对话 cue（-58 起按 16 dB 归一）
         // 只有 0.25，低于 0.5 门限 -> 不进入 anticipating，走 external_voice_intent。
-        // D54：进 EXTERNAL_VOICE_INTENT 需要 300 ms 滞回，之后还有 650 ms EQ 平滑；
+        // D54：进 EXTERNAL_VOICE_INTENT 需要 300 ms 滞回，之后还有 650 ms 包络调节平滑；
         // 20 拍 × 150 ms 让曲线收敛。
         for (int i = 0; i < 20; ++i) out = background.update(frame(-54, 0.8f), 150,
                                                               false, false, false,
@@ -341,7 +341,7 @@ int main() {
     {
         AdaptController noisy;
         EarbudCommand out;
-        // voice 0.6、-45 dBFS：够"有人声"（EQ/场景）但不够对话（0.65）。
+        // voice 0.6、-45 dBFS：够"有人声"（包络调节/场景）但不够对话（0.65）。
         for (int i = 0; i < 12; ++i) {
             out = noisy.update(frame(-45, 0.6f), 150, false, false, false,
                                /*speech_event=*/true);
@@ -369,7 +369,7 @@ int main() {
               "self 声纹不进入对话");
         check(!out.ambient_open, "self 声纹不开环境声");
         check(out.media_percent == 100, "self 声纹不压媒体");
-        check(out.tuning_mode == TuningMode::flat, "self 声纹不进入外部人声 EQ");
+        check(out.tuning_mode == TuningMode::flat, "self 声纹不进入外部人声包络调节");
         bool any_eq = false;
         for (std::size_t band = 0; band < 24; ++band) {
             if (out.eq_gain_db[band] > 0.01f) any_eq = true;
@@ -411,7 +411,7 @@ int main() {
     }
 
     // ---- 键盘特殊掩蔽 + 普通噪声掩蔽（2026-10-26，D48）----
-    // 真机定位：键盘来时模式停在 SONG_EQ、掩蔽推量 ≈ 0、EQ 只动 ±0.8 dB。这里钉住：
+    // 真机定位：键盘来时模式停在 SONG_EQ、掩蔽推量 ≈ 0、包络调节只动 ±0.8 dB。这里钉住：
     // ①键盘事件在足迹段（1.0–3.4 kHz）给出清晰但克制的掩蔽抬升；②普通噪声掩蔽按
     // 电平连续缩放；③安静/安全保持不叠掩蔽；④±4 dB 上限不破；⑤键盘停止后掩蔽慢释放
     // 不瞬间抽掉（2026-10-26 现场第一版拉满 +4 dB：人声全变、毛刺感极强）。
@@ -423,7 +423,7 @@ int main() {
                                   /*external_self_voice=*/false, /*keyboard_event=*/true);
         }
         check(typed.tuning_mode == TuningMode::song_eq,
-              "keyboard stays in song EQ mode (non-voice noise)");
+              "keyboard stays in song envelope modulation mode (non-voice noise)");
         check(typed.eq_gain_db[10] >= 1.2f,
               "keyboard footprint band gets a clear masking lift");
         check(typed.eq_gain_db[0] > 0.3f && typed.eq_gain_db[0] < typed.eq_gain_db[10],
@@ -440,7 +440,7 @@ int main() {
             plain_out = plain.update(frame(-42.0f, 0.0f), 150, /*non_voice_event=*/true);
         }
         check(plain_out.tuning_mode == TuningMode::song_eq,
-              "plain noise without the keyboard event stays in song EQ");
+              "plain noise without the keyboard event stays in song envelope modulation");
         check(typed.eq_gain_db[10] > plain_out.eq_gain_db[10] + 0.8f,
               "the keyboard event adds a distinct emphasis on top of noise masking");
 
@@ -488,8 +488,8 @@ int main() {
 
     // ---- 漏音/非人声不得进入对话或背景人声判定（2026-10-26，D49）----
     // 耳边实测：OWS 耳机漏音把 voice_likelihood 顶到 0.82（event=quiet），旧路径把
-    // 对话状态机锁进 engaged、EQ 压平 47%。现在 speech_event=false 时必须既不进对话、
-    // 也不进背景人声掩蔽，掩蔽在 SONG_EQ 下继续工作。
+    // 对话状态机锁进 engaged、包络调节压平 47%。现在 speech_event=false 时必须既不进对话、
+    // 也不进背景人声掩蔽，掩蔽在 SONG_EQ下继续工作。
     {
         AdaptController leaked;
         EarbudCommand out;
@@ -501,7 +501,7 @@ int main() {
         check(out.conversation == ConversationState::none,
               "leakage-like voice without a speech event never starts a conversation");
         check(out.tuning_mode == TuningMode::song_eq,
-              "leakage-like voice without a speech event stays in song EQ (no voice mask)");
+              "leakage-like voice without a speech event stays in song envelope modulation (no voice mask)");
         check(out.eq_gain_db[14] < 2.5f,
               "no D41 voice-band emphasis for leakage (only the level-driven noise mask)");
         check(out.media_percent == 100 && !out.ambient_open,
@@ -570,7 +570,7 @@ int main() {
         check(with_demo.own_voice.proxy && !with_demo.own_voice.bone,
               "near_field_demo never claims bone evidence");
         check(with_demo.tuning_mode == TuningMode::flat,
-              "conversation mode does not lift the song EQ");
+              "conversation mode does not lift the song envelope modulation");
 
         AdaptController off;
         off.set_evidence_policy(EvidencePolicy::disabled);
@@ -656,7 +656,7 @@ int main() {
         }
         check(engaged.media_percent <= 61, "precondition: sustained speech engages the fast path");
         check(engaged.ambient_open, "precondition: engaged opens the environment intent");
-        check(engaged.tuning_mode == TuningMode::flat, "precondition: engaged keeps the song EQ flat");
+        check(engaged.tuning_mode == TuningMode::flat, "precondition: engaged keeps the song envelope modulation flat");
 
         // 否决后：连续证据继续喂，也必须保持释放——否则电视/播客会把状态机顶回去。
         EarbudCommand after_veto;

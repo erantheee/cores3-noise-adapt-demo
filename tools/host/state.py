@@ -315,7 +315,7 @@ class HostState:
         self.capture_event_seq: int = 0
         self.audio_samples: int = 0
         self.recording = False
-        #: 演示暂停：只停执行端（EQ/媒体/环境声），采集、ASR/LLM、训练数据继续。
+        #: 演示暂停：只停执行端（包络调节/媒体/环境声），采集、ASR/LLM、训练数据继续。
         #: 由面板 POST /api/execution 置位；主循环读它决定是否把 S3 决策下发到音频。
         self.execution_paused = False
 
