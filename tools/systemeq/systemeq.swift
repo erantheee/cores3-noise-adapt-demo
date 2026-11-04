@@ -13,7 +13,7 @@
 // stdout：{"event":"ready",...} / {"event":"state",...} / {"event":"error",...}
 //
 // 边界：
-//   * 只 tap 目标 App（默认 com.tencent.QQMusicMac），不 tap 整个系统，避免把自己的输出再抓回来；
+//   * --app system 捕获系统混音并排除自身；bundle ID 保留单应用捕获；
 //   * muteBehavior = mutedWhenTapped：原声在读取期间静音，EQ 副本从耳机输出；
 //   * tap/engine 启动失败、退出、stdin EOF 都要销毁 tap，让原声恢复（fail-open）；
 //   * 这是原型：默认输出设备切换、蓝牙 HFP、流媒体 DRM、延迟还没有完整验收。
@@ -294,7 +294,7 @@ final class StemBridge: @unchecked Sendable {
         self.autocast = autocast
         self.strength = strength
         self.controlEnvironment = environment
-        // Holds >10 seconds so 2 s model bursts do not underrun the source node.
+        // Capacity for model bursts; actual startup water level is set by preroll below.
         self.outputRing = AudioRingBuffer(channelCount: channels,
                                           capacity: max(48_000, sampleRate * 12))
     }
@@ -799,6 +799,56 @@ final class ContentMeter: @unchecked Sendable {
 
 // MARK: - Process tap
 
+func audioProcessObject(for pid: pid_t) throws -> AudioObjectID {
+    var pidValue = pid
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyTranslatePIDToProcessObject,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var object = AudioObjectID(kAudioObjectUnknown)
+    var size = UInt32(MemoryLayout<AudioObjectID>.size)
+    let status = AudioObjectGetPropertyData(
+        AudioObjectID(kAudioObjectSystemObject), &address,
+        UInt32(MemoryLayout<pid_t>.size), &pidValue, &size, &object)
+    guard status == noErr, object != kAudioObjectUnknown else {
+        throw NSError(domain: "SystemEq", code: 3,
+                      userInfo: [NSLocalizedDescriptionKey:
+                        "无法解析音频进程 PID \(pid)（\(status)）；未启动捕获"])
+    }
+    return object
+}
+
+func playbackPrerollFrames(sampleRate: Double, stemWindow: Double?, overlap: Double) -> Int {
+    // One model burst is not a reserve: playback consumes it while the next is
+    // computed. Keep two hops before starting, so a late window has one hop spare.
+    let seconds = stemWindow.map { max(0.5, 2 * ($0 - overlap)) } ?? 0.5
+    return Int(ceil(sampleRate * seconds))
+}
+
+/// Dependency injection keeps routing/exclusion tests independent of live audio.
+func makeTapDescription(target: String, ownPID: pid_t = getpid(),
+                        appPID: (String) -> pid_t? = {
+                            NSRunningApplication.runningApplications(withBundleIdentifier: $0)
+                                .first?.processIdentifier
+                        },
+                        resolve: (pid_t) throws -> AudioObjectID = audioProcessObject)
+    throws -> CATapDescription {
+    if target == "system" {
+        // Never fall back to an empty exclusion list: that would capture our playback.
+        let ownObject = try resolve(ownPID)
+        guard ownObject != kAudioObjectUnknown else {
+            throw NSError(domain: "SystemEq", code: 3,
+                          userInfo: [NSLocalizedDescriptionKey: "无法排除自身音频进程；未启动全局捕获"])
+        }
+        return CATapDescription(stereoGlobalTapButExcludeProcesses: [ownObject])
+    }
+    guard let pid = appPID(target) else {
+        throw NSError(domain: "SystemEq", code: 2,
+                      userInfo: [NSLocalizedDescriptionKey: "App 未运行：\(target)"])
+    }
+    return CATapDescription(stereoMixdownOfProcesses: [try resolve(pid)])
+}
+
 final class TapCapture {
     let sampleRate: Double
     let channels: Int
@@ -806,7 +856,6 @@ final class TapCapture {
     let ring: AudioRingBuffer
     let meter = Meter()
     let content = ContentMeter()
-    private let processID: AudioObjectID
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var aggregateID = AudioDeviceID(kAudioObjectUnknown)
     private var ioProcID: AudioDeviceIOProcID?
@@ -814,29 +863,7 @@ final class TapCapture {
     private var running = false
 
     init(bundleID: String) throws {
-        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first else {
-            throw NSError(domain: "SystemEq", code: 2,
-                          userInfo: [NSLocalizedDescriptionKey: "App 未运行：\(bundleID)"])
-        }
-        let pid = app.processIdentifier
-
-        var pidValue = pid
-        var processAddress = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyTranslatePIDToProcessObject,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
-        var audioProcessID = AudioObjectID(kAudioObjectUnknown)
-        var processSize = UInt32(MemoryLayout<AudioObjectID>.size)
-        let processStatus = AudioObjectGetPropertyData(
-            AudioObjectID(kAudioObjectSystemObject), &processAddress,
-            UInt32(MemoryLayout<pid_t>.size), &pidValue, &processSize, &audioProcessID)
-        guard processStatus == noErr, audioProcessID != kAudioObjectUnknown else {
-            throw NSError(domain: "SystemEq", code: 3,
-                          userInfo: [NSLocalizedDescriptionKey: "找不到 QQ 音乐的 process object"])
-        }
-        self.processID = audioProcessID
-
-        let description = CATapDescription(stereoMixdownOfProcesses: [audioProcessID])
+        let description = try makeTapDescription(target: bundleID)
         description.name = "cores3-systemeq"
         description.isPrivate = true
         let muteRaw = Int(ProcessInfo.processInfo.environment["SYSTEMEQ_MUTE"] ?? "2") ?? 2
@@ -846,7 +873,7 @@ final class TapCapture {
         let tapStatus = AudioHardwareCreateProcessTap(description, &createdTap)
         guard tapStatus == noErr, createdTap != kAudioObjectUnknown else {
             throw NSError(domain: "SystemEq", code: 4,
-                          userInfo: [NSLocalizedDescriptionKey: "创建 process tap 失败：\(tapStatus)"])
+                          userInfo: [NSLocalizedDescriptionKey: "创建 process tap 失败：\(tapStatus)；请检查 macOS 系统音频录制权限"])
         }
         self.tapID = createdTap
 
@@ -1069,7 +1096,7 @@ final class EqState: @unchecked Sendable {
         var mediaPercent: Float = 100
         var mode = "aggressive"
         //: 基线缩放系数（0 = 完全平直）。S3 报 FLAT（安静/对话）时 host 下发 0，
-        //: 保证"安静时完全没有 EQ 动作"（2026-10-23 用户口径）。
+        //: 保证"安静时完全没有包络调节动作"（2026-10-23 用户口径）。
         var baseGain: Float = 1.0
         var ambientBands = [Float](repeating: -120, count: 24)
         var ambientBroadbandDbfs: Float = -120
@@ -1230,7 +1257,41 @@ func runSystemEqSelfTest() {
     missing.record(requested: 512, supplied: 0)
     require(missing.snapshot().frames == 524 && missing.snapshot().events == 2,
             "partial and empty reads must count exact missing frames")
-    print("systemeq selftest: 15/15 passed")
+    do {
+        let global = try makeTapDescription(target: "system", ownPID: 123,
+            appPID: { _ in fatalError("global capture must not resolve an app") },
+            resolve: { pid in
+                require(pid == 123, "global exclusion resolves our own PID")
+                return 77
+            })
+        require(global.isExclusive && global.processes == [77],
+                "global capture excludes precisely our audio process")
+        let single = try makeTapDescription(target: "com.example.browser", appPID: { _ in 456 },
+            resolve: { pid in require(pid == 456, "single app resolves selected PID"); return 88 })
+        require(!single.isExclusive && single.processes == [88],
+                "single-app compatibility includes only selected process")
+    } catch { require(false, "tap selection failed: \(error)") }
+    do {
+        _ = try makeTapDescription(target: "system", resolve: { _ in kAudioObjectUnknown })
+        require(false, "unknown self process must fail closed")
+    } catch { }
+    do {
+        _ = try makeTapDescription(target: "system", resolve: { _ in
+            throw NSError(domain: "test", code: 1)
+        })
+        require(false, "self lookup errors must not start a tap")
+    } catch { }
+    do {
+        _ = try makeTapDescription(target: "missing.app", appPID: { _ in nil })
+        require(false, "missing application must still fail clearly")
+    } catch { }
+    require(playbackPrerollFrames(sampleRate: 48000, stemWindow: nil, overlap: 0.1) == 24000,
+            "ordinary envelope modulation retains half-second startup")
+    require(playbackPrerollFrames(sampleRate: 48000, stemWindow: 2, overlap: 0.1) == 182400,
+            "four stems start with two complete output hops")
+    require(playbackPrerollFrames(sampleRate: 44100, stemWindow: 2, overlap: 0.1) == 167580,
+            "stem preroll follows the actual capture rate")
+    print("systemeq selftest: 25/25 passed")
 }
 
 // MARK: - Main
@@ -1533,7 +1594,7 @@ for (index, center) in bandCenters.enumerated() {
     band.filterType = .parametric
     band.frequency = center
     // 0.30 oct：24 段是 1/3 oct 间隔，0.30 oct 的带宽让相邻段几乎不重叠（每个频点约
-    // 1 个滤波器生效）。**不要随手加宽**（2026-10-28 实测）：AVAudioUnitEQ 的段是并联
+    // 1 个滤波器生效）。**不要随手加宽**（2026-10-28 实测）：AVAudioUnitEQ的段是并联
     // 叠加的，加到 0.55 oct 后相邻段重叠，等效增益翻倍——输出峰值从 1.8 冲到 4.0、
     // 4.6% 采样削波，"毛刺"更重。要平滑音色应该动增益预算/滤波类型，不是加宽带宽。
     band.bandwidth = 0.30
@@ -1577,7 +1638,7 @@ func applyEq(_ state: EqState) {
     let content = capture.content.snapshot()
     // 高频收放（仅基础档）由两个维度取 max：
     //   * 内容 harshness（方案 A）：0(稀疏人声)=保留高频清透，1(密集器乐/电子)=收高频压底噪；
-    //   * 环境曝光 envExposure（2026-10-23 用户口径）：环境音进入时也要压 EQ——S3 端侧
+    //   * 环境曝光 envExposure（2026-10-23 用户口径）：环境音进入时也要压包络调节——S3 端侧
     //     处方幅度就是"环境吵不吵"的信号（安静≈0、越吵越大），处方活动度 max|band|/2.5
     //     超过阈值就把高频压下去（环境高频嘶声与音乐高频叠加只会更吵）。
     // 4–7 kHz 轻收、8.5 kHz+ 重收；两维各自平滑后取 max，再走一步 50 ms 节拍平滑。
@@ -1683,10 +1744,12 @@ func quit(_ reason: String) {
 
 // 预缓冲（2026-10-23）：tap 已经先启动、ring 在积累。若不预缓冲就起 engine，
 // 首次 render 回调只能拿到几百帧 -> AVAudioConverter 输出不足 -> 静音填充造成
-// 周期性"刷"声。等 ring 积累 ≥ 0.5 s（24000 帧 @48k）再起引擎；上限 3 s 防挂死。
+// 周期性"刷"声。普通 EQ 等 0.5 s；四轨等两个输出 hop；等待上限分别为 3/8 s。
 var prerollWaitedMs = 0
 let prerollLimitMs = stemBridge == nil ? 3000 : 8000
-while playbackRing.fillCount < 24000 && prerollWaitedMs < prerollLimitMs {
+let prerollFrames = playbackPrerollFrames(sampleRate: sourceFormat.sampleRate,
+    stemWindow: stemBridge == nil ? nil : options.stemWindow, overlap: options.stemOverlap)
+while playbackRing.fillCount < prerollFrames && prerollWaitedMs < prerollLimitMs {
     usleep(10_000)
     prerollWaitedMs += 10
 }
@@ -1729,6 +1792,9 @@ emit([
     "stem_autocast": options.stemAutocast,
     "stem_environment": options.stemEnvironment,
     "stem_preroll_ms": prerollWaitedMs,
+    "playback_preroll_frames": prerollFrames,
+    "capture_scope": options.app == "system" ? "system" : "application",
+    "self_excluded": options.app == "system",
     "build_sha256": executableBuild.sha256,
     "build_size": executableBuild.size,
 ])
@@ -1848,6 +1914,8 @@ if options.reportSeconds > 0 {
         let stem = stemBridge?.snapshot()
         emit([
             "event": "state",
+            "capture_scope": options.app == "system" ? "system" : "application",
+            "self_excluded": options.app == "system",
             "rms": meter.rms,
             "peak": meter.peak,
             "callbacks": meter.callbacks,

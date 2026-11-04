@@ -5,7 +5,7 @@
 
 ## 项目是什么
 CoreS3 = AI OWS 耳机仓（端侧感知/决策）；Mac = 播放器与原型执行器；耳机 = OWS 耳夹（Xiaomi）或 TWS 对照（AirPods Pro），同版本自动识别（D35/D36）。
-验证的是：预判式对话感知（0.5 s 预下压 70% / 0.8 s 确认 60%，D16/D40）、噪声自适应歌曲 EQ（D39）、背景人声掩蔽（D41）、环境声执行门（D42）。
+验证的是：预判式对话感知（0.5 s 预下压 70% / 0.8 s 确认 60%，D16/D40）、噪声自适应歌曲包络调节（D39）、背景人声掩蔽（D41）、环境声执行门（D42）。
 **不做**：降噪、音频回传注入（D2/D3）；不宣称目标人声增强、双耳原始麦流、声学 DOA/波束（D36）。
 
 ## 当前状态（2026-11-02；详情以 `docs/handoff.md` 为准）
@@ -20,7 +20,7 @@ CoreS3 = AI OWS 耳机仓（端侧感知/决策）；Mac = 播放器与原型执
 - `main/controller.{hpp,cpp}` — 策略/增益：`kMaxSpeechGainDb=6.5`（产品策略）、`kDemoSpeechGainDb=8.0`（demo 实发）
 - `main/app_main.cpp` — 主循环 / 串口协议 v4；`main/demo_ui.cpp` — 屏幕
 - `main/{sound_event.hpp,listening_model.h,voiceprint_gate.*,bone_voice.*}` — 端侧规则/模型/证据
-- `tools/host/` — 上位机（`__main__.py` 入口，`assistant.py` ASR/LLM，`state.py` 快照，`memo.py` 账本，`web/` 面板）；`tools/player/` — Swift 实时 24 段 EQ
+- `tools/host/` — 上位机（`__main__.py` 入口，`assistant.py` ASR/LLM，`state.py` 快照，`memo.py` 账本，`web/` 面板）；`tools/player/` — Swift 实时 24 段包络调节
 - `test/*_test.cpp`（ctest）、`tools/host/tests/test_host.py`、`tools/host/tests/render_check.js`
 - `tools/{build.sh,flash.sh,monitor.sh,host_up.sh,free_port.sh,record_from_device.py}`
 - 索引：`docs/INDEX.md`（先看，含归档级标记与已知矛盾）；口径：`docs/product-alignment.md`；状态：`docs/plan-status.md`（只看状态表/下一步）；决策：`docs/decisions.md` 按 D 编号 grep（最新 D54）
@@ -46,8 +46,8 @@ sh tools/build.sh flash       # 编译后刷写（复用 tools/flash.sh）
 ## 硬规则 / 已知坑
 - **多会话协作（2026-10-23）：host 归谁管**。同一台机器的多个 DSH 会话共享这个仓库和串口。
   ① host 只能经 `sh tools/host_up.sh --detach` 启动——脚本已**固化演示默认三件套**
-  （`--system-eq-app com.tencent.QQMusicMac --eq-mode basic --ambient-gate voice --voiceprint`），
-  任何会话裸跑都会带上 EQ，不会再把 systemeq 冲掉；要额外功能显式加参
+  （`--system-eq-app system --eq-mode basic --ambient-gate voice --voiceprint`），
+  任何会话裸跑都会带上包络调节，不会再把 systemeq 冲掉；要额外功能显式加参
   （如对方会话的中继：`sh tools/host_up.sh --detach --relay-audio --ambient-executor relay`）。
   ② 重启 host 前先 `curl -s http://127.0.0.1:8787/api/snapshot` 确认现状：systemeq 已在就别重启；
   确实要重启，先 `sh tools/free_port.sh --kill` 再 host_up，**禁止 kill 对家进程后不管**。

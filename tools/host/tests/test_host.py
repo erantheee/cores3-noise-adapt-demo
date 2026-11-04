@@ -2367,6 +2367,20 @@ def test_eq_mode_and_bypass_control() -> None:
 def test_systemeq_execution_contract() -> None:
     from host.systemeq import SystemEqError, SystemEqService
     # 独立于 HTTP：字段校验、分轨回退和实际执行器回执。
+    global_service = SystemEqService(app="system", autostart=False)
+    eq(global_service.snapshot()["capture_scope"], "system", "全局模式透传捕获范围")
+    check(not global_service.snapshot()["self_excluded"], "未启动不能冒认已排除自身")
+    global_service._ready = {"self_excluded": True, "stem_preroll_ms": 2500}
+    check(global_service.snapshot()["self_excluded"], "排除自身需有执行器回执")
+    global_service._process = _FakePlayerProcess()
+    global_service._state = {"rms": 0.4, "content_window_rms": 0.0, "self_excluded": True}
+    eq(global_service.snapshot()["execution"], "silent", "暂停后旧累计 RMS 不能冒认仍在播放")
+    global_service._state.update({"stem_input_frames": 96000, "stem_output_frames": 91200,
+                                  "stem_output_fill": 24000})
+    eq(global_service.snapshot()["stem_output_fill"], 24000, "分轨缓冲水位透传便于验收")
+    eq(global_service.snapshot()["stem_preroll_ms"], 2500, "分轨启动预缓冲耗时透传")
+    global_service._state["content_window_rms"] = 0.1
+    eq(global_service.snapshot()["execution"], "applied", "新来源有输入后恢复执行无需重建")
     service = SystemEqService(autostart=False)
     try:
         service.command("mode", value="loud")
@@ -2922,6 +2936,20 @@ def test_media_card() -> None:
     check("QQ 音乐执行端未运行" in failed["source_text"], "媒体卡要写明执行端故障")
     check("切回 24 段 EQ" in failed["source_text"], "媒体卡要带回退原因")
     eq(failed["track"], None, "执行端不可用时不得编造曲目")
+
+    for available in (True, False):
+        global_card = describe_media(
+            systemeq={"app": "system", "available": available, "execution": "silent"},
+            player=None, frame=None, leak=None)
+        eq(global_card["source"], "system" if available else "system_unavailable",
+           "全局媒体源不能冒充 QQ 音乐")
+        check("系统音频" in global_card["source_text"], "全局模式显示系统音频")
+        check("QQ 音乐" not in str(global_card), "全局模式不编造应用和曲目")
+        eq(global_card["track"], None, "全局模式不推断曲目")
+    browser_card = describe_media(
+        systemeq={"app": "com.example.browser", "available": True},
+        player=None, frame=None, leak=None)
+    eq(browser_card["source"], "application", "显式浏览器不是 QQ 音乐")
 
     # 2) 只有本地播放器：曲目名读得到
     card = describe_media(systemeq=None,

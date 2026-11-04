@@ -379,6 +379,8 @@ class SystemEqService:
                 "reason": reason or "systemeq 没有在运行",
                 "execution": "unavailable",
                 "app": self.app,
+                "capture_scope": "system" if self.app == "system" else "application",
+                "self_excluded": bool((state or ready or {}).get("self_excluded", False)),
                 "demo": self.demo,
                 "stem_stream": bool(self.stem_worker),
                 "stem_requested": self.stem_requested,
@@ -397,7 +399,9 @@ class SystemEqService:
             }
 
         state = state or {}
-        rms = state.get("rms")
+        # Lifetime RMS retains the previous source across pauses; recent-window
+        # RMS lets global playback become silent and recover without a restart.
+        rms = state.get("content_window_rms", state.get("rms"))
         bypass = bool(state.get("bypass"))
         if bypass:
             execution = "bypass"
@@ -418,6 +422,8 @@ class SystemEqService:
             "reason": reason,
             "execution": execution,
             "app": self.app,
+            "capture_scope": "system" if self.app == "system" else "application",
+            "self_excluded": bool((state or ready or {}).get("self_excluded", False)),
             "demo": self.demo,
             "stem_stream": bool(self.stem_worker),
             "stem_requested": self.stem_requested,
@@ -483,6 +489,10 @@ class SystemEqService:
             "stem_bypass": state.get("stem_bypass"),
             "stem_windows": state.get("stem_windows"),
             "stem_process_ms": state.get("stem_process_ms"),
+            "stem_preroll_ms": (ready or {}).get("stem_preroll_ms"),
+            "stem_input_frames": state.get("stem_input_frames"),
+            "stem_output_frames": state.get("stem_output_frames"),
+            "stem_output_fill": state.get("stem_output_fill"),
             "stem_rtf": state.get("stem_rtf"),
             "stem_roles": state.get("stem_roles") or {},
             "stem_names": state.get("stem_names") or [],

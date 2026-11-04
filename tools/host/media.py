@@ -6,7 +6,7 @@ pop）、调音思路。** 所以判断都放在 host，面板只负责照实显
 
 ## 三件事各自能拿到什么、拿不到什么
 
-1. **媒体源**：能确定。执行端是 systemeq tap 就是 QQ 音乐；只有本地播放器在播就是本机
+1. **媒体源**：能确定。执行端按捕获目标显示系统音频或指定应用；只有本地播放器在播就是本机
    播放器；都没有就是没有媒体。**曲目名/歌手读不到**：QQ 音乐在 macOS 上没有可用的
    AppleScript 曲目接口，MediaRemote 的 Now Playing 探测也拿不到（2026-10-30 实测回调
    不返回）。所以曲目一栏如实写"不可读"，不猜。
@@ -212,27 +212,33 @@ def describe_media(*, systemeq: dict | None, player: dict | None,
     systemeq = systemeq or {}
     player = player or {}
     systemeq_failed = bool(systemeq) and systemeq.get("available") is False
-    qq_running = bool(systemeq) and systemeq.get("available") is not False
+    tap_running = bool(systemeq) and systemeq.get("available") is not False
     player_playing = bool(player.get("playing"))
+    target = str(systemeq.get("app") or "com.tencent.QQMusicMac")
+    source_key = "system" if target == "system" else (
+        "qqmusic" if target == "com.tencent.QQMusicMac" else "application")
+    source_label = "系统音频" if target == "system" else (
+        "QQ 音乐" if source_key == "qqmusic" else f"应用 {target}")
 
-    if qq_running:
+    if tap_running:
         execution = str(systemeq.get("execution") or "")
-        source_text = "QQ 音乐（tap 执行端）"
+        source_text = f"{source_label}（tap 执行端）"
         if execution == "applied":
             source_text += " · 正在出声"
         elif execution == "silent":
-            source_text += " · 歌在播但实测无信号"
+            source_text += " · 当前无音频信号"
         elif execution == "bypass":
             source_text += " · 已直通"
         track = None
-        track_note = "曲目信息不可读（QQ 音乐未暴露曲目接口）"
+        track_note = ("曲目信息不可读（QQ 音乐未暴露曲目接口）" if source_key == "qqmusic"
+                      else "未读取网站、曲目或视频信息")
     elif player_playing:
         source_text = "Mac 本地播放器"
         track = player.get("track_title")
         track_note = "" if track else "曲目名不可读"
     elif systemeq_failed:
         reason = str(systemeq.get("reason") or "执行端没有在运行")
-        source_text = f"QQ 音乐执行端未运行：{reason}"
+        source_text = f"{source_label}执行端未运行：{reason}"
         track = None
         track_note = "执行端恢复后才能判断当前歌曲"
     else:
@@ -240,12 +246,12 @@ def describe_media(*, systemeq: dict | None, player: dict | None,
         track = None
         track_note = ""
 
-    kind = estimate_content_kind(systemeq) if (qq_running or player_playing) else {
+    kind = estimate_content_kind(systemeq) if (tap_running or player_playing) else {
         "kind": "unknown", "text": "无内容", "confidence": 0.0, "basis": "",
     }
     return {
-        "source": "qqmusic" if qq_running else (
-            "player" if player_playing else ("qqmusic_unavailable" if systemeq_failed else "none")),
+        "source": source_key if tap_running else (
+            "player" if player_playing else (f"{source_key}_unavailable" if systemeq_failed else "none")),
         "source_text": source_text,
         "track": track,
         "track_note": track_note,

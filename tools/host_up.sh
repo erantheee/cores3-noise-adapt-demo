@@ -82,7 +82,7 @@ case " $* " in
     *" --ambient-executor "*|*" --mock "*|*" --replay "*) : ;;
     *) set -- --ambient-executor off "$@" ;;
 esac
-# 演示默认三件套：QQ 音乐执行端 + voice 门 + 声纹。
+# 演示默认三件套：系统音频执行端 + voice 门 + 声纹。
 # 2026-10-23 上午连续两次"host 被不带参数重启 → systemeq 静默消失"，根因是这些参数
 # 只存在于口头命令里。现在写进 host_up.sh 默认值：任何会话/脚本起 host 都带上。
 # 2026-10-30：实时分轨改成四轨 htdemucs + 2 s/0.1 s overlap + MPS autocast。
@@ -90,7 +90,7 @@ esac
 # 显式传参或 mock/replay 时不覆盖。
 case " $* " in
     *" --system-eq-app "*|*" --mock "*|*" --replay "*) : ;;
-    *) set -- --system-eq-app com.tencent.QQMusicMac --eq-mode basic "$@" ;;
+    *) set -- --system-eq-app system --eq-mode basic "$@" ;;
 esac
 case " $* " in
     *" --stem-remix "*|*" --no-stem-remix "*|*" --mock "*|*" --replay "*) : ;;

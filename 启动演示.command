@@ -17,12 +17,13 @@ echo "== CoreS3 演示启动 =="
 # 若检测到旧的无分轨实例，先停掉再切到默认四轨链路。
 if curl -s --max-time 2 "${URL}api/health" >/dev/null 2>&1; then
     SNAPSHOT=$(curl -s --max-time 3 "${URL}api/snapshot" 2>/dev/null || true)
-    if printf '%s' "$SNAPSHOT" | grep -Eq '"stem_stream"[[:space:]]*:[[:space:]]*true'; then
-        echo "当前四轨实时分轨上位机已经在运行，直接打开面板。"
+    if printf '%s' "$SNAPSHOT" | grep -Eq '"stem_stream"[[:space:]]*:[[:space:]]*true' &&
+       printf '%s' "$SNAPSHOT" | grep -Eq '"capture_scope"[[:space:]]*:[[:space:]]*"system"'; then
+        echo "当前系统音频四轨实时分轨上位机已经在运行，直接打开面板。"
         open "$URL" >/dev/null 2>&1 || true
         exit 0
     fi
-    echo "检测到旧的无分轨实例，正在关闭并切换到四轨实时分轨…"
+    echo "检测到旧的单应用或无分轨实例，正在切换到系统音频四轨实时分轨…"
     curl -s --max-time 4 "${URL}api/stop" >/dev/null 2>&1 || true
     sleep 2
 fi
@@ -30,7 +31,7 @@ fi
 echo "1/2 释放串口（可能在跑的上位机 / 录音工具）…"
 sh tools/free_port.sh --kill >/dev/null 2>&1 || true
 
-echo "2/2 启动上位机（四轨实时分轨 + 对话门 + 声纹 + 训练数据）…"
+echo "2/2 启动上位机（系统音频 + 四轨实时分轨 + 对话门 + 声纹 + 训练数据）…"
 if ! sh tools/host_up.sh --detach; then
     echo
     echo "启动失败。完整输出：sh tools/host_up.sh"

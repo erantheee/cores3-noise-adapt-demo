@@ -272,7 +272,7 @@
       <div class="sub" id="media-kind">—</div>
       <div class="sub" id="media-tuning" style="white-space:pre-line">—</div>
       <details style="margin-top:8px">
-        <summary class="sub">本机播放器（调试 / 原版对照，不参与 QQ 音乐链路）</summary>
+        <summary class="sub">本机播放器（调试 / 原版对照，单应用捕获时不参与主链；系统捕获时会被接管）</summary>
         <div class="row" style="margin-top:6px">
           <span class="value small" id="track">—</span>
           <span class="sub" id="track-pos" style="margin-top:0">—</span>
@@ -885,7 +885,7 @@ function receiptText(s) {
   if (!side) {
     return `设备自报 execution=${device} · Mac：本次运行没有启用执行端 · 耳机是否已播放：无法验证`;
   }
-  const label = side.kind === "systemeq" ? "QQ音乐 tap" : "Mac";
+  const label = side.kind === "systemeq" ? (side.data.app === "system" ? "系统音频 tap" : "应用 tap") : "Mac";
   const state = EXECUTION_LABEL[side.data.execution] || `未知状态（${side.data.execution}）`;
   return `设备自报 execution=${device} · ${label}：${state} · 耳机是否已播放：无法验证（链路无回执）`;
 }
@@ -975,7 +975,7 @@ function renderSystemEq(s) {
     return;
   }
   if (se.available === false) {
-    el.textContent = `QQ 音乐 tap 不可用：${se.reason || "进程没起来"}`;
+    el.textContent = `${se.app === "system" ? "系统音频" : (se.app || "应用")} tap 不可用：${se.reason || "进程没起来"}`;
     return;
   }
   const exec = {
@@ -1046,7 +1046,7 @@ function renderSystemEq(s) {
       + (Number.isFinite(leakLevel) ? ` · 漏音 ${leakLevel.toFixed(1)} dB` : "")
       + ` · 置信 ${Math.round((Number(leak.confidence) || 0) * 100)}%）`
     : "";
-  el.textContent = `QQ 音乐 tap：${exec}${baseLabel} · RMS ${fmt(se.rms, 4)} · 峰值 ${fmt(se.peak, 2)} · `
+  el.textContent = `${se.app === "system" ? "系统音频" : (se.app || "应用")} tap：${exec}${baseLabel} · RMS ${fmt(se.rms, 4)} · 峰值 ${fmt(se.peak, 2)} · `
     + `深度 ${(Number(se.depth) || 0).toFixed(1)}× · ${se.sample_rate || "?"} Hz · `
     + `状态 ${se.state_age_s ?? "?"} s 前${contentNote}${maskingNote}${headroomNote}${leakNote}${roleText}${cutText}${stemSafety}${se.last_error ? ` · ${se.last_error}` : ""}`;
   // 深度滑块现在是 systemeq 的处方深度（1…4 倍）。
@@ -1064,7 +1064,7 @@ function renderStemAction(s) {
     return;
   }
   if (se.available === false) {
-    el.textContent = `执行端未运行：${se.reason || "等待 QQ 音乐开始播放"}`;
+    el.textContent = `执行端未运行：${se.reason || "等待音频输入"}`;
     return;
   }
   if (!se.stem_stream) {

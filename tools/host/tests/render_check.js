@@ -344,6 +344,22 @@ if (snapshot.player) {
 }
 
 if (snapshot.systemeq) {
+  const globalTrial = Object.assign({}, snapshot, {
+    systemeq: Object.assign({}, snapshot.systemeq, { app: "system", available: true }),
+  });
+  render(globalTrial);
+  check(text("systemeq-note").startsWith("系统音频 tap："), "全局回执显示系统音频");
+  check(!text("systemeq-note").includes("QQ 音乐"), "全局回执不假定 QQ 音乐");
+  check(text("apply-note").includes("系统音频 tap"), "全局应用曲线显示系统音频");
+  check(text("receipt").includes("系统音频 tap"), "全局设备回执显示系统音频");
+  globalTrial.systemeq.available = false;
+  globalTrial.systemeq.reason = "权限未授予";
+  render(globalTrial);
+  check(text("systemeq-note").includes("系统音频 tap 不可用：权限未授予"), "全局捕获失败如实显示");
+  render(snapshot);
+}
+
+if (snapshot.systemeq) {
   const trial = Object.assign({}, snapshot, {
     systemeq: Object.assign({}, snapshot.systemeq, {
       available: true, execution: "bypass", stem_stream: true, bypass: true,
@@ -487,7 +503,7 @@ if (snapshot.frame) {
 }
 
 // ---------------------------------------------------------------- 有符号调音（负=削）
-// 现场 host 可能还是旧代码、实时快照里没有负值；新 SONG_EQ 曲线一定会出现负增益。
+// 现场 host 可能还是旧代码、实时快照里没有负值；新 SONG_EQ曲线一定会出现负增益。
 // 所以在**同一份真快照**上合成一条含负值的曲线，验证 render() 真的能把负段画到零线
 // 下方、文案说清"负=削"，而不是仍按"只抬不削"把负值钳掉。
 // 注意：这里只改测试用的快照，不改面板——曲线形状仍然只能来自设备报的 tuning。

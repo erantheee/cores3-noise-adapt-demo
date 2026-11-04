@@ -659,7 +659,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "对 QQ 音乐启用实时分轨重混（默认开）；四轨模型优先保证吞吐，"
+            "对捕获音频启用实时分轨重混（默认开）；四轨模型优先保证吞吐，"
             "可用 --stem-model htdemucs_6s 切六轨。S3 环境决定策略，旧 24 段 EQ 自动归零"
         ),
     )
@@ -1182,7 +1182,7 @@ def main(argv: list[str] | None = None) -> int:
     if player_service is not None:
         cleanup_steps.append(("Mac 播放器", player_service.stop))
     if systemeq_service is not None:
-        cleanup_steps.append(("QQ 音乐 system EQ", systemeq_service.stop))
+        cleanup_steps.append(("系统音频 / 应用 system EQ", systemeq_service.stop))
     if voiceprint is not None:
         cleanup_steps.append(("声纹 off 回执", send_voiceprint_off))
         cleanup_steps.append(("声纹 worker", voiceprint.stop))

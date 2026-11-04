@@ -10,8 +10,8 @@ ARGS=$(
     CORES3_PYTHON=/bin/echo CORES3_WEB_PORT=18999 sh tools/host_up.sh | tail -1
 )
 case " $ARGS " in
-    *" --system-eq-app com.tencent.QQMusicMac "*) : ;;
-    *) echo "默认启动参数缺少 QQ 音乐低延迟执行端：$ARGS" >&2; exit 1 ;;
+    *" --system-eq-app system "*) : ;;
+    *) echo "默认启动参数缺少 系统音频执行端：$ARGS" >&2; exit 1 ;;
 esac
 case " $ARGS " in
     *" --stem-remix "*) : ;;
@@ -39,4 +39,18 @@ grep -Eq 'api/snapshot' "$ROOT/启动演示.command"
 grep -Eq '"stem_stream".*true' "$ROOT/启动演示.command"
 grep -q '四轨实时分轨' "$ROOT/启动演示.command"
 
-echo "启动器回归测试通过：默认四轨实时分轨，六轨需显式开启"
+
+APP_ARGS=$(
+    cd "$ROOT"
+    CORES3_PYTHON=/bin/echo CORES3_WEB_PORT=18999 sh tools/host_up.sh --system-eq-app com.tencent.QQMusicMac | tail -1
+)
+case " $APP_ARGS " in
+    *" --system-eq-app system "*) echo "显式单应用不得被全局默认覆盖" >&2; exit 1 ;;
+esac
+case " $APP_ARGS " in
+    *" --system-eq-app com.tencent.QQMusicMac "*) : ;;
+    *) echo "显式单应用参数丢失" >&2; exit 1 ;;
+esac
+grep -q 'capture_scope' "$ROOT/启动演示.command"
+
+echo "启动器回归测试通过：默认系统音频四轨；单应用与关闭分轨参数保留"
