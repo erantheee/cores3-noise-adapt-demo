@@ -97,17 +97,17 @@ case " $* " in
     *) set -- --stem-remix "$@" ;;
 esac
 case " $* " in
-    *" --ambient-gate "*|*" --mock "*|*" --replay "*) : ;;
+    *" --ambient-gate "*|*" --mock "*|*" --replay "*|*" --khadas-url "*) : ;;
     *) set -- --ambient-gate voice "$@" ;;
 esac
 case " $* " in
-    *" --voiceprint "*|*" --mock "*|*" --replay "*) : ;;
+    *" --voiceprint "*|*" --mock "*|*" --replay "*|*" --khadas-url "*) : ;;
     *) set -- --voiceprint "$@" ;;
 esac
 # 训练数据默认落盘到 gitignore 的 记录/训练数据/（D34）：每个候选片段一条 JSONL +
 # 16 kHz WAV，供端侧蒸馏与人工复盘；不需要时传 --no-training-data 或 --training-dir ""。
 case " $* " in
-    *" --training-dir "*|*" --no-training-data "*|*" --mock "*|*" --replay "*) : ;;
+    *" --training-dir "*|*" --no-training-data "*|*" --mock "*|*" --replay "*|*" --khadas-url "*) : ;;
     *) set -- --training-dir "$ROOT/记录/训练数据" "$@" ;;
 esac
 # 连续音频默认关（约 150 MB/小时）：与 6 s 训练分段不同，它是无人工断裂的整段混合音频，

@@ -90,6 +90,7 @@ LINK_TEXT = {
 
 SOURCE_TEXT = {
     "serial": "串口（真机）",
+    "khadas": "Khadas Edge2（网络）",
     "mock": "模拟源（无设备）",
     "replay": "回放（历史日志）",
 }
@@ -758,6 +759,7 @@ class HostState:
             "source": self.source,
             "source_text": SOURCE_TEXT.get(self.source, self.source),
             "source_detail": self.source_detail,
+            "khadas": getattr(self, "khadas_status", None),
             "read_errors": self.read_errors,
             "reconnects": self.reconnects,
             "uptime_s": round(now - origin, 1),

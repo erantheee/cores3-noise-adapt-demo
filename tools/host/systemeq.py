@@ -299,7 +299,10 @@ class SystemEqService:
             # 分轨只负责改变声部组成；S3 24 段、事件包络和掩蔽矩阵仍在下游执行。
             # 初版在这里把三者全部归零，导致用户看到“分轨开了但包络没了”。
             # 固定 demo 基线仍关掉，避免在模型输出上再叠一层旧音染。
-            base_gain = 0.0
+            # Edge2 remains the execution path when sensor-derived EQ is neutral.  This
+            # non-audible sentinel prevents Swift from bypassing the remote worker;
+            # demo=False means it never becomes an EQ gain.
+            base_gain = 0.001 if self.stem_model == "edge2-rknn" else 0.0
         if not self.available:
             # QQ 音乐没在出声时 tap 起不来、进程会退出。这里每隔几秒重试一次，
             # 用户点开播放后不用重启上位机就能恢复执行。

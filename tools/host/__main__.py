@@ -47,6 +47,7 @@ from .training import TrainingWriter
 from .voiceprint import VoiceprintService
 from .sources import (
     MissingDependency,
+    KhadasSource,
     MockSource,
     ReplaySource,
     SerialSource,
@@ -587,12 +588,13 @@ def parse_earphone(raw: str) -> Earphone:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="python3 -m host",
-        description="CoreS3 上位机：实时显示 EarbudCommand 帧，并可回控设备录音。",
+        description="OWS 上位机：支持 CoreS3 串口或 Khadas Edge2 网络执行端。",
     )
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--port", help="串口设备（默认自动找 /dev/cu.usbmodem*）")
     source.add_argument("--mock", action="store_true", help="用模拟源（不需要设备）")
     source.add_argument("--replay", help="回放一份历史串口日志")
+    source.add_argument("--khadas-url", help="用 Khadas Edge2 替代 S3，例如 http://172.16.20.18:8787")
     parser.add_argument("--baud", type=int, default=115200, help="波特率，默认 115200")
     parser.add_argument(
         "--web-port",
@@ -665,7 +667,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--stem-model",
-        choices=("htdemucs", "htdemucs_6s"),
+        choices=("htdemucs", "htdemucs_6s", "edge2-rknn"),
         default="htdemucs",
         help="实时分轨模型：htdemucs=四轨、更快；htdemucs_6s=六轨、声部更细",
     )
@@ -1160,10 +1162,12 @@ def main(argv: list[str] | None = None) -> int:
         eq_depth = 1.3 if args.eq_mode == "basic" else 2.5
         stem_worker = None
         if args.stem_remix:
-            stem_worker = str(Path(__file__).resolve().parents[1] / "stem_remix" / "stream_worker.py")
+            worker_name = "edge2_stream_worker.py" if args.khadas_url else "stream_worker.py"
+            stem_worker = str(Path(__file__).resolve().parents[1] / "stem_remix" / worker_name)
         systemeq_service = SystemEqService(
             app=args.system_eq_app, mode=args.eq_mode, depth=eq_depth,
             demo=not args.stem_remix, stem_worker=stem_worker,
+            stem_device=args.khadas_url or "mps",
             stem_model=args.stem_model, stem_window=args.stem_window,
             stem_overlap=args.stem_overlap, stem_segment=args.stem_segment,
             stem_autocast=args.stem_autocast, stem_strength=args.stem_strength,
@@ -1213,7 +1217,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.quiet:
         print("=" * 66)
-        print("CoreS3 上位机")
+        print("Khadas Edge2 OWS 上位机" if isinstance(source, KhadasSource) else "CoreS3 上位机")
         print(f"  数据源    {state.source}  {source.detail or ''}")
         print("  耳机      自动识别：" + " / ".join(
             f"{e.label}（{e.match}）" for e in args.earphones))

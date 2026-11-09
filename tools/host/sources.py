@@ -15,11 +15,13 @@
 from __future__ import annotations
 
 import glob
+import json
 import os
 import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Protocol
@@ -466,6 +468,69 @@ class MockSource:
             state.set_connection(False, "模拟源结束")
 
 
+class KhadasSource:
+    """Edge2 heartbeat for the existing host UI; sensor fields stay invalid."""
+
+    def __init__(self, base_url: str, interval_s: float = 0.2):
+        self.base_url = base_url.rstrip("/")
+        self.interval_s = interval_s
+        self.name = "khadas"
+        self.detail = f"{self.base_url}（Edge2；DMIC 感知未接入）"
+
+    def run(self, state: HostState, stop: threading.Event) -> None:
+        state.set_source_detail(self.detail)
+        sequence = 0
+        started = time.monotonic()
+        was_connected = False
+        while not stop.is_set():
+            try:
+                with urllib.request.urlopen(f"{self.base_url}/v1/status", timeout=2.0) as response:
+                    status = json.loads(response.read().decode("utf-8"))
+                if not isinstance(status, dict):
+                    raise ValueError("Edge2 status is not an object")
+                state.khadas_status = status
+                state.set_source_detail(
+                    f"Edge2 {self.base_url} · requested={status.get('requested_mode')} "
+                    f"actual={status.get('actual_mode')} · RTF={status.get('last_rtf')}"
+                )
+                state.set_connection(True, "Edge2 网络服务已连接；DMIC 感知未接入")
+                was_connected = True
+                sequence += 1
+                payload = {
+                    "type": "earbud_command", "schema": 4, "sequence": sequence,
+                    "timestamp_ms": int((time.monotonic() - started) * 1000),
+                    "speech_gain_db": 0.0, "external_voice_gain_db": 0.0,
+                    "media_percent": 100, "ambient_open": False,
+                    "broadband_dbfs": -120.0, "voice_likelihood": 0.0,
+                    "vocal_ratio": 0.0, "spectral_flatness": 0.0,
+                    "vocal_peakiness": 0.0, "excited_vocal_bands": 0,
+                    "mic2_broadband_dbfs": -120.0, "mic_diff_db": 0.0,
+                    "mic_coherence": 0.0, "mic2_valid": False,
+                    "state": "IDLE", "environment": "QUIET", "mode": "FLAT",
+                    "conversation": "NONE", "confidence": 0.0,
+                    "execution": "edge2_network", "link": "connected",
+                    "eq_gain_db": [0.0] * 24,
+                    "context": "unknown", "context_score": 0.0,
+                    "context_valid": False, "context_us": 0,
+                    "context_top2": "unknown", "context_top2_score": 0.0,
+                    "context_mixed": False, "event": "quiet", "event_valid": False,
+                    "own_voice_confidence": 0.0, "own_voice_correlation": 0.0,
+                    "own_voice_source": "unavailable", "own_voice_policy": "disabled",
+                    "imu_gravity": 0.0, "imu_ok": False, "imu_motion": False,
+                    "imu_drops": 0, "imu_samples": 0,
+                    "ambient_band_dbfs": [-120.0] * 24,
+                }
+                state.feed_line(json.dumps(payload))
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                state.khadas_status = {"available": False, "error": str(exc)}
+                state.set_connection(False, f"Edge2 不可达：{exc}")
+                if was_connected:
+                    state.note_read_error(f"Edge2 连接中断：{exc}")
+                was_connected = False
+            stop.wait(self.interval_s)
+        state.set_connection(False, "Edge2 网络源已停止")
+
+
 def _command_timestamp(line: str) -> int | None:
     """取出 earbud_command 行的 timestamp_ms，用于原速回放。"""
     if '"timestamp_ms"' not in line:
@@ -488,6 +553,8 @@ def build_source(args) -> Source:
         return MockSource(seconds=getattr(args, "mock_seconds", 0.0), speed=getattr(args, "speed", 1.0))
     if getattr(args, "replay", None):
         return ReplaySource(args.replay, speed=getattr(args, "speed", 1.0), loop=getattr(args, "loop", False))
+    if getattr(args, "khadas_url", None):
+        return KhadasSource(args.khadas_url)
     return SerialSource(
         port=getattr(args, "port", None),
         baud=getattr(args, "baud", 115200),
